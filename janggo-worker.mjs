@@ -1,45 +1,35 @@
-// FRESH AI TRADER - SUPER DEBUG MODE V1.3
+// FRESH AI TRADER - BULLETPROOF DEBUG V1.4
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 1. TELEGRAM WEBHOOK
     if (path === '/telegram-webhook' && request.method === 'POST') {
       try {
         const update = await request.json();
         if (!update.message || !update.message.text) return new Response("OK");
         
         const chatId = String(update.message.chat.id);
-        const botToken = env.TELEGRAM_BOT_TOKEN;
-        const savedChatId = env.TELEGRAM_CHAT_ID;
+        const userText = update.message.text.trim();
+        const savedChatId = String(env.TELEGRAM_CHAT_ID || 'NOT_SET');
 
-        let replyText = "";
-        
-        if (!botToken) {
-          replyText = "❌ ERROR: TELEGRAM_BOT_TOKEN Cloudflare mein set nahi hai! Please check Variables.";
-        } else {
-          replyText = `✅ Message Received!\n\nTumhara Actual Chat ID: \`${chatId}\`\nCloudflare mein saved Chat ID: \`${savedChatId || 'NOT SET'}\`\nBot Token Status: ✅ Set Hai`;
-        }
+        // Hamesha reply karega taaki hum check kar sakein
+        const replyText = `✅ BOT IS WORKING!\n\nTumne message bheja Chat ID se: \`${chatId}\`\nCloudflare mein saved hai: \`${savedChatId}\`\n\nAgar dono same hain, toh setup 100% perfect hai!`;
 
-        if (botToken) {
-          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: replyText, parse_mode: 'Markdown' })
-          });
-        }
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: replyText, parse_mode: 'Markdown' })
+        });
 
         return new Response("OK");
       } catch (e) {
-        console.error("Worker Error:", e);
         return new Response("Error: " + e.message, { status: 500 });
       }
     }
 
-    // 2. HEALTH CHECK (Yeh tumhe browser mein sab dikha dega)
     if (path === '/' || path === '/health') {
-      return new Response(`Fresh AI Trader Active!\n\n--- DEBUG INFO ---\nBot Token Set: ${env.TELEGRAM_BOT_TOKEN ? 'YES ✅' : 'NO ❌'}\nChat ID Set: ${env.TELEGRAM_CHAT_ID ? 'YES ✅' : 'NO ❌'}\nSaved Chat ID Value: ${env.TELEGRAM_CHAT_ID || 'NOT SET'}`, {
+      return new Response("Fresh AI Trader Active! Bulletproof Mode ON", {
         headers: { 'Content-Type': 'text/plain' }
       });
     }
