@@ -4,29 +4,27 @@ export default {
       try {
         const update = await request.json();
         const chatId = update.message?.chat?.id;
-        if (chatId) {
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: `✅ WORKING! Chat ID: ${chatId}` })
-          });
-        }
-        return new Response("OK");
+        
+        if (!chatId) return new Response("No chat ID found");
+
+        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: "Hello from Cloudflare!" })
+        });
+        
+        const data = await res.text();
+        // Yeh line error ko Telegram ke logs mein bhej degi
+        return new Response(data); 
       } catch (e) {
-        return new Response("Error");
+        return new Response("CRITICAL ERROR: " + e.message);
       }
     }
     return new Response("Fresh AI Trader Active!");
   }
 };
 
-// Yeh class zaroori hai warna Cloudflare deploy fail kar deta hai
 export class JanggoEngine {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-  async fetch(request) {
-    return new Response("Engine Running");
-  }
+  constructor(state, env) { this.state = state; this.env = env; }
+  async fetch(request) { return new Response("Engine Running"); }
 }
