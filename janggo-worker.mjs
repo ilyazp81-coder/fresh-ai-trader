@@ -19,3 +19,14 @@ export default {
     return new Response("Fresh AI Trader Active!");
   }
 };
+
+// Yeh class zaroori hai warna Cloudflare deploy fail kar deta hai
+export class JanggoEngine {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+  async fetch(request) {
+    return new Response("Engine Running");
+  }
+}
