@@ -1,4 +1,4 @@
-// FRESH AI TRADER - DEBUG MODE V1.1
+// FRESH AI TRADER - DEBUG MODE V1.2
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -12,12 +12,10 @@ export default {
         const chatId = String(update.message.chat.id);
         const userText = update.message.text.trim();
         
-        // Debug: Cloudflare logs mein dekhne ke liye
         console.log("Incoming Chat ID:", chatId);
         console.log("Saved Env Chat ID:", env.TELEGRAM_CHAT_ID);
 
-        // Debug Reply: Yeh message tumhe wapas aayega
-        const debugReply = `✅ Message Received!\n\nTumhara Actual Chat ID: \`${chatId}\`\nCloudflare mein saved ID: \`${env.TELEGRAM_CHAT_ID || 'NOT SET'}\`\n\nAgar dono same hain, toh humara setup perfect hai!`;
+        const debugReply = `✅ Message Received!\n\nTumhara Actual Chat ID: \`${chatId}\`\nCloudflare mein saved ID: \`${env.TELEGRAM_CHAT_ID || 'NOT SET'}\``;
 
         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: 'POST',
@@ -41,3 +39,14 @@ export default {
     return new Response("Not Found", { status: 404 });
   }
 };
+
+// Yeh class zaroori hai agar wrangler.jsonc mein Durable Objects set hain
+export class JanggoEngine {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+  async fetch(request) {
+    return new Response("Engine Running");
+  }
+}
