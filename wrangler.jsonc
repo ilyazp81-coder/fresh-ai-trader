@@ -1,1 +1,31 @@
-
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fresh-ai-trader",
+  "main": "janggo-worker.mjs",
+  "compatibility_date": "2024-01-01",
+  "workers_dev": true,
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fresh-trader-db",
+      "database_id": "YOUR_NEW_D1_DATABASE_ID"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ENGINE",
+        "class_name": "JanggoEngine"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["JanggoEngine"]
+    }
+  ]
+}
