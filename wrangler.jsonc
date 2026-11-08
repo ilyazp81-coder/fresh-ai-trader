@@ -11,7 +11,7 @@
     {
       "binding": "DB",
       "database_name": "fresh-trader-db",
-      "database_id": "YOUR_NEW_D1_DATABASE_ID"
+      "database_id": "f345ad46-1a15-4a37-a11c-61f583693b46"
     }
   ],
   "durable_objects": {
