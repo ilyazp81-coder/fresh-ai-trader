@@ -2,15 +2,15 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // TELEGRAM WEBHOOK
+    // TELEGRAM WEBHOOK HANDLER
     if (url.pathname === '/telegram-webhook' && request.method === 'POST') {
       try {
         const update = await request.json();
         const chatId = update.message?.chat?.id;
-        const text = update.message?.text || 'No text';
+        const text = update.message?.text;
 
         if (chatId) {
-          const reply = `✅ Bot Working!\n\nTumne likha: ${text}\n\nCloudflare ne message receive kar liya.`;
+          const reply = `✅ Bot Working!\n\nTumne likha: ${text || 'No text'}\nTumhara Chat ID: ${chatId}`;
           
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -33,7 +33,7 @@ export default {
   }
 };
 
-// Required for wrangler.jsonc Durable Objects setting
+// Yeh class isliye zaroori hai kyunki wrangler.jsonc mein Durable Object set hai
 export class JanggoEngine {
   constructor(state, env) {
     this.state = state;
