@@ -111,3 +111,15 @@ export default {
     }catch(e){console.error("scheduled scan failed",e.message);if(env.TELEGRAM_CHAT_ID&&env.STATE){const k="error:"+istDate();if(!await load(env,k)){await tg(env,env.TELEGRAM_CHAT_ID,"⚠️ Cloud AI data/scan unavailable; alerts paused. Check /status.");await store(env,k,{at:Date.now()})}}}})());
   }
 };
+
+// Preserve the class export required by the existing Cloudflare Durable Object binding.
+// This is the original placeholder behavior shown by the user, NOT a trading engine.
+export class JanggoEngine {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+  async fetch(request) {
+    return new Response('Engine Running');
+  }
+}
