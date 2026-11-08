@@ -6,6 +6,12 @@
   "ai": {
     "binding": "AI"
   },
+"kv_namespaces": [
+{
+"binding": "STATE",
+"id": "3b04ac24997341449fa82775ef0646ca"
+}
+],
   "observability": {
     "logs": {
       "enabled": true,
