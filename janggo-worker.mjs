@@ -1,25 +1,25 @@
-// FRESH AI TRADER - BULLETPROOF DEBUG V1.4
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === '/telegram-webhook' && request.method === 'POST') {
+    
+    if (url.pathname === '/telegram-webhook' && request.method === 'POST') {
       try {
         const update = await request.json();
-        if (!update.message || !update.message.text) return new Response("OK");
         
-        const chatId = String(update.message.chat.id);
-        const userText = update.message.text.trim();
-        const savedChatId = String(env.TELEGRAM_CHAT_ID || 'NOT_SET');
+        // Har cheez ko console mein print karo taaki hum dekh sakein Telegram kya bhej raha hai
+        console.log("FULL TELEGRAM UPDATE:", JSON.stringify(update));
 
-        // Hamesha reply karega taaki hum check kar sakein
-        const replyText = `✅ BOT IS WORKING!\n\nTumne message bheja Chat ID se: \`${chatId}\`\nCloudflare mein saved hai: \`${savedChatId}\`\n\nAgar dono same hain, toh setup 100% perfect hai!`;
+        // Chat ID ko kahi se bhi nikal lo (message ya button click se)
+        const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
+        
+        if (!chatId) return new Response("OK");
+
+        const replyText = `🎯 SUCCESS!\n\nTumhara Actual Chat ID: ${chatId}\nCloudflare Saved ID: ${env.TELEGRAM_CHAT_ID || 'NOT SET'}\nToken Status: ${env.TELEGRAM_BOT_TOKEN ? '✅ SET' : '❌ MISSING'}`;
 
         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: replyText, parse_mode: 'Markdown' })
+          body: JSON.stringify({ chat_id: chatId, text: replyText })
         });
 
         return new Response("OK");
@@ -28,22 +28,10 @@ export default {
       }
     }
 
-    if (path === '/' || path === '/health') {
-      return new Response("Fresh AI Trader Active! Bulletproof Mode ON", {
-        headers: { 'Content-Type': 'text/plain' }
-      });
+    if (url.pathname === '/') {
+      return new Response("Fresh AI Trader is ALIVE and Listening!");
     }
 
     return new Response("Not Found", { status: 404 });
   }
 };
-
-export class JanggoEngine {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-  async fetch(request) {
-    return new Response("Engine Running");
-  }
-}
