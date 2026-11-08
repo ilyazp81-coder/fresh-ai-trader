@@ -2,7 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // TELEGRAM WEBHOOK
+    // 1. TELEGRAM WEBHOOK (Yeh hissa Telegram ko reply karega)
     if (url.pathname === '/telegram-webhook' && request.method === 'POST') {
       try {
         const update = await request.json();
@@ -24,7 +24,7 @@ export default {
       }
     }
 
-    // HEALTH CHECK
+    // 2. HEALTH CHECK
     if (url.pathname === '/') {
       return new Response("Telegram Bot is ALIVE and listening!");
     }
@@ -33,7 +33,7 @@ export default {
   }
 };
 
-// Yeh class isliye zaroori hai kyunki wrangler.jsonc mein Durable Object set hai
+// 3. YEH CLASS ZAROORI HAI (Iske bina deploy fail ho jayega)
 export class JanggoEngine {
   constructor(state, env) {
     this.state = state;
