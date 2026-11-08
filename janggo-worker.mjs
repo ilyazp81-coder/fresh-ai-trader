@@ -1,4 +1,4 @@
-// JANGGO CLOUD v4 | Signals-only, paper-tracked. No order endpoints.
+// JANGGO CLOUD v6 | Deterministic research brain + signals-only paper observations. No order endpoints.
 const TZ='Asia/Kolkata';
 const json=(v,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{'content-type':'application/json'}});
 const day=()=>new Date().toLocaleDateString('sv-SE',{timeZone:TZ});
@@ -44,6 +44,103 @@ async function observe(e,c,q){
  if(move<1||move>12)return {reason:'momentum outside bounds'};
  return {candidate:true,move,entry:sample.ltp,sl:Math.round(sample.ltp*.97*100)/100,target:Math.round(sample.ltp*1.06*100)/100};
 }
+
+// V6 deterministic research brain: no LLM controls execution or fabricates market evidence.
+const round2=x=>Math.round(x*100)/100;
+function researchBrain(c,q,samples){
+ const a=samples.filter(x=>Number.isFinite(x.ltp)&&x.ltp>0&&Number.isFinite(x.volume));
+ if(a.length<4)return {ready:false,reason:'Need >=4 sequential market observations'};
+ const recent=a.slice(-4),first=recent[0],last=recent[3];
+ if(last.t-first.t<10*60000||Date.now()-last.t>7*60000)return {ready:false,reason:'Observation timing/staleness gate'};
+ if(recent.some((v,i)=>i>0&&(v.t<=recent[i-1].t||v.volume<recent[i-1].volume)))return {ready:false,reason:'Nonmonotonic timestamps/volume'};
+ if(!Number.isFinite(last.high)||!Number.isFinite(last.low)||last.high<=last.low)return {ready:false,reason:'Invalid day range'};
+ const momentum=100*(last.ltp/first.ltp-1);
+ const rise=recent.slice(1).filter((v,i)=>v.ltp>recent[i].ltp).length;
+ const volumeDelta=last.volume-first.volume;
+ const nearHigh=last.ltp>=last.high*.995;
+ const highBreak=last.ltp>Math.max(...recent.slice(0,3).map(v=>v.ltp))*1.002;
+ const score=(rise===3?30:rise===2?15:0)+(momentum>=.8&&momentum<=8?25:0)+(volumeDelta>0?15:0)+(nearHigh?15:0)+(highBreak?15:0);
+ const valid=score>=85&&rise===3&&nearHigh&&highBreak&&momentum>=.8&&momentum<=8;
+ return {ready:true,valid,score,momentum:round2(momentum),strategy:'premium_momentum_confirmation_v1',reason:valid?'Confirmed sampled premium momentum (not certified trade)':'Quality gates not met',entry:round2(last.ltp),sl:round2(last.ltp*.97),target:round2(last.ltp*1.06),sampleCount:recent.length,observedAt:last.t};
+}
+// Open-source-inspired, independently implemented rule families (not copied code).
+// Online learning is deliberately restricted to shadow research ranking, never execution.
+const FAMILIES=['momentum','breakout','reversion'];
+function candidates(samples){
+ const a=samples.filter(x=>Number.isFinite(x.ltp)&&x.ltp>0&&Number.isFinite(x.volume)).slice(-8);
+ if(a.length<5)return [];
+ const f=a[0],l=a.at(-1),prev=a.slice(0,-1),elapsed=l.t-f.t;
+ if(elapsed<10*60000||Date.now()-l.t>7*60000||a.some((x,i)=>i&&(x.t<=a[i-1].t||x.volume<a[i-1].volume)))return [];
+ const change=(l.ltp/f.ltp-1)*100, hi=Math.max(...prev.map(x=>x.ltp)),lo=Math.min(...prev.map(x=>x.ltp));
+ const rising=a.slice(1).filter((x,i)=>x.ltp>a[i].ltp).length;
+ const range=(hi-lo)/f.ltp*100;
+ const defs=[
+  {id:'momentum',valid:change>=1&&change<=8&&rising>=a.length-2&&l.ltp>=hi,score:Math.min(100,50+rising*7+change*3)},
+  {id:'breakout',valid:range>=.5&&l.ltp>hi*1.004&&l.volume>f.volume,score:Math.min(100,55+change*4+range*4)},
+  {id:'reversion',valid:range>=1.2&&l.ltp>prev.at(-1).ltp&&prev.at(-1).ltp<=lo*1.005&&l.ltp<hi*.995,score:Math.min(100,55+range*6)}
+ ];
+ return defs.filter(x=>x.valid).map(x=>({...x,entry:round2(l.ltp),sl:round2(l.ltp*.97),target:round2(l.ltp*1.06),at:l.t}));
+}
+async function shadowObserve(e,c,samples,price){
+ const picks=candidates(samples),out=[];
+ for(const id of FAMILIES){
+  const key=`shadow:${day()}:${c.exchange}:${c.token}:${id}`;
+  const old=await get(e,key);
+  if(old?.status==='OPEN'){
+   const close=price<=old.sl?'LOSS':price>=old.target?'WIN':null;
+   if(close){old.status=close;old.exit=price;old.closedAt=Date.now();await put(e,key,old,172800);
+    // Immutable event IDs; KV is eventually consistent, so updates remain best-effort.
+    const eventKey=`learn:event:${day()}:${c.exchange}:${c.token}:${id}`;
+    if(!await get(e,eventKey)){
+     await put(e,eventKey,{id,day:day(),result:close,entry:old.entry,exit:price},86400*45);
+     const indexKey='learn:index';const index=(await get(e,indexKey))||[];
+     if(!index.includes(eventKey))await put(e,indexKey,[...index,eventKey].slice(-500),86400*90);
+    }
+   }
+  }else if(!old){const pick=picks.find(x=>x.id===id);if(pick)await put(e,key,{...pick,status:'OPEN',symbol:c.symbol},172800)}
+ }
+ return picks;
+}
+async function learningReport(e){
+ const idx=(await get(e,'learn:index'))||[];
+ const events=(await Promise.all(idx.slice(-500).map(k=>get(e,k)))).filter(x=>x&&FAMILIES.includes(x.id));
+ const stats=FAMILIES.map(id=>{const rows=events.filter(x=>x.id===id),train=rows.slice(0,Math.max(0,rows.length-10)),holdout=rows.slice(-10);
+ const wins=a=>a.filter(x=>x.result==='WIN').length;
+ return {strategy:id,observations:rows.length,trainCount:train.length,trainWinRate:train.length?round2(wins(train)/train.length*100):null,holdoutCount:holdout.length,holdoutWinRate:holdout.length?round2(wins(holdout)/holdout.length*100):null,eligible:train.length>=30&&holdout.length>=10&&wins(train)/train.length>=.55&&wins(holdout)/holdout.length>=.5};});
+ return {status:'SHADOW_RESEARCH_ONLY',stats,qualified:stats.filter(x=>x.eligible).map(x=>x.strategy),method:'Sequential threshold observations; last 10 held out. Not statistically reliable or trade fills. No automatic strategy promotion or real orders.'};
+}
+async function brainEvaluate(e,c,q,send){
+ const key=`samples:${day()}:${c.exchange}:${c.token}`;
+ const a=(await get(e,key))||[];
+ const verdict=researchBrain(c,q,a);
+ const shadow=await shadowObserve(e,c,a,Number(q.ltp));
+ const learning=await learningReport(e);
+ verdict.shadowCandidates=shadow.map(x=>x.id);verdict.researchQualified=learning.qualified;
+ await put(e,`brain:${day()}:${c.exchange}:${c.token}`,{...verdict,symbol:c.symbol,underlying:c.underlying,at:Date.now()},86400);
+ if(!verdict.valid)return {verdict,alert:false};
+ const k=`brain:alert:${day()}:${c.exchange}:${c.token}`;
+ if(await get(e,k))return {verdict,alert:false};
+ // Research alert is deliberately labeled; quote freshness, spreads and underlying trend unverified.
+ if(send)await telegram(e,`🧠 JANGGO RESEARCH SETUP — NOT VERIFIED TRADE ADVICE\n${c.underlying} ${c.symbol} (${c.side})\nScore ${verdict.score}/100 | observed ₹${verdict.entry}\nIllustrative SL ₹${verdict.sl} | target ₹${verdict.target}\nPremium move ${verdict.momentum}% | strategy ${verdict.strategy}\nNo exchange timestamp, bid/ask spread, underlying confirmation or fill verification. No orders.`);
+ await put(e,k,{at:Date.now(),score:verdict.score},86400);
+ return {verdict,alert:true};
+}
+async function trackPaper(e,c,price,send){
+ const k=`paper:${day()}:${c.exchange}:${c.token}`,r=await get(e,k);
+ if(!r||r.status!=='OPEN'||!Number.isFinite(price))return null;
+ // Cannot infer intrabar SL/target from snapshots; first observed threshold wins.
+ const status=price<=r.sl?'SL_OBSERVED':price>=r.target?'TARGET_OBSERVED':null;
+ if(!status){r.last=price;await put(e,k,r,172800);return null}
+ r.status=status;r.last=price;r.closedAt=Date.now();r.hypotheticalPoints=round2(price-r.entry);r.caveat='Snapshot threshold observation; not an executable fill or realized P&L';
+ await put(e,k,r,172800);
+ if(send)await telegram(e,`🧪 PAPER TRACK UPDATE — ${status}\n${r.symbol} | reference ₹${r.entry} → observed ₹${price}\nHypothetical change ${r.hypotheticalPoints} premium points. Not a fill; no orders.`);
+ return status;
+}
+async function brainReport(e){
+ const last=await get(e,'scan:last');
+ return {mode:'SIGNALS_ONLY_RESEARCH',lastScan:last||null,strategies:['premium_momentum_confirmation_v1',...FAMILIES],learning:await learningReport(e),safety:'No orders, no verified trading signals, no autonomous strategy promotion. Snapshot observations only.'};
+}
+
 async function paperCandidate(e,c,ob,send){
  const k=`paper:${day()}:${c.exchange}:${c.token}`;
  if(await get(e,k))return false;
@@ -61,11 +158,11 @@ async function paperReport(e){
  return {date:day(),candidates:rows.length,open:rows.filter(r=>r.status==='OPEN').length,closed:rows.filter(r=>r.status!=='OPEN').length,warning:'Hypothetical observations, not executed trades; no meaningful win rate until independently validated.'};
 }
 // Price-based observations only: quote snapshots do not establish a validated trade setup.
-async function scan(e,{send=true}={}){if(!hasKV(e))throw Error('STATE KV binding missing');const all=await instruments(e);const jwt=await session(e);const result={at:new Date().toISOString(),mode:'PAPER_RESEARCH',contracts:0,quoted:0,watchAlerts:0,paperCandidates:0,issues:[]};for(const name of ['NIFTY','SENSEX']){const cs=select(all,name);result.contracts+=cs.length;if(!cs.length){result.issues.push(`${name}: no contracts`);continue}const groups={};for(const c of cs)(groups[c.exchange]??=[]).push(c.token);const q=[];for(const [ex,tokens] of Object.entries(groups))for(let i=0;i<tokens.length;i+=50)q.push(...await quotes(e,jwt,ex,tokens.slice(i,i+50)));const byToken=new Map(q.map(v=>[String(v.symbolToken??v.symboltoken??v.token),v]));for(const c of cs){const v=byToken.get(c.token);if(!v)continue;const ltp=Number(v.ltp),open=Number(v.open),high=Number(v.high),low=Number(v.low),vol=Number(v.tradeVolume??v.volume);if(![ltp,open,high,low,vol].every(Number.isFinite)||ltp<=0||open<=0||high<=low||vol<=0)continue;result.quoted++;if(marketOpen(e)){const ob=await observe(e,c,v);if(ob.candidate&&await paperCandidate(e,c,ob,send))result.paperCandidates++;}const change=100*(ltp/open-1);if(change<3||ltp<high*.995)continue;const k=`watch:${day()}:${c.exchange}:${c.token}`;if(await get(e,k))continue;const msg=`👀 RESEARCH WATCH — NOT A BUY SIGNAL\n${name} ${c.symbol}\nExpiry ${c.expiry} | LTP ₹${ltp.toFixed(2)}\nChange from open +${change.toFixed(2)}% | Volume ${vol}\nSingle quote snapshot only. No confirmed entry, SL, target or exit. No orders.`;if(send)await telegram(e,msg);await put(e,k,{at:Date.now(),ltp},86400);result.watchAlerts++}}await put(e,'scan:last',result,86400);return result}
+async function scan(e,{send=true}={}){if(!hasKV(e))throw Error('STATE KV binding missing');const all=await instruments(e);const jwt=await session(e);const result={at:new Date().toISOString(),mode:'SIGNALS_ONLY_RESEARCH',contracts:0,quoted:0,watchAlerts:0,paperCandidates:0,brainAlerts:0,paperClosed:0,issues:[]};for(const name of ['NIFTY','SENSEX']){const cs=select(all,name);result.contracts+=cs.length;if(!cs.length){result.issues.push(`${name}: no contracts`);continue}const groups={};for(const c of cs)(groups[c.exchange]??=[]).push(c.token);const q=[];for(const [ex,tokens] of Object.entries(groups))for(let i=0;i<tokens.length;i+=50)q.push(...await quotes(e,jwt,ex,tokens.slice(i,i+50)));const byToken=new Map(q.map(v=>[String(v.symbolToken??v.symboltoken??v.token),v]));for(const c of cs){const v=byToken.get(c.token);if(!v)continue;const ltp=Number(v.ltp),open=Number(v.open),high=Number(v.high),low=Number(v.low),vol=Number(v.tradeVolume??v.volume);if(![ltp,open,high,low,vol].every(Number.isFinite)||ltp<=0||open<=0||high<=low||vol<=0)continue;result.quoted++;if(marketOpen(e)){await trackPaper(e,c,ltp,send).then(x=>{if(x)result.paperClosed++});const ob=await observe(e,c,v);if(ob.candidate&&await paperCandidate(e,c,ob,send))result.paperCandidates++;const br=await brainEvaluate(e,c,v,send);if(br.alert)result.brainAlerts++;}const change=100*(ltp/open-1);if(change<3||ltp<high*.995)continue;const k=`watch:${day()}:${c.exchange}:${c.token}`;if(await get(e,k))continue;const msg=`👀 RESEARCH WATCH — NOT A BUY SIGNAL\n${name} ${c.symbol}\nExpiry ${c.expiry} | LTP ₹${ltp.toFixed(2)}\nChange from open +${change.toFixed(2)}% | Volume ${vol}\nSingle quote snapshot only. No confirmed entry, SL, target or exit. No orders.`;if(send)await telegram(e,msg);await put(e,k,{at:Date.now(),ltp},86400);result.watchAlerts++}}await put(e,'scan:last',result,86400);return result}
 async function ai(e,text){if(!e.AI)return 'AI binding missing';try{const r=await e.AI.run('@cf/meta/llama-3.2-3b-instruct',{messages:[{role:'system',content:'You are Janggo, a helpful Hinglish research assistant. You have no live quotes or verified news in this conversation. Do not invent prices, trades, win rates or current events. No order placement.'},{role:'user',content:String(text).slice(0,3000)}],max_tokens:450});return String(r.response||'No AI response')}catch(err){log('AI',err);return 'AI unavailable; check Cloudflare model catalog and logs.'}}
-async function handle(e,u){const m=u.message||u.edited_message;if(String(m?.chat?.id)!==String(e.TELEGRAM_CHAT_ID))return;const raw=String(m.text||'').trim();if(!raw)return;const cmd=raw.split(/\s+/)[0].split('@')[0].toLowerCase();let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud v4 — research-only\n/status configuration\n/testangel broker login test\n/scan live option research watch\n/nifty /sensex AI checklist\n/news verified feed status\n/paper /performance paper research counts\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode RESEARCH WATCHLIST`;else if(cmd==='/testangel'){try{await session(e);out='✅ Angel login succeeded. No orders placed. Quote access separately unverified.'}catch(err){out='❌ Angel login failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scan(e,{send:false}),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await ai(e,`Explain how to evaluate ${cmd.slice(1).toUpperCase()} option opportunities, without claiming live prices or issuing trades.`);else if(cmd==='/news')out='No verified news provider configured. Pre-market news briefing is disabled until sourced.';else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else out=await ai(e,raw);await telegram(e,out)}
+async function handle(e,u){const m=u.message||u.edited_message;if(String(m?.chat?.id)!==String(e.TELEGRAM_CHAT_ID))return;const raw=String(m.text||'').trim();if(!raw)return;const cmd=raw.split(/\s+/)[0].split('@')[0].toLowerCase();let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud v7 — signals-only research\n/status configuration\n/testangel broker login test\n/scan live option research watch\n/nifty /sensex AI checklist\n/news verified feed status\n/paper /performance paper research counts\n/brain — research brain status\n/learning — shadow strategy learning\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode RESEARCH WATCHLIST`;else if(cmd==='/testangel'){try{await session(e);out='✅ Angel login succeeded. No orders placed. Quote access separately unverified.'}catch(err){out='❌ Angel login failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scan(e,{send:false}),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await ai(e,`Explain how to evaluate ${cmd.slice(1).toUpperCase()} option opportunities, without claiming live prices or issuing trades.`);else if(cmd==='/brain')out=JSON.stringify(await brainReport(e),null,2);else if(cmd==='/learning')out=JSON.stringify(await learningReport(e),null,2);else if(cmd==='/news')out='No verified news provider configured. Pre-market news briefing is disabled until sourced.';else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else out=await ai(e,raw);await telegram(e,out)}
 export default {
- async fetch(req,e){const u=new URL(req.url);if(u.pathname==='/health')return json({ok:true,version:'5.0',mode:'paper-research'});if(['/telegram','/telegram-webhook'].includes(u.pathname)&&req.method==='POST'){if(!e.TELEGRAM_WEBHOOK_SECRET||req.headers.get('X-Telegram-Bot-Api-Secret-Token')!==e.TELEGRAM_WEBHOOK_SECRET)return json({error:'forbidden'},403);let update;try{update=await req.json()}catch{return json({error:'invalid json'},400)}try{if(!hasKV(e))throw Error('KV unavailable');const key=`tg:${update.update_id}`;if(await get(e,key))return json({ok:true,duplicate:true});await handle(e,update);await put(e,key,{at:Date.now()},86400);return json({ok:true})}catch(err){log('webhook',err);return json({error:'handler failed'},500)}}return json({error:'not found'},404)},
+ async fetch(req,e){const u=new URL(req.url);if(u.pathname==='/health')return json({ok:true,version:'6.0',mode:'paper-research'});if(['/telegram','/telegram-webhook'].includes(u.pathname)&&req.method==='POST'){if(!e.TELEGRAM_WEBHOOK_SECRET||req.headers.get('X-Telegram-Bot-Api-Secret-Token')!==e.TELEGRAM_WEBHOOK_SECRET)return json({error:'forbidden'},403);let update;try{update=await req.json()}catch{return json({error:'invalid json'},400)}try{if(!hasKV(e))throw Error('KV unavailable');const key=`tg:${update.update_id}`;if(await get(e,key))return json({ok:true,duplicate:true});await handle(e,update);await put(e,key,{at:Date.now()},86400);return json({ok:true})}catch(err){log('webhook',err);return json({error:'handler failed'},500)}}return json({error:'not found'},404)},
  async scheduled(ev,e,ctx){ctx.waitUntil((async()=>{try{if(!marketOpen(e))return;const r=await scan(e);console.log('scan',JSON.stringify(r))}catch(err){log('scheduled scan',err)}})())}
 };
 // Compatibility export for existing Durable Object binding. No order logic.
