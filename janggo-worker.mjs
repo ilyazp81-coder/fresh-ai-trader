@@ -47,3 +47,14 @@ export default {
     return new Response("Not Found", { status: 404 });
   }
 };
+
+// Yeh class isliye zaroori hai taaki Cloudflare ka purana setting error na de
+export class JanggoEngine {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+  async fetch(request) {
+    return new Response("Engine Running");
+  }
+}
