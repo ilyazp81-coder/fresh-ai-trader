@@ -22,10 +22,10 @@ function istDate(){return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Kolkat
 function istClock(){return new Intl.DateTimeFormat("en-GB",{timeZone:"Asia/Kolkata",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(new Date())}
 function marketWindow(){const d=new Date(), day=new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Kolkata",weekday:"short"}).format(d),t=istClock();return !["Sat","Sun"].includes(day)&&t>="09:15"&&t<="15:30"}
 async function angelSession(env){
-  const required=["ANGEL_API_KEY","ANGEL_CLIENT_CODE","ANGEL_PIN","ANGEL_TOTP_SECRET"];
+  const required=["SMART_API_KEY","SMART_CLIENT_CODE","SMART_PIN","SMART_TOTOTP_SEED"];
   const missing=required.filter(x=>!env[x]);if(missing.length)throw Error("Missing "+missing.join(", "));
   // TOTP from a locally configured base32 secret. Secret is never logged or sent to Telegram.
-  const base32=String(env.ANGEL_TOTP_SECRET).toUpperCase().replace(/[\s=]/g,"");
+  const base32=String(env.SMART_TOTOTP_SEED).toUpperCase().replace(/[\s=]/g,"");
   let bits=0,val=0,bytes=[];
   for(const c of base32){const i="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".indexOf(c);if(i<0)throw Error("Invalid TOTP secret");val=(val<<5)|i;bits+=5;if(bits>=8){bytes.push((val>>>(bits-=8))&255)}}
   const counter=Math.floor(Date.now()/30000),data=new Uint8Array(8);
@@ -34,13 +34,13 @@ async function angelSession(env){
   const sig=new Uint8Array(await crypto.subtle.sign("HMAC",key,data)),offset=sig[19]&15;
   const otp=(((sig[offset]&127)<<24)|((sig[offset+1]&255)<<16)|((sig[offset+2]&255)<<8)|(sig[offset+3]&255))%1000000;
   const r=await fetch("https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",{
-    method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json","X-UserType":"USER","X-SourceID":"WEB","X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"127.0.0.1","X-MACAddress":"00:00:00:00:00:00","X-PrivateKey":env.ANGEL_API_KEY},
-    body:JSON.stringify({clientcode:env.ANGEL_CLIENT_CODE,password:env.ANGEL_PIN,totp:String(otp).padStart(6,"0")})
+    method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json","X-UserType":"USER","X-SourceID":"WEB","X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"127.0.0.1","X-MACAddress":"00:00:00:00:00:00","X-PrivateKey":env.SMART_API_KEY},
+    body:JSON.stringify({clientcode:env.SMART_CLIENT_CODE,password:env.SMART_PIN,totp:String(otp).padStart(6,"0")})
   });const x=await r.json();if(!r.ok||!x.status||!x.data?.jwtToken)throw Error("Angel login failed: "+(x.message||r.status));return x.data.jwtToken;
 }
 async function angelQuote(env,jwt,exchange,tokens){
   const r=await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/",{
-    method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json","Authorization":"Bearer "+jwt,"X-UserType":"USER","X-SourceID":"WEB","X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"127.0.0.1","X-MACAddress":"00:00:00:00:00:00","X-PrivateKey":env.ANGEL_API_KEY},
+    method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json","Authorization":"Bearer "+jwt,"X-UserType":"USER","X-SourceID":"WEB","X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"127.0.0.1","X-MACAddress":"00:00:00:00:00:00","X-PrivateKey":env.SMART_API_KEY},
     body:JSON.stringify({mode:"FULL",exchangeTokens:{[exchange]:tokens}})
   });const x=await r.json();if(!r.ok||!x.status)throw Error("Quote unavailable: "+(x.message||r.status));return x.data?.fetched||[];
 }
@@ -79,7 +79,7 @@ async function handle(env,update){
   const raw=(msg.text||"").trim(),cmd=raw.split(/\s+/)[0].split("@")[0].toLowerCase();
   let reply="";
   if(cmd==="/start"||cmd==="/help")reply="🤖 Cloud AI Signals\n/status — system checks\n/scan — inspect current option quotes (watchlist only)\n/nifty, /sensex — request AI educational analysis\n/news — news feed status\n/performance — stored alert count\nAny text — ask AI\n⚠️ No real orders; verified buy/sell signals are disabled until full validation.";
-  else if(cmd==="/status")reply=`System: online\nIST: ${istDate()} ${istClock()}\nNormal market window: ${marketWindow()?"OPEN":"CLOSED"}\nContracts: ${contracts(env).length}\nState KV: ${env.STATE?"yes":"missing"}\nAngel configured: ${["ANGEL_API_KEY","ANGEL_CLIENT_CODE","ANGEL_PIN","ANGEL_TOTP_SECRET"].every(x=>!!env[x])?"yes":"no"}\nMode: WATCHLIST ONLY; live signals not certified`;
+  else if(cmd==="/status")reply=`System: online\nIST: ${istDate()} ${istClock()}\nNormal market window: ${marketWindow()?"OPEN":"CLOSED"}\nContracts: ${contracts(env).length}\nState KV: ${env.STATE?"yes":"missing"}\nAngel configured: ${["SMART_API_KEY","SMART_CLIENT_CODE","SMART_PIN","SMART_TOTOTP_SEED"].every(x=>!!env[x])?"yes":"no"}\nMode: WATCHLIST ONLY; live signals not certified`;
   else if(cmd==="/scan"){try{reply=JSON.stringify(await scan(env,{manual:true}),null,2)}catch(e){reply="Scan failed: "+e.message}}
   else if(cmd==="/performance")reply="Verified trade performance: not available. Watchlist alerts are not executed trades; do not interpret as win rate.";
   else if(cmd==="/news")reply="Verified news provider not configured. No headlines will be invented.";
