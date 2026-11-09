@@ -14,7 +14,7 @@
   ],
   "triggers": {
     "crons": [
-      "*/5 3-10 * * MON-FRI"
+      "*/5 3-11 * * *"
     ]
   },
   "observability": {
