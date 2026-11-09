@@ -477,7 +477,7 @@ function evaluateOptionEvidence({underlying,options,market,now=Date.now(),market
 const {historicalRequest,normalizeAngelCandles} = __modules["angel-data-transport.mjs"];
 const { assessLiveReadiness } = __modules["live-readiness.mjs"];
 const TZ='Asia/Kolkata';
-const VERSION='v101-live-readiness-audit';
+const VERSION='v112-single-file-diagnostics-fix';
 // Scanner failure recovery: clear broker failure stages and avoid repeated master fetches.
 // Shared rounding helper used by scanner, research brain, options and paper lifecycle.
 const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
@@ -1951,13 +1951,13 @@ async function systemDiagnostics(e){
   kv:hasKV(e),aiBinding:!!e.AI,credentialsConfigured:cfg(e).length===0,
   marketCalendarConfigured:calendarConfigured(e),sessionValid:sessionConfig(e).valid,
   scheduledScanRecent:lastAge!==null&&lastAge>=0&&lastAge<=15,
-  brokerQuoteFresh:last?.quoteFresh>0,
-  brokerQuoteCoverage:last?.quoted>0,
+  brokerQuoteFresh:marketOpen(e)&&lastAge!==null&&lastAge>=0&&lastAge<=6&&last?.quoteFresh>0&&last?.quoteFresh===last?.quoted,
+  brokerQuoteCoverage:marketOpen(e)&&lastAge!==null&&lastAge>=0&&lastAge<=6&&last?.quoted>0&&last?.quoted===last?.contracts,
   verifiedGreeks:false,verifiedNews:false,verifiedBacktests:false,
   verifiedProductionSignals:false,ordersDisabled:true
  };
  return {version:VERSION,checkedAt:new Date().toISOString(),checks,
-  lastScanAgeMinutes:lastAge,lastScanSummary:last||null,
+  lastScanAgeMinutes:lastAge,marketOpen:marketOpen(e),quoteStatus:!marketOpen(e)?'MARKET_CLOSED':lastAge===null||lastAge<0||lastAge>6?'SCAN_NOT_RECENT':'SCAN_RECENT_CHECK_COVERAGE',lastScanSummary:last||null,
   issues:[...Object.entries(checks).filter(([k,v])=>v===false&&!['verifiedGreeks','verifiedNews','verifiedBacktests','verifiedProductionSignals'].includes(k)).map(([k])=>k+' not ready'),
   ...['verifiedGreeks','verifiedNews','verifiedBacktests','verifiedProductionSignals'].map(k=>k+' not independently verified')],
   note:'Worker status is not proof of Angel One connectivity. Do not treat research observations as executable signals.'};
