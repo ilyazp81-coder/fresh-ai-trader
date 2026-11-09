@@ -1,6 +1,6 @@
 // JANGGO CLOUD v8 | Signal-only research with OI, market-data quality, news and explicit validation gates.
 const TZ='Asia/Kolkata';
-const VERSION='v35-fullcheck-calendar-readiness';
+const VERSION='v36-ist-quote-timestamp-fix';
 const json=(v,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{'content-type':'application/json'}});
 const day=()=>new Date().toLocaleDateString('sv-SE',{timeZone:TZ});
 const clock=()=>new Intl.DateTimeFormat('en-GB',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
@@ -59,7 +59,7 @@ async function spotReference(e,jwt,name){
  const value=num(q?.ltp);
  if(!Number.isFinite(value)||value<=0)throw Error(name+' spot reference quote unavailable');
  const freshness=quoteTimestamp(q);
- if(freshness.state!=='FRESH')throw Error(name+' spot reference is '+freshness.state+' (cannot validate underlying direction)');
+ if(freshness.state!=='FRESH')throw Error(name+' spot quote timestamp '+freshness.state+' (ageSeconds='+freshness.ageSeconds+'; cannot validate underlying direction)');
  return {value,exchange,token,observedAt:Date.now(),freshness,warning:'Spot quote fresh; trend alignment not yet certified'};
 }
 // Paper research is intentionally conservative: quotes lack exchange timestamps and a single
@@ -171,13 +171,27 @@ async function newsDigest(e){
 }
 // Broker fields vary by exchange. Only enforce timestamp freshness when a parseable
 // exchange timestamp exists; otherwise explicitly report timestamp as unverified.
+// SmartAPI exchange timestamps are often naive IST strings (e.g. 09-Nov-2026 09:31:00).
+// Date.parse() treats those as UTC in Workers, incorrectly making quotes 5h30m FUTURE.
+// Parse explicitly as Asia/Kolkata (UTC+05:30); never treat missing/invalid time as fresh.
 function quoteTimestamp(q){
  const raw=q.exchFeedTime??q.exchTradeTime??q.exchangeTime??q.lastTradeTime??q.last_traded_time;
  if(raw===undefined||raw===null||raw==='')return {state:'UNVERIFIED',ageSeconds:null};
  let t=NaN;
  if(typeof raw==='number')t=raw<1e11?raw*1000:raw;
  else if(/^\d{10,13}$/.test(String(raw)))t=Number(raw)*(String(raw).length===10?1000:1);
- else {const v=String(raw).trim();t=Date.parse(v);if(!Number.isFinite(t)&&/^\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}$/.test(v)){const [date,time]=v.split(' ');t=Date.parse(date+' '+time+' GMT+0530');}}
+ else {
+  const v=String(raw).trim();
+  const m=v.match(/^(\d{1,2})[-\/](\w{3}|\d{1,2})[-\/](\d{4})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/);
+  const iso=v.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/);
+  if(m){
+   const months={JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+   const mo=/^\d+$/.test(m[2])?Number(m[2])-1:months[m[2].toUpperCase()];
+   if(Number.isInteger(mo)&&mo>=0&&mo<12)t=Date.UTC(+m[3],mo,+m[1],+m[4],+m[5],+m[6],+(m[7]||0)*10**(3-(m[7]||'').length))-330*60000;
+  }else if(iso){
+   t=Date.UTC(+iso[1],+iso[2]-1,+iso[3],+iso[4],+iso[5],+iso[6],+(iso[7]||0)*10**(3-(iso[7]||'').length))-330*60000;
+  }else if(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(v))t=Date.parse(v);
+ }
  if(!Number.isFinite(t))return {state:'UNVERIFIED',ageSeconds:null};
  const age=Math.round((Date.now()-t)/1000);
  return {state:age< -120?'FUTURE':age>180?'STALE':'FRESH',ageSeconds:age};
