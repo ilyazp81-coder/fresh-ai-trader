@@ -1,10 +1,445 @@
-import {autoSelectPaper} from './auto-paper-selection.mjs';
-import {runScheduledPaperCycle} from './scheduled-paper-cycle.mjs';
-import {reviewAllStrategies,lastStrategyReview,reviewStrategyIndex} from './strategy-review-cycle.mjs';
-import {registerAttributedPaper,attributedPerformance} from './strategy-attribution.mjs';
-import {assessPaperCandidate,registerResearchPaper} from './paper-candidate.mjs';
-import {trackerRegister,trackerStep,trackerReport} from './premium-tracker.mjs';
-import {paperStrategySelectionReport} from './strategy-selection.mjs';
+// JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
+// Paper-only alerts; live broker validation pending.
+
+const __modules = Object.create(null);
+
+// MODULE: premium-forward.mjs
+__modules["premium-forward.mjs"] = (() => {
+// Deterministic, fail-closed option-premium forward simulator. No orders, no invented fills.
+const premiumKey = (r) => [r.index,r.symbol,r.token,r.expiry,r.side].join(':');
+const number = x => typeof x==='number' && Number.isFinite(x);
+function validatePremiumTick(t, now=Date.now(), maxAgeMs=15000) {
+  if (!t || !['NIFTY','SENSEX'].includes(t.index) || !['CE','PE'].includes(t.side) ||
+      !t.symbol || !t.token || !t.expiry || !number(t.bid) || !number(t.ask) ||
+      t.bid<=0 || t.ask<t.bid || !number(t.ts) || t.ts>now+2000 || now-t.ts>maxAgeMs ||
+      !number(t.lotSize) || !Number.isInteger(t.lotSize) || t.lotSize<=0 ||
+      !number(t.volume) || t.volume<=0 || !number(t.oi) || t.oi<=0) return {ok:false,reason:'INVALID_OR_STALE_OPTION_QUOTE'};
+  const expiry=Date.parse(t.expiry+'T15:30:00+05:30');
+  if (!Number.isFinite(expiry) || expiry<=now) return {ok:false,reason:'EXPIRED_CONTRACT'};
+  const spreadPct=(t.ask-t.bid)/((t.ask+t.bid)/2)*100;
+  if (spreadPct>3) return {ok:false,reason:'SPREAD_TOO_WIDE'};
+  return {ok:true,spreadPct};
+}
+function openPaperOption(state,t,opts={}) {
+  const valid=validatePremiumTick(t,opts.now??Date.now());if(!valid.ok)return {state,accepted:false,reason:valid.reason};
+  if(state?.position)return {state,accepted:false,reason:'POSITION_ALREADY_OPEN'};
+  const lots=opts.lots??1;
+  if(!Number.isInteger(lots)||lots<1)return {state,accepted:false,reason:'INVALID_LOTS'};
+  const quantity=lots*t.lotSize, fee=opts.feePerOrder??20, slippage=opts.slippagePerUnit??0;
+  if(!number(fee)||fee<0||!number(slippage)||slippage<0)return {state,accepted:false,reason:'INVALID_COSTS'};
+  const entry=t.ask+slippage;
+  const stop=opts.stop, target=opts.target;
+  if(!number(stop)||!number(target)||stop<=0||stop>=entry||target<=entry)return {state,accepted:false,reason:'INVALID_RISK_LEVELS'};
+  return {accepted:true,state:{position:{key:premiumKey(t),symbol:t.symbol,token:t.token,side:t.side,expiry:t.expiry,entry,stop,target,quantity,openedAt:t.ts,fee,slippage},trades:[...(state?.trades||[])]}};
+}
+function updatePaperOption(state,t,opts={}) {
+  if(!state?.position)return {state,closed:false,reason:'NO_POSITION'};
+  const p=state.position, now=opts.now??Date.now();
+  const valid=validatePremiumTick(t,now);
+  if(!valid.ok)return {state,closed:false,reason:valid.reason};
+  if(p.key!==premiumKey(t))return {state,closed:false,reason:'CONTRACT_MISMATCH'};
+  if(t.ts<=p.openedAt)return {state,closed:false,reason:'NOT_FORWARD_DATA'};
+  if(state.lastTickAt!=null && t.ts<=state.lastTickAt)return {state,closed:false,reason:'DUPLICATE_OR_OLD_TICK'};
+  const bid=t.bid-p.slippage;
+  const exitReason=bid<=p.stop?'STOP':bid>=p.target?'TARGET':opts.forceClose?'MANUAL_PAPER_CLOSE':null;
+  if(!exitReason)return {state:{...state,lastTickAt:t.ts},closed:false,reason:'OPEN'};
+  const gross=(bid-p.entry)*p.quantity, costs=2*p.fee, net=gross-costs;
+  const trade={...p,exit:bid,closedAt:t.ts,exitReason,gross,costs,net};
+  return {state:{position:null,trades:[...state.trades,trade],lastTickAt:t.ts},closed:true,trade};
+}
+function premiumMetrics(state) {
+  const trades=state?.trades||[];const wins=trades.filter(t=>t.net>0), losses=trades.filter(t=>t.net<0);
+  let equity=0,peak=0,drawdown=0;
+  for(const t of trades){equity+=t.net;peak=Math.max(peak,equity);drawdown=Math.max(drawdown,peak-equity)}
+  const profit=wins.reduce((s,t)=>s+t.net,0),loss=Math.abs(losses.reduce((s,t)=>s+t.net,0));
+  return {trades:trades.length,wins:wins.length,losses:losses.length,winRate:trades.length?wins.length/trades.length:null,net:equity,profitFactor:loss?profit/loss:null,maxDrawdown:drawdown,forwardCertified:false,execution:'SIMULATED_BID_ASK_NOT_BROKER_FILLS'};
+}
+
+return {premiumKey,validatePremiumTick,openPaperOption,updatePaperOption,premiumMetrics};
+})();
+
+// MODULE: premium-tracker.mjs
+__modules["premium-tracker.mjs"] = (() => {
+const {openPaperOption,updatePaperOption,premiumMetrics,validatePremiumTick} = __modules["premium-forward.mjs"];
+const INDEXES=new Set(['NIFTY','SENSEX']);
+const key=n=>'premium:tracker:'+n;
+async function trackerRead(kv,index){if(!INDEXES.has(index))throw Error('INVALID_INDEX');return (await kv.get(key(index),'json'))||{position:null,trades:[],lastTickAt:null,enabled:false};}
+async function trackerRegister(kv,index,contract,levels,attribution=null){
+ if(attribution!==null && (!attribution.strategyId||!attribution.frozenHash||!attribution.historicalAuditId||!Number.isFinite(attribution.registeredAt)||attribution.registeredAt>Date.now()))throw Error('INVALID_STRATEGY_ATTRIBUTION');
+ if(!INDEXES.has(index))throw Error('INVALID_INDEX');
+ const s=await trackerRead(kv,index);if(s.position||s.pending)throw Error('TRACKER_BUSY');
+ if(!contract||!contract.exchange||!contract.token||!contract.symbol||!['CE','PE'].includes(contract.side)||!contract.expiry||!Number.isInteger(contract.lotSize)||contract.lotSize<1)throw Error('INVALID_CONTRACT');
+ if(!Number.isFinite(levels.stop)||!Number.isFinite(levels.target)||levels.stop<=0||levels.target<=levels.stop)throw Error('INVALID_LEVELS');
+ const next={...s,enabled:true,pending:{...contract,index,stop:levels.stop,target:levels.target,lots:levels.lots??1,registeredAt:Date.now(),...(attribution?{attribution:{...attribution}}:{})},lastError:null};
+ await kv.put(key(index),JSON.stringify(next));return {status:'REGISTERED_PAPER_ONLY',index,contract:contract.symbol};
+}
+function quoteToTick(index,contract,q,now=Date.now()){
+ const depth=q?.depth;const bid=Number(depth?.buy?.[0]?.price),ask=Number(depth?.sell?.[0]?.price);
+ const rawTs=q?.exchFeedTime||q?.exchangeTime||q?.timestamp;
+ const parsed=typeof rawTs==='number'?(rawTs<1e12?rawTs*1000:rawTs):Date.parse(rawTs||'');
+ const volume=Number(q?.tradeVolume??q?.volume),oi=Number(q?.opnInterest??q?.openInterest??q?.oi);
+ return {index,side:contract.side,symbol:contract.symbol,token:String(contract.token),expiry:contract.expiry,lotSize:contract.lotSize,bid,ask,volume,oi,ts:parsed};
+}
+async function trackerStep(kv,index,quoteProvider,{now=Date.now(),marketOpen=false,forceClose=false}={}){
+ const s=await trackerRead(kv,index);if(!s.enabled||(!s.pending&&!s.position))return {status:'IDLE',index};
+ if(!marketOpen)return {status:'MARKET_CLOSED_NO_NEW_QUOTES',index};
+ const c=s.pending||s.position;
+ let q;try{q=await quoteProvider(c)}catch{return {status:'QUOTE_UNAVAILABLE',index}};
+ const tick=quoteToTick(index,c,q,now);const valid=validatePremiumTick(tick,now);
+ if(!valid.ok)return {status:'WAIT',reason:valid.reason,index};
+ let next,report;
+ if(s.pending){
+  if(tick.ts<=s.pending.registeredAt)return {status:'WAIT',reason:'NO_POST_REGISTRATION_QUOTE',index};
+  const result=openPaperOption(s,tick,{now,stop:s.pending.stop,target:s.pending.target,lots:s.pending.lots});
+  if(!result.accepted)return {status:'WAIT',reason:result.reason,index};
+  next={...result.state,position:{...result.state.position,exchange:c.exchange,lotSize:c.lotSize,...(c.attribution?{attribution:c.attribution}:{})},enabled:true,pending:null,lastTickAt:tick.ts};report={status:'PAPER_OPEN',index,symbol:c.symbol,entry:next.position.entry};
+ }else{
+  const result=updatePaperOption(s,tick,{now,forceClose});
+  next={...result.state,enabled:true,pending:null};
+  if(result.closed && s.position?.attribution){
+   const a=s.position.attribution, trade=next.trades[next.trades.length-1];
+   const attributed={...trade,strategyId:a.strategyId,frozenHash:a.frozenHash,historicalAuditId:a.historicalAuditId,registeredAt:a.registeredAt,source:'FORWARD_PAPER',execution:'SIMULATED_BID_ASK',tradeId:[index,trade.symbol,trade.openedAt,trade.closedAt].join(':')};
+   next.trades=[...next.trades.slice(0,-1),attributed];result.trade=attributed;
+  }
+  report={status:result.closed?'PAPER_CLOSED':result.reason,index,trade:result.closed?result.trade:undefined};
+  if(result.reason==='DUPLICATE_OR_OLD_TICK'||result.reason==='NOT_FORWARD_DATA')return report;
+ }
+ // Cloudflare KV is eventually consistent: one writer per index is required; not suitable for real orders.
+ await kv.put(key(index),JSON.stringify({...next,trades:(next.trades||[]).slice(-200)}));return report;
+}
+async function trackerReport(kv,index){const s=await trackerRead(kv,index);return {index,enabled:s.enabled,pending:s.pending||null,position:s.position||null,metrics:premiumMetrics(s),lastTickAt:s.lastTickAt||null,disclaimer:'SIMULATED PAPER QUOTES ONLY; NO VERIFIED FILLS OR FORWARD CERTIFICATION'};}
+
+return {trackerRead,trackerRegister,quoteToTick,trackerStep,trackerReport};
+})();
+
+// MODULE: paper-candidate.mjs
+__modules["paper-candidate.mjs"] = (() => {
+// Research-only CE/PE candidate to paper-registration bridge. No orders or production signals.
+const {trackerRegister,trackerRead} = __modules["premium-tracker.mjs"];
+const finite=x=>typeof x==='number'&&Number.isFinite(x);
+const stamp=x=>typeof x==='number'?x:Date.parse(x||'');
+function assessPaperCandidate({index,market,options,now=Date.now(),marketOpen=false}={}){
+ const reasons=[];
+ if(!['NIFTY','SENSEX'].includes(index))reasons.push('INVALID_INDEX');
+ if(!marketOpen)reasons.push('MARKET_CLOSED');
+ if(market?.underlying!==index||options?.underlying!==index)reasons.push('MISSING_MATCHED_EVIDENCE');
+ for(const [label,item,age] of [['MARKET',market,300000],['OPTIONS',options,90000]]){
+  const t=stamp(item?.at);if(!finite(t)||t>now+2000||now-t>age)reasons.push(label+'_STALE');
+ }
+ const frames=market?.frames||[];
+ const trend=n=>frames.find(f=>String(f.timeframe).replace(/\D/g,'')===String(n))?.trend;
+ const side=trend(5)==='UP'&&trend(15)==='UP'?'CE':trend(5)==='DOWN'&&trend(15)==='DOWN'?'PE':null;
+ if(!side)reasons.push('TREND_NOT_CONFIRMED');
+ const eligible=(options?.chain||[]).filter(c=>{
+  const qt=stamp(c.quoteAt), exp=Date.parse(c.expiry+'T15:30:00+05:30');
+  return c.side===side&&c.exchange==='NFO'&&typeof c.token==='string'&&/^\d+$/.test(c.token)&&
+   typeof c.symbol==='string'&&c.symbol.length>5&&Number.isInteger(c.lotSize)&&c.lotSize>0&&
+   finite(exp)&&exp>now&&finite(qt)&&qt<=now+2000&&now-qt<=15000&&c.fresh==='FRESH'&&
+   finite(c.strike)&&finite(options.spot)&&(side==='CE'?c.strike<options.spot:c.strike>options.spot)&&
+   finite(c.ltp)&&c.ltp>0&&finite(c.oi)&&c.oi>0&&finite(c.volume)&&c.volume>0&&
+   finite(c.spreadPct)&&c.spreadPct>=0&&c.spreadPct<=1.5&&
+   ['delta','gamma','theta','vega'].every(k=>finite(c[k]));
+ });
+ if(!eligible.length)reasons.push('NO_VERIFIED_CONTRACT_METADATA_AND_FRESH_QUOTE');
+ const best=[...eligible].sort((a,b)=>a.spreadPct-b.spreadPct||b.volume-a.volume)[0];
+ const contract=best?{exchange:best.exchange,token:best.token,symbol:best.symbol,side:best.side,expiry:best.expiry,lotSize:best.lotSize}:null;
+ return {status:reasons.length?'WAIT':'RESEARCH_PAPER_CANDIDATE',index,side,contract,reasons,productionSignal:false,ordersAllowed:false,
+  note:'Not strategy-certified; paper-only and subject to next fresh broker quote.'};
+}
+async function registerResearchPaper(kv,evidence,opts={}){
+ const result=assessPaperCandidate(evidence);
+ if(result.status!=='RESEARCH_PAPER_CANDIDATE')return result;
+ const {index,options}=evidence;const c=options.chain.find(x=>x.token===result.contract.token);
+ const stop=Math.round(c.ltp*0.94*100)/100,target=Math.round(c.ltp*1.1*100)/100;
+ if(stop<=0||target<=stop)return {...result,status:'WAIT',reasons:['INVALID_PAPER_LEVELS']};
+ const existing=await trackerRead(kv,index);
+ if(existing.position||existing.pending)return {...result,status:'WAIT',reasons:['TRACKER_BUSY']};
+ const registered=await trackerRegister(kv,index,result.contract,{stop,target,lots:1});
+ return {...result,status:'RESEARCH_PAPER_REGISTERED',registered,stop,target,simulationOnly:true};
+}
+
+return {assessPaperCandidate,registerResearchPaper};
+})();
+
+// MODULE: strategy-selection.mjs
+__modules["strategy-selection.mjs"] = (() => {
+// V105 research-only strategy selection. Paper outcomes must be attributable to a frozen strategy.
+// No live signals, no orders, and no promotion from simulated results alone.
+const {trackerRead} = __modules["premium-tracker.mjs"];
+const INDEXES=['NIFTY','SENSEX'];
+const finite=x=>typeof x==='number'&&Number.isFinite(x);
+function evaluateStrategyCandidates(candidates,{minTrades=30,minDays=10,minProfitFactor=1.2,maxDrawdown=5000}={}){
+ if(!Array.isArray(candidates))throw Error('INVALID_CANDIDATES');
+ const seen=new Set();
+ const results=candidates.map(c=>{
+  const reasons=[];const id=String(c?.id||'');
+  if(!id||seen.has(id))reasons.push('MISSING_OR_DUPLICATE_ID');seen.add(id);
+  if(!INDEXES.includes(c?.index))reasons.push('INVALID_INDEX');
+  if(!c?.frozenHash||!c?.historicalAuditId)reasons.push('MISSING_FROZEN_HISTORICAL_PROVENANCE');
+  const trades=c?.trades;
+  if(!Array.isArray(trades))reasons.push('NO_ATTRIBUTED_FORWARD_TRADES');
+  const t=Array.isArray(trades)?trades:[];
+  const unique=new Set();let equity=0,peak=0,maxDD=0,gains=0,losses=0,wins=0;
+  const days=new Set();
+  for(const x of t){
+   if(x?.strategyId!==id||x?.frozenHash!==c?.frozenHash||!finite(x?.net)||!finite(x?.closedAt)||!finite(x?.openedAt)||x.closedAt<=x.openedAt||x?.source!=='FORWARD_PAPER'||x?.execution!=='SIMULATED_BID_ASK'){
+    reasons.push('INVALID_OR_UNATTRIBUTED_TRADE');continue;
+   }
+   const tradeId=String(x.tradeId||'');if(!tradeId||unique.has(tradeId)){reasons.push('DUPLICATE_TRADE_ID');continue}unique.add(tradeId);
+   if(finite(c.registeredAt)&&x.openedAt<=c.registeredAt){reasons.push('PRE_REGISTRATION_TRADE');continue}
+   days.add(new Date(x.closedAt).toISOString().slice(0,10));
+   equity+=x.net;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,peak-equity);
+   if(x.net>0){wins++;gains+=x.net}else if(x.net<0)losses-=x.net;
+  }
+  if(unique.size<minTrades)reasons.push('INSUFFICIENT_FORWARD_TRADES');
+  if(days.size<minDays)reasons.push('INSUFFICIENT_INDEPENDENT_DAYS');
+  const pf=losses>0?gains/losses:null;
+  if(pf===null||pf<minProfitFactor)reasons.push('PROFIT_FACTOR_BELOW_THRESHOLD_OR_UNDEFINED');
+  if(equity<=0)reasons.push('NON_POSITIVE_NET');
+  if(maxDD>maxDrawdown)reasons.push('DRAWDOWN_LIMIT');
+  if(c?.integrityVerified!==true)reasons.push('INTEGRITY_NOT_VERIFIED');
+  return {id,index:c?.index||null,eligibleForFurtherReview:reasons.length===0,reasons:[...new Set(reasons)],metrics:{trades:unique.size,days:days.size,wins,net:equity,profitFactor:pf,maxDrawdown:maxDD},productionSignalAllowed:false,automaticPromotion:false};
+ });
+ return {status:'RESEARCH_SELECTION_ONLY',candidates:results,reviewQueue:results.filter(x=>x.eligibleForFurtherReview).map(x=>x.id),productionSignalsEnabled:false,ordersEnabled:false};
+}
+async function paperStrategySelectionReport(kv,index){
+ if(!INDEXES.includes(index))throw Error('INVALID_INDEX');
+ const state=await trackerRead(kv,index);
+ // Legacy paper trades have no frozen strategy identity; never misattribute them.
+ const candidates=(await kv.get('research:strategy-candidates:'+index,'json'))||[];
+ if(!Array.isArray(candidates))return {status:'INVALID_RESEARCH_REGISTRY',productionSignalsEnabled:false};
+ const r=evaluateStrategyCandidates(candidates);
+ return {...r,index,unattributedPaperTrades:(state.trades||[]).filter(t=>!t.strategyId||!t.frozenHash).length,disclaimer:'Research screening only; simulated trades cannot certify live profitability.'};
+}
+
+return {evaluateStrategyCandidates,paperStrategySelectionReport};
+})();
+
+// MODULE: strategy-attribution.mjs
+__modules["strategy-attribution.mjs"] = (() => {
+// V106: explicit, immutable strategy-to-paper attribution. Never retroactively label legacy trades.
+const {trackerRead,trackerRegister} = __modules["premium-tracker.mjs"];
+const {evaluateStrategyCandidates} = __modules["strategy-selection.mjs"];
+const indexes=new Set(['NIFTY','SENSEX']);
+const registryKey=i=>'research:strategy-candidates:'+i;
+async function registerAttributedPaper(kv,index,strategyId,contract,levels){
+ if(!indexes.has(index))throw Error('INVALID_INDEX');
+ const registry=await kv.get(registryKey(index),'json');
+ if(!Array.isArray(registry))throw Error('NO_STRATEGY_REGISTRY');
+ const matches=registry.filter(x=>x.id===strategyId&&x.index===index);
+ if(matches.length!==1)throw Error('UNKNOWN_OR_DUPLICATE_STRATEGY');
+ const candidate=matches[0];
+ if(candidate.integrityVerified!==true||!candidate.frozenHash||!candidate.historicalAuditId||!Number.isFinite(candidate.registeredAt)||candidate.registeredAt>Date.now())throw Error('UNVERIFIED_STRATEGY');
+ const current=await trackerRead(kv,index);
+ if(current.position||current.pending)throw Error('TRACKER_BUSY');
+ const attribution={strategyId,frozenHash:candidate.frozenHash,historicalAuditId:candidate.historicalAuditId,registeredAt:candidate.registeredAt};
+ const result=await trackerRegister(kv,index,contract,levels,attribution);
+ return {...result,attribution,productionSignalsEnabled:false,ordersEnabled:false};
+}
+async function attributedPerformance(kv,index){
+ if(!indexes.has(index))throw Error('INVALID_INDEX');
+ const registry=await kv.get(registryKey(index),'json');
+ const state=await trackerRead(kv,index);
+ if(!Array.isArray(registry))return {status:'NO_STRATEGY_REGISTRY',index,productionSignalsEnabled:false};
+ const candidates=registry.filter(c=>c?.index===index).map(c=>({...c,trades:(state.trades||[]).filter(t=>t.strategyId===c.id&&t.frozenHash===c.frozenHash&&t.historicalAuditId===c.historicalAuditId)}));
+ const report=evaluateStrategyCandidates(candidates);
+ return {...report,index,unattributedTrades:(state.trades||[]).filter(t=>!t.strategyId).length,disclaimer:'Paper simulation only; no live fills or independently certified performance.'};
+}
+
+return {registerAttributedPaper,attributedPerformance};
+})();
+
+// MODULE: auto-paper-selection.mjs
+__modules["auto-paper-selection.mjs"] = (() => {
+// V109: fail-closed automatic research strategy selection -> attributed paper registration.
+// No production signals, no broker orders. KV needs a single scheduled writer per index.
+const {assessPaperCandidate} = __modules["paper-candidate.mjs"];
+const {registerAttributedPaper} = __modules["strategy-attribution.mjs"];
+const {trackerRead} = __modules["premium-tracker.mjs"];
+const validIndex=i=>['NIFTY','SENSEX'].includes(i);
+const key=i=>'research:strategy-candidates:'+i;
+const reject=(index,reason)=>({index,status:'WAIT',reasons:[reason],paperOnly:true,productionSignalsEnabled:false,ordersEnabled:false});
+async function autoSelectPaper(kv,{index,market,options,marketOpen=false,now=Date.now(),maxEvidenceAgeMs=90000}={}){
+ if(!validIndex(index))return reject(index,'INVALID_INDEX');
+ if(!marketOpen)return reject(index,'MARKET_CLOSED');
+ const paper=assessPaperCandidate({index,market,options,marketOpen,now});
+ if(paper.status!=='RESEARCH_PAPER_CANDIDATE')return {...paper,paperOnly:true,productionSignalsEnabled:false};
+ const state=await trackerRead(kv,index);
+ if(state.position||state.pending)return reject(index,'TRACKER_BUSY');
+ const review=await kv.get('research:review:'+index,'json');
+ if(!review||review.status==='REVIEW_FAILED'||!Number.isFinite(review.at)||review.at>now||now-review.at>maxEvidenceAgeMs)return reject(index,'FRESH_STRATEGY_REVIEW_REQUIRED');
+ const registry=await kv.get(key(index),'json');
+ if(!Array.isArray(registry))return reject(index,'NO_STRATEGY_REGISTRY');
+ const shortlisted=new Set(Array.isArray(review.reviewQueue)?review.reviewQueue:[]);
+ const eligible=registry.filter(c=>c?.index===index&&shortlisted.has(c.id)&&c.integrityVerified===true&&typeof c.frozenHash==='string'&&c.frozenHash.length>0&&c.historicalAuditId&&Number.isFinite(c.registeredAt)&&c.registeredAt<=now);
+ // Refuse ambiguous selection; do not invent a strategy ranking or signal from review order.
+ if(eligible.length!==1)return reject(index,eligible.length?'AMBIGUOUS_STRATEGY_SELECTION':'NO_VALIDATED_RESEARCH_CANDIDATE');
+ const candidate=eligible[0];
+ // Explicit research side binding is mandatory. A trend direction alone cannot authorize a strategy.
+ if(candidate.side!==paper.side)return reject(index,'STRATEGY_DIRECTION_NOT_CONFIRMED');
+ const quote=options.chain.find(c=>c.token===paper.contract.token&&c.symbol===paper.contract.symbol);
+ if(!quote||!(Number.isFinite(quote.ltp)&&quote.ltp>0))return reject(index,'INVALID_PREMIUM');
+ const stop=Math.round(quote.ltp*0.94*100)/100;
+ const target=Math.round(quote.ltp*1.10*100)/100;
+ if(!(stop>0&&target>stop))return reject(index,'INVALID_LEVELS');
+ try{
+  const registered=await registerAttributedPaper(kv,index,candidate.id,paper.contract,{stop,target,lots:1});
+  return {index,status:'ATTRIBUTED_PAPER_REGISTERED',strategyId:candidate.id,contract:paper.contract.symbol,stop,target,registered,paperOnly:true,productionSignalsEnabled:false,ordersEnabled:false};
+ }catch(err){return reject(index,'REGISTRATION_REJECTED_'+String(err?.message||'UNKNOWN').slice(0,60));}
+}
+
+return {autoSelectPaper};
+})();
+
+// MODULE: scheduled-paper-cycle.mjs
+__modules["scheduled-paper-cycle.mjs"] = (() => {
+// Scheduled research-paper cycle. No orders or production alerts.
+// One writer per index is required: configure a single Worker cron deployment.
+async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY','SENSEX'],review,track,select,loadEvidence,now=()=>Date.now()}={}){
+ if(!kv||typeof kv.put!=='function'||typeof kv.get!=='function')throw Error('KV_REQUIRED');
+ if(!marketOpen)return {status:'MARKET_CLOSED',results:[],ordersEnabled:false,productionSignalsEnabled:false};
+ const results=[];
+ for(const index of indices){
+  if(!['NIFTY','SENSEX'].includes(index))continue;
+  const result={index,at:now(),tracking:null,review:null,selection:null,status:'WAIT'};
+  try{
+   // Sequential: settle exits before considering any new paper entry.
+   result.tracking=await track(index);
+   result.review=await review(index);
+   const evidence=await loadEvidence(index);
+   if(!evidence?.market||!evidence?.options){result.status='NO_EVIDENCE';}
+   else {
+    result.selection=await select(index,evidence);
+    result.status=result.selection?.status||'WAIT';
+   }
+  }catch(err){result.status='ERROR';result.reason=String(err?.message||err).slice(0,120)}
+  // Store diagnostics even if a single index fails. No claims of actual fills.
+  await kv.put('paper:scheduled:last:'+index,JSON.stringify({...result,paperOnly:true,ordersEnabled:false,productionSignalsEnabled:false}),{expirationTtl:86400});
+  results.push(result);
+ }
+ return {status:'COMPLETED',results,paperOnly:true,ordersEnabled:false,productionSignalsEnabled:false};
+}
+
+return {runScheduledPaperCycle};
+})();
+
+// MODULE: strategy-review-cycle.mjs
+__modules["strategy-review-cycle.mjs"] = (() => {
+// V107 complete research review cycle: deterministic, read-only, fail closed.
+// Does not promote strategies, open paper positions, or send production alerts.
+const {attributedPerformance} = __modules["strategy-attribution.mjs"];
+const INDEXES=['NIFTY','SENSEX'];
+const KEY=i=>'research:review:'+i;
+async function reviewStrategyIndex(kv,index,{now=Date.now()}={}){
+ if(!INDEXES.includes(index))throw Error('INVALID_INDEX');
+ if(!Number.isFinite(now))throw Error('INVALID_TIME');
+ const report=await attributedPerformance(kv,index);
+ const results=report.candidates||[];
+ const reviewQueue=results.filter(x=>x.eligibleForFurtherReview).map(x=>x.id);
+ const summary={version:107,index,at:now,status:report.status,reviewQueue,
+  candidates:results.map(x=>({id:x.id,eligibleForFurtherReview:x.eligibleForFurtherReview,reasons:x.reasons,metrics:x.metrics})),
+  unattributedTrades:report.unattributedTrades??null,automaticPromotion:false,
+  productionSignalsEnabled:false,ordersEnabled:false,
+  note:'Research review only. Manual out-of-sample inspection and independent live verification required.'};
+ await kv.put(KEY(index),JSON.stringify(summary));
+ return summary;
+}
+async function reviewAllStrategies(kv,{now=Date.now()}={}){
+ const results={};
+ for(const index of INDEXES){try{results[index]=await reviewStrategyIndex(kv,index,{now})}
+  catch(err){results[index]={status:'REVIEW_FAILED',index,reason:String(err?.message||err).slice(0,120),productionSignalsEnabled:false}}}
+ return {at:now,results,automaticPromotion:false,productionSignalsEnabled:false};
+}
+async function lastStrategyReview(kv,index){
+ if(!INDEXES.includes(index))throw Error('INVALID_INDEX');
+ const r=await kv.get(KEY(index),'json');
+ return r||{index,status:'NO_REVIEW_YET',productionSignalsEnabled:false};
+}
+
+return {reviewStrategyIndex,reviewAllStrategies,lastStrategyReview};
+})();
+
+// MODULE: angel-data-transport.mjs
+__modules["angel-data-transport.mjs"] = (() => {
+// V100: read-only Angel One historical transport. Never submits orders.
+class AngelDataError extends Error {
+ constructor(code,status=0){super(`ANGEL_${code}${status?` HTTP ${status}`:''}`);this.name='AngelDataError';this.code=code;this.status=status;}
+}
+function retryDelay(response,attempt){
+ const raw=response?.headers?.get?.('Retry-After');
+ const seconds=raw===null||raw===undefined?NaN:Number(raw);
+ return Number.isFinite(seconds)&&seconds>=0?Math.min(2000,seconds*1000):Math.min(2000,350*(attempt+1));
+}
+async function historicalRequest(url,options,{label='historical',timeoutMs=15000,retries=1,fetchImpl=fetch,sleepImpl=ms=>new Promise(r=>setTimeout(r,ms))}={}){
+ for(let attempt=0;attempt<=retries;attempt++){
+  let response;
+  try{response=await fetchImpl(url,{...options,signal:AbortSignal.timeout(timeoutMs)});}
+  catch(err){if(attempt<retries){await sleepImpl(350*(attempt+1));continue;}throw new AngelDataError(err?.name==='TimeoutError'?'TIMEOUT':'TRANSPORT');}
+  if(response.status===429||response.status>=500){
+   if(attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
+   throw new AngelDataError(response.status===429?'RATE_LIMITED':'BROKER_UNAVAILABLE',response.status);
+  }
+  if(response.status===401||response.status===403)throw new AngelDataError('ACCESS_DENIED',response.status);
+  // Never include raw response or broker credentials in errors/logs.
+  let payload;try{const raw=await response.text();if(!raw.trim())throw new Error('empty');payload=JSON.parse(raw);}catch{throw new AngelDataError('NON_JSON_RESPONSE',response.status);}
+  if(!response.ok||payload?.status!==true||!Array.isArray(payload?.data))throw new AngelDataError('INVALID_CANDLE_RESPONSE',response.status);
+  return payload;
+ }
+ throw new AngelDataError('UNAVAILABLE');
+}
+function normalizeAngelCandles(data,{intervalMs=60000,now=Date.now(),closedOnly=true}={}){
+ if(!Array.isArray(data))throw new AngelDataError('INVALID_CANDLE_ARRAY');
+ const parsed=data.map(row=>{
+  if(!Array.isArray(row)||row.length<6)return null;
+  const t=Date.parse(row[0]);const [o,h,l,c,v]=row.slice(1,6).map(Number);
+  if(!Number.isFinite(t)||![o,h,l,c,v].every(Number.isFinite)||o<=0||h<Math.max(o,c,l)||l>Math.min(o,c,h)||v<0)return null;
+  return {t,o,h,l,c,v};
+ }).filter(Boolean).sort((a,b)=>a.t-b.t);
+ const unique=new Map();for(const candle of parsed){if(closedOnly&&candle.t+intervalMs>now)continue;unique.set(candle.t,candle);}
+ return [...unique.values()];
+}
+
+return {AngelDataError,retryDelay,historicalRequest,normalizeAngelCandles};
+})();
+
+// MODULE: live-readiness.mjs
+__modules["live-readiness.mjs"] = (() => {
+// Read-only, fail-closed live market readiness assessment. Never authorizes signals.
+const parsedTime = value => {if(value==null)return NaN;const t=typeof value==='number'?value:Date.parse(value);return Number.isFinite(t)?(t<1e11?t*1000:t):NaN};
+function assessLiveReadiness({probe,now=Date.now(),marketOpen=false,calendarConfigured=false,aiVerified=false,telegramDelivered=false}={}) {
+ const blockers=[];
+ if(!calendarConfigured)blockers.push('CALENDAR_NOT_CONFIGURED');
+ if(!marketOpen)blockers.push('MARKET_CLOSED');
+ if(!aiVerified)blockers.push('AI_INFERENCE_UNVERIFIED');
+ if(!telegramDelivered)blockers.push('TELEGRAM_DELIVERY_UNVERIFIED');
+ if(!probe?.allPassed)blockers.push('BROKER_MARKET_PROBE_FAILED');
+ const result={};
+ for(const name of ['NIFTY','SENSEX']){
+  const row=probe?.indices?.[name];const issues=[];
+  if(!row?.ok)issues.push('OPTION_COVERAGE_INCOMPLETE');
+  const c=row?.coverage;
+  if(!c||!Number.isInteger(c.expected)||c.expected<1||c.quoted!==c.expected||c.fresh!==c.expected||c.withOI!==c.expected||c.withBidAsk!==c.expected)issues.push('QUOTE_DEPTH_OI_FRESHNESS_INCOMPLETE');
+  const stamp=parsedTime(row?.spotDiagnostic?.freshness?.timestamp??row?.spotDiagnostic?.freshness?.at);
+  if(!Number.isFinite(stamp)||stamp>now+5000||now-stamp>90000)issues.push('SPOT_TIMESTAMP_NOT_VERIFIED');
+  result[name]={marketDataVerified:issues.length===0,issues};
+  if(issues.length)blockers.push(name+'_DATA_NOT_VERIFIED');
+ }
+ // A successful broker probe does not establish independent option-premium forward validation.
+ blockers.push('INDEPENDENT_OPTION_FORWARD_VALIDATION_MISSING');
+ return {checkedAt:new Date(now).toISOString(),marketOpen,indices:result,blockers:[...new Set(blockers)],researchDataReady:blockers.every(x=>!x.endsWith('_DATA_NOT_VERIFIED')&&x!=='BROKER_MARKET_PROBE_FAILED'),productionSignalsAuthorized:false,ordersAuthorized:false};
+}
+
+return {assessLiveReadiness};
+})();
+
+// ENTRY: janggo-worker.mjs
+const {autoSelectPaper} = __modules["auto-paper-selection.mjs"];
+const {runScheduledPaperCycle} = __modules["scheduled-paper-cycle.mjs"];
+const {reviewAllStrategies,lastStrategyReview,reviewStrategyIndex} = __modules["strategy-review-cycle.mjs"];
+const {registerAttributedPaper,attributedPerformance} = __modules["strategy-attribution.mjs"];
+const {assessPaperCandidate,registerResearchPaper} = __modules["paper-candidate.mjs"];
+const {trackerRegister,trackerStep,trackerReport} = __modules["premium-tracker.mjs"];
+const {paperStrategySelectionReport} = __modules["strategy-selection.mjs"];
 // Pure, fail-closed CE/PE evidence gate. This module NEVER places orders or authorizes live alerts.
 const finite = x => typeof x === 'number' && Number.isFinite(x);
 const timestamp = x => { const n=typeof x==='number'?x:Date.parse(x); return Number.isFinite(n)?n:NaN; };
@@ -39,8 +474,8 @@ function evaluateOptionEvidence({underlying,options,market,now=Date.now(),market
 }
 
 // JANGGO CLOUD v60 | Pretrained-AI research scanner, read-only Angel data, Telegram alerts. No broker orders.
-import {historicalRequest,normalizeAngelCandles} from './angel-data-transport.mjs';
-import { assessLiveReadiness } from './live-readiness.mjs';
+const {historicalRequest,normalizeAngelCandles} = __modules["angel-data-transport.mjs"];
+const { assessLiveReadiness } = __modules["live-readiness.mjs"];
 const TZ='Asia/Kolkata';
 const VERSION='v101-live-readiness-audit';
 // Scanner failure recovery: clear broker failure stages and avoid repeated master fetches.
