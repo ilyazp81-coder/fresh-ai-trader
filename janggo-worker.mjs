@@ -1,6 +1,8 @@
 // JANGGO CLOUD v8 | Signal-only research with OI, market-data quality, news and explicit validation gates.
 const TZ='Asia/Kolkata';
-const VERSION='v37-quote-clock-diagnostics';
+const VERSION='v38-scan-rounding-runtime-fix';
+// Shared rounding helper used by scanner, research brain, options and paper lifecycle.
+const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
 const json=(v,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{'content-type':'application/json'}});
 const day=()=>new Date().toLocaleDateString('sv-SE',{timeZone:TZ});
 const clock=()=>new Intl.DateTimeFormat('en-GB',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
