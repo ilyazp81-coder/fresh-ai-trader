@@ -1,6 +1,6 @@
 // JANGGO CLOUD v8 | Signal-only research with OI, market-data quality, news and explicit validation gates.
 const TZ='Asia/Kolkata';
-const VERSION='v36-ist-quote-timestamp-fix';
+const VERSION='v37-quote-clock-diagnostics';
 const json=(v,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{'content-type':'application/json'}});
 const day=()=>new Date().toLocaleDateString('sv-SE',{timeZone:TZ});
 const clock=()=>new Intl.DateTimeFormat('en-GB',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
@@ -59,7 +59,7 @@ async function spotReference(e,jwt,name){
  const value=num(q?.ltp);
  if(!Number.isFinite(value)||value<=0)throw Error(name+' spot reference quote unavailable');
  const freshness=quoteTimestamp(q);
- if(freshness.state!=='FRESH')throw Error(name+' spot quote timestamp '+freshness.state+' (ageSeconds='+freshness.ageSeconds+'; cannot validate underlying direction)');
+ if(freshness.state!=='FRESH')throw Error(name+' spot quote timestamp '+freshness.state+' (ageSeconds='+freshness.ageSeconds+'; possibleIstEpochOffset='+!!freshness.possibleIstEpochOffset+'; cannot validate underlying direction)');
  return {value,exchange,token,observedAt:Date.now(),freshness,warning:'Spot quote fresh; trend alignment not yet certified'};
 }
 // Paper research is intentionally conservative: quotes lack exchange timestamps and a single
@@ -194,7 +194,11 @@ function quoteTimestamp(q){
  }
  if(!Number.isFinite(t))return {state:'UNVERIFIED',ageSeconds:null};
  const age=Math.round((Date.now()-t)/1000);
- return {state:age< -120?'FUTURE':age>180?'STALE':'FRESH',ageSeconds:age};
+ // Some broker fields are epoch-shaped but encode an IST wall-clock as UTC.
+ // Do not silently accept them as fresh: report the likely offset and require
+ // explicit validation against broker exchange time before signal eligibility.
+ const offsetCandidate=age < -120 && Math.abs(age+19800)<180;
+ return {state:age< -120?'FUTURE':age>180?'STALE':'FRESH',ageSeconds:age,possibleIstEpochOffset:offsetCandidate};
 }
 function quoteQuality(q){
  const price=num(q.ltp),volume=num(q.tradeVolume??q.volume);
@@ -686,6 +690,10 @@ async function marketDataProbe(e){
  for(const name of ['NIFTY','SENSEX']){
   const row={ok:false,underlying:name};report.indices[name]=row;
   try{
+   const ex=name==='NIFTY'?'NSE':'BSE';
+   const tok=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
+   const raw=(await quotes(e,jwt,ex,[tok])).find(x=>String(x.symbolToken??x.symboltoken??x.symbol_token??x.token)===tok);
+   if(raw){row.spotDiagnostic={exchange:ex,token:tok,ltp:Number(raw.ltp),timestampFields:{exchFeedTime:raw.exchFeedTime??null,exchTradeTime:raw.exchTradeTime??null,exchangeTime:raw.exchangeTime??null,lastTradeTime:raw.lastTradeTime??null,last_traded_time:raw.last_traded_time??null},freshness:quoteTimestamp(raw)};}
    const spot=await spotReference(e,jwt,name);row.spot=spot.value;
    const selected=select(master,name,spot.value);row.selectedContracts=selected.length;
    if(!selected.length)throw Error('No valid option contracts selected');
