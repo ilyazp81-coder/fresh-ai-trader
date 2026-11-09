@@ -1,6 +1,6 @@
 // JANGGO CLOUD v48 | Pretrained-AI research scanner, read-only Angel data, Telegram alerts. No broker orders.
 const TZ='Asia/Kolkata';
-const VERSION='v48-integrated-test-build';
+const VERSION='v49-scanstatus-fix';
 // Shared rounding helper used by scanner, research brain, options and paper lifecycle.
 const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
 const aiModel=e=>String(e.AI_MODEL||'@cf/meta/llama-3.2-3b-instruct').trim();
@@ -915,9 +915,9 @@ async function fullCheck(e){
  result.live.telegramDelivery={status:'VERIFY_BY_RECEIPT',reason:'Receiving this /fullcheck reply confirms bot outbound delivery'};
  result.readyForResearchScans=calendarConfigured(e)&&s.valid&&hasKV(e)&&result.live.angelLogin.status==='PASS';
  result.readyForVerifiedTradingSignals=false;
- // Refresh the saved report after alert attempts, so /scanstatus shows delivery outcomes.
- // This second write is best-effort and is skipped when KV is exhausted.
- result.scanSummaryUpdated=await put(e,'scan:last',result,86400);
+ // /fullcheck is read-only: never overwrite the scheduled scanner's scan:last KV record.
+ // This preserves /scanstatus timestamps, quote coverage and alert counters.
+ result.scanSummaryUpdated=false;
  return result;
 }
 
