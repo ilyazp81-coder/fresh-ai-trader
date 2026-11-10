@@ -3,20 +3,42 @@
   "main": "janggo-worker.mjs",
   "compatibility_date": "2024-01-01",
   "workers_dev": true,
+
   "ai": {
     "binding": "AI"
   },
+
   "kv_namespaces": [
     {
       "binding": "STATE",
       "id": "3b04ac24997341449fa82775ef0646ca"
     }
   ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAPER_COORDINATOR",
+        "class_name": "PaperAlertCoordinator"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "paper-coordinator-v1",
+      "new_sqlite_classes": [
+        "PaperAlertCoordinator"
+      ]
+    }
+  ],
+
   "triggers": {
     "crons": [
       "*/3 3-11 * * *"
     ]
   },
+
   "observability": {
     "logs": {
       "enabled": true,
