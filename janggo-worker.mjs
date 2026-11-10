@@ -48,7 +48,7 @@ function updatePaperOption(state,t,opts={}) {
   return {state:{position:null,trades:[...state.trades,trade],lastTickAt:t.ts},closed:true,trade};
 }
 function premiumMetrics(state) {
-  const trades=state?.trades||[];const wins=trades.filter(t=>t.net>0), losses=trades.filter(t=>t.net<0);
+  const trades=Array.isArray(state?.trades)?state.trades:[];const wins=trades.filter(t=>t.net>0), losses=trades.filter(t=>t.net<0);
   let equity=0,peak=0,drawdown=0;
   for(const t of trades){equity+=t.net;peak=Math.max(peak,equity);drawdown=Math.max(drawdown,peak-equity)}
   const profit=wins.reduce((s,t)=>s+t.net,0),loss=Math.abs(losses.reduce((s,t)=>s+t.net,0));
@@ -69,20 +69,26 @@ async function trackerRegister(kv,index,contract,levels,attribution=null){
  if(!INDEXES.has(index))throw Error('INVALID_INDEX');
  const s=await trackerRead(kv,index);if(s.position||s.pending)throw Error('TRACKER_BUSY');
  if(!contract||!contract.exchange||!contract.token||!contract.symbol||!['CE','PE'].includes(contract.side)||!contract.expiry||!Number.isInteger(contract.lotSize)||contract.lotSize<1)throw Error('INVALID_CONTRACT');
- if(!Number.isFinite(levels.stop)||!Number.isFinite(levels.target)||levels.stop<=0||levels.target<=levels.stop)throw Error('INVALID_LEVELS');
+ const expiryTime=Date.parse(String(contract.expiry)+'T15:30:00+05:30');
+ if(!Number.isFinite(expiryTime)||expiryTime<=Date.now())throw Error('EXPIRED_OR_INVALID_CONTRACT');
+ if(!levels||!Number.isFinite(levels.stop)||!Number.isFinite(levels.target)||levels.stop<=0||levels.target<=levels.stop)throw Error('INVALID_LEVELS');
+ if(!Number.isSafeInteger(levels.lots??1)||(levels.lots??1)<1||(levels.lots??1)>10000)throw Error('INVALID_LOTS');
  const next={...s,enabled:true,pending:{...contract,index,stop:levels.stop,target:levels.target,lots:levels.lots??1,registeredAt:Date.now(),...(attribution?{attribution:{...attribution}}:{})},lastError:null};
  await kv.put(key(index),JSON.stringify(next));return {status:'REGISTERED_PAPER_ONLY',index,contract:contract.symbol};
 }
 function quoteToTick(index,contract,q,now=Date.now()){
  const depth=q?.depth;const bid=Number(depth?.buy?.[0]?.price),ask=Number(depth?.sell?.[0]?.price);
  const rawTs=q?.exchFeedTime||q?.exchangeTime||q?.timestamp;
- const parsed=typeof rawTs==='number'?(rawTs<1e12?rawTs*1000:rawTs):Date.parse(rawTs||'');
+ // Angel timestamps can be epoch seconds/milliseconds, numeric strings or ISO dates.
+ // Reject missing/ambiguous timestamps rather than using local receive time.
+ const epoch=(typeof rawTs==='number' || (typeof rawTs==='string' && /^\d{10,13}$/.test(rawTs.trim())))?Number(rawTs):NaN;
+ const parsed=Number.isFinite(epoch)?(epoch<1e12?epoch*1000:epoch):Date.parse(rawTs||'');
  const volume=Number(q?.tradeVolume??q?.volume),oi=Number(q?.opnInterest??q?.openInterest??q?.oi);
  return {index,side:contract.side,symbol:contract.symbol,token:String(contract.token),expiry:contract.expiry,lotSize:contract.lotSize,bid,ask,volume,oi,ts:parsed};
 }
 async function trackerStep(kv,index,quoteProvider,{now=Date.now(),marketOpen=false,forceClose=false}={}){
  const s=await trackerRead(kv,index);if(!s.enabled||(!s.pending&&!s.position))return {status:'IDLE',index};
- if(!marketOpen)return {status:'MARKET_CLOSED_NO_NEW_QUOTES',index};
+ if(!marketOpen)return {status:'MARKET_CLOSED_NO_NEW_QUOTES',index,requiresNextSessionReconciliation:true};
  const c=s.pending||s.position;
  let q;try{q=await quoteProvider(c)}catch{return {status:'QUOTE_UNAVAILABLE',index}};
  const tick=quoteToTick(index,c,q,now);const valid=validatePremiumTick(tick,now);
@@ -90,6 +96,7 @@ async function trackerStep(kv,index,quoteProvider,{now=Date.now(),marketOpen=fal
  let next,report;
  if(s.pending){
   if(tick.ts<=s.pending.registeredAt)return {status:'WAIT',reason:'NO_POST_REGISTRATION_QUOTE',index};
+  if(s.lastTickAt!=null && tick.ts<=s.lastTickAt)return {status:'WAIT',reason:'DUPLICATE_OR_OLD_TICK',index};
   const result=openPaperOption(s,tick,{now,stop:s.pending.stop,target:s.pending.target,lots:s.pending.lots});
   if(!result.accepted)return {status:'WAIT',reason:result.reason,index};
   next={...result.state,position:{...result.state.position,exchange:c.exchange,lotSize:c.lotSize,...(c.attribution?{attribution:c.attribution}:{})},enabled:true,pending:null,lastTickAt:tick.ts};report={status:'PAPER_OPEN',index,symbol:c.symbol,entry:next.position.entry};
@@ -179,26 +186,31 @@ function evaluateStrategyCandidates(candidates,{minTrades=30,minDays=10,minProfi
   const trades=c?.trades;
   if(!Array.isArray(trades))reasons.push('NO_ATTRIBUTED_FORWARD_TRADES');
   const t=Array.isArray(trades)?trades:[];
-  const unique=new Set();let equity=0,peak=0,maxDD=0,gains=0,losses=0,wins=0;
+  const unique=new Set();let validTrades=0,equity=0,peak=0,maxDD=0,gains=0,losses=0,wins=0;
   const days=new Set();
   for(const x of t){
    if(x?.strategyId!==id||x?.frozenHash!==c?.frozenHash||!finite(x?.net)||!finite(x?.closedAt)||!finite(x?.openedAt)||x.closedAt<=x.openedAt||x?.source!=='FORWARD_PAPER'||x?.execution!=='SIMULATED_BID_ASK'){
     reasons.push('INVALID_OR_UNATTRIBUTED_TRADE');continue;
    }
    const tradeId=String(x.tradeId||'');if(!tradeId||unique.has(tradeId)){reasons.push('DUPLICATE_TRADE_ID');continue}unique.add(tradeId);
-   if(finite(c.registeredAt)&&x.openedAt<=c.registeredAt){reasons.push('PRE_REGISTRATION_TRADE');continue}
-   days.add(new Date(x.closedAt).toISOString().slice(0,10));
+   if(!finite(c.registeredAt)||x.openedAt<=c.registeredAt){reasons.push('PRE_REGISTRATION_TRADE_OR_MISSING_REGISTRATION');continue}
+   if(x.closedAt> Date.now()+60000){reasons.push('FUTURE_TRADE');continue}
+   validTrades++;
+   days.add(new Date(x.closedAt+19800000).toISOString().slice(0,10)); // India trading-session day
    equity+=x.net;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,peak-equity);
    if(x.net>0){wins++;gains+=x.net}else if(x.net<0)losses-=x.net;
   }
-  if(unique.size<minTrades)reasons.push('INSUFFICIENT_FORWARD_TRADES');
+  if(validTrades<minTrades)reasons.push('INSUFFICIENT_FORWARD_TRADES');
   if(days.size<minDays)reasons.push('INSUFFICIENT_INDEPENDENT_DAYS');
   const pf=losses>0?gains/losses:null;
   if(pf===null||pf<minProfitFactor)reasons.push('PROFIT_FACTOR_BELOW_THRESHOLD_OR_UNDEFINED');
   if(equity<=0)reasons.push('NON_POSITIVE_NET');
   if(maxDD>maxDrawdown)reasons.push('DRAWDOWN_LIMIT');
   if(c?.integrityVerified!==true)reasons.push('INTEGRITY_NOT_VERIFIED');
-  return {id,index:c?.index||null,eligibleForFurtherReview:reasons.length===0,reasons:[...new Set(reasons)],metrics:{trades:unique.size,days:days.size,wins,net:equity,profitFactor:pf,maxDrawdown:maxDD},productionSignalAllowed:false,automaticPromotion:false};
+  if(c?.historicalHoldoutPassed!==true)reasons.push('HISTORICAL_HOLDOUT_NOT_VERIFIED');
+  if(c?.costModelVerified!==true)reasons.push('OPTION_COST_MODEL_NOT_VERIFIED');
+  if(c?.brokerQuoteEvidenceVerified!==true)reasons.push('BROKER_QUOTE_EVIDENCE_NOT_VERIFIED');
+  return {id,index:c?.index||null,eligibleForFurtherReview:reasons.length===0,reasons:[...new Set(reasons)],metrics:{trades:validTrades,days:days.size,wins,net:equity,profitFactor:pf,maxDrawdown:maxDD},productionSignalAllowed:false,automaticPromotion:false};
  });
  return {status:'RESEARCH_SELECTION_ONLY',candidates:results,reviewQueue:results.filter(x=>x.eligibleForFurtherReview).map(x=>x.id),productionSignalsEnabled:false,ordersEnabled:false};
 }
@@ -305,12 +317,19 @@ async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY','SENSEX'],
   try{
    // Sequential: settle exits before considering any new paper entry.
    result.tracking=await track(index);
+   const trackingStatus=String(result.tracking?.status||'');
+   if(!['IDLE','PAPER_CLOSED','OPEN'].includes(trackingStatus)){
+    result.status='TRACKING_NOT_READY';result.reason=trackingStatus||'MISSING_TRACKING_STATUS';
+   }else if(trackingStatus==='OPEN'||trackingStatus==='PAPER_CLOSED'){
+    result.status=trackingStatus==='OPEN'?'POSITION_STILL_OPEN':'EXIT_SETTLED_WAIT_NEXT_CYCLE';
+   }else {
    result.review=await review(index);
    const evidence=await loadEvidence(index);
    if(!evidence?.market||!evidence?.options){result.status='NO_EVIDENCE';}
    else {
     result.selection=await select(index,evidence);
     result.status=result.selection?.status||'WAIT';
+   }
    }
   }catch(err){result.status='ERROR';result.reason=String(err?.message||err).slice(0,120)}
   // Store diagnostics even if a single index fails. No claims of actual fills.
@@ -321,6 +340,37 @@ async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY','SENSEX'],
 }
 
 return {runScheduledPaperCycle};
+})();
+
+// MODULE: paper-lifecycle-regression.mjs
+__modules["paper-lifecycle-regression.mjs"] = (() => {
+const {trackerRegister,trackerStep,trackerRead}=__modules["premium-tracker.mjs"];
+async function runPaperLifecycleRegression(){
+ const now=Date.parse('2026-11-10T06:00:00Z');
+ const memory=new Map();
+ const kv={async get(k){const x=memory.get(k);return x?JSON.parse(x):null},async put(k,v){memory.set(k,v)}};
+ const contract={exchange:'NFO',token:'12345',symbol:'NIFTY_TEST_CE',side:'CE',expiry:'2099-12-31',lotSize:65};
+ const quote=(ts,bid,ask)=>({depth:{buy:[{price:bid}],sell:[{price:ask}]},exchFeedTime:ts,tradeVolume:1000,opnInterest:5000});
+ const checks=[];
+ // trackerRegister uses wall clock; all test ticks are based on registration time.
+ const registration=Date.now();
+ await trackerRegister(kv,'NIFTY',contract,{stop:90,target:120,lots:1});
+ const before=await trackerStep(kv,'NIFTY',async()=>quote(registration-1000,99,100),{now:registration+1000,marketOpen:true});
+ checks.push(['pre-registration quote blocked',before.reason==='NO_POST_REGISTRATION_QUOTE']);
+ const ts=registration+1000;
+ const opened=await trackerStep(kv,'NIFTY',async()=>quote(ts,99,100),{now:ts,marketOpen:true});
+ checks.push(['fresh quote opens paper',opened.status==='PAPER_OPEN']);
+ const duplicate=await trackerStep(kv,'NIFTY',async()=>quote(ts,99,100),{now:ts+1000,marketOpen:true});
+ checks.push(['same tick cannot close paper',duplicate.status==='NOT_FORWARD_DATA'||duplicate.status==='DUPLICATE_OR_OLD_TICK']);
+ const mismatch=await trackerStep(kv,'NIFTY',async()=>quote(ts+1000,101,102),{now:ts+1000,marketOpen:false});
+ checks.push(['closed market blocks updates',mismatch.status==='MARKET_CLOSED_NO_NEW_QUOTES']);
+ const closed=await trackerStep(kv,'NIFTY',async()=>quote(ts+2000,122,123),{now:ts+2000,marketOpen:true});
+ checks.push(['target closes paper position',closed.status==='PAPER_CLOSED'&&closed.trade?.exitReason==='TARGET']);
+ const state=await trackerRead(kv,'NIFTY');
+ checks.push(['trade stored with costs',state.position===null&&state.trades.length===1&&Number.isFinite(state.trades[0].net)]);
+ return {passed:checks.filter(x=>x[1]).length,total:checks.length,cases:checks.map(([name,pass])=>({name,pass})),ordersEnabled:false};
+}
+return {runPaperLifecycleRegression};
 })();
 
 // MODULE: strategy-review-cycle.mjs
@@ -1087,13 +1137,29 @@ async function lifecycleReport(e){
 }
 async function trackPaper(e,c,price,send){
  const k=`paper:${day()}:${c.exchange}:${c.token}`,r=await get(e,k);
- if(!r||r.status!=='OPEN'||!Number.isFinite(price))return null;
- // Cannot infer intrabar SL/target from snapshots; first observed threshold wins.
+ if(!r||r.status!=='OPEN')return null;
+ // Fail closed on missing/invalid quotes and malformed stored paper levels.
+ if(!Number.isFinite(price)||price<=0||!Number.isFinite(r.entry)||r.entry<=0||
+    !Number.isFinite(r.sl)||r.sl<=0||!Number.isFinite(r.target)||r.target<=r.entry||r.sl>=r.entry)
+  return 'INVALID_PAPER_EVIDENCE';
  const status=price<=r.sl?'SL_OBSERVED':price>=r.target?'TARGET_OBSERVED':null;
- if(!status){r.last=price;await put(e,k,r,172800);return null}
- r.status=status;r.last=price;r.closedAt=Date.now();r.hypotheticalPoints=round2(price-r.entry);r.caveat='Snapshot threshold observation; not an executable fill or realized P&L';
+ if(!status){
+  r.last=price;
+  return await put(e,k,r,172800)?null:'PERSISTENCE_FAILED';
+ }
+ r.status=status;r.last=price;r.closedAt=Date.now();r.hypotheticalPoints=round2(price-r.entry);
+ r.caveat='Snapshot threshold observation; not an executable fill or realized P&L';
+ // Reserve external notification before sending. Never roll back a terminal paper state
+ // if Telegram times out: delivery is uncertain and manual reconciliation is required.
+ if(send)r.notification={status:'UNKNOWN',reservedAt:Date.now()};
  if(!await put(e,k,r,172800))return 'PERSISTENCE_FAILED';
- if(send)await telegram(e,`🧪 PAPER TRACK UPDATE — ${status}\n${r.symbol} | reference ₹${r.entry} → observed ₹${price}\nHypothetical change ${r.hypotheticalPoints} premium points. Not a fill; no orders.`);
+ if(send){
+  try{
+   await telegram(e,`🧪 PAPER TRACK UPDATE — ${status}\n${r.symbol} | reference ₹${r.entry} → observed ₹${price}\nHypothetical change ${r.hypotheticalPoints} premium points. Not a fill; no orders.`);
+   r.notification={status:'SENT',at:Date.now()};
+  }catch(err){r.notification={status:'UNKNOWN',at:Date.now(),error:String(err?.message||err).slice(0,120)};}
+  if(!await put(e,k,r,172800))return 'PERSISTENCE_FAILED_AFTER_NOTIFICATION';
+ }
  return status;
 }
 async function brainReport(e){
@@ -1170,6 +1236,17 @@ async function scanQuotesOnly(e){
      if(quality.hasOi){result.withOI++;info.withOI++}if(quality.hasSpread){result.withBidAsk++;info.withBidAsk++}
     }
    }
+   // Preserve the actual broker snapshot for audit and paper lifecycle. Never
+   // manufacture Greeks, liquidity, approvals or independent attestation.
+   const evidence={at:new Date(now).toISOString(),index:name,spot:{price:spot.value,at:new Date(spot.observedAt).toISOString(),exchange:spot.exchange,token:spot.token},contracts:cs.length,quoted:info.quoted,fresh:info.fresh,quotes:[]};
+   for(const c of cs){
+    const raw=byToken.get(String(c.token));if(!raw)continue;
+    const v=quoteQuality(raw);
+    if(v.state!=='FRESH'||!Number.isFinite(v.price)||v.price<=0)continue;
+    evidence.quotes.push({contract:{underlying:name,exchange:c.exchange,token:String(c.token),symbol:c.symbol,side:c.side,expiry:c.expiry,lotSize:c.lotSize},quote:{price:v.price,bid:v.bid,ask:v.ask,oi:v.oi,volume:v.volume,at:new Date(now-Math.max(0,v.ageSeconds||0)*1000).toISOString(),state:v.state},greeksVerified:false});
+   }
+   info.evidenceSaved=await put(e,'broker:snapshot:'+name,evidence,900);
+   if(!info.evidenceSaved)result.issues.push(name+': broker snapshot persistence failed');
    result.indices[name]=info;
   }catch(err){result.issues.push(name+': '+String(err.message).slice(0,150))}
  }
@@ -1319,7 +1396,7 @@ async function scan(e,{send=true}={}){
  kvWriteCount=0;kvWriteSkipped=0;kvWriteErrors=[];
  if(!marketOpen(e))return {at:new Date().toISOString(),mode:'MARKET_CLOSED',reason:sessionConfig(e).reason||'Outside session',contracts:0,quoted:0,issues:[]};
  const now=Date.now(), previous=await get(e,`rolling:${day()}`)||{},next={...previous};
- const result={version:VERSION,at:new Date(now).toISOString(),marketOpen:true,mode:'COMPACT_RESEARCH_SCAN',contracts:0,quoted:0,quoteFresh:0,quoteStale:0,quoteUnverified:0,withOI:0,withBidAsk:0,researchCandidates:0,researchAlerts:0,strategyWatches:[],strategyWaitReasons:{},issues:[],indices:{},verifiedBuySellSignals:false};
+ const result={paperContractEvidence:{},version:VERSION,at:new Date(now).toISOString(),marketOpen:true,mode:'COMPACT_RESEARCH_SCAN',contracts:0,quoted:0,quoteFresh:0,quoteStale:0,quoteUnverified:0,withOI:0,withBidAsk:0,researchCandidates:0,researchAlerts:0,strategyWatches:[],strategyWaitReasons:{},issues:[],indices:{},verifiedBuySellSignals:false};
  // Fetch independent login and instrument metadata concurrently to reduce cold-start latency.
  // allSettled prevents an unhandled rejection when either source fails.
  const [authResult,masterResult]=await Promise.allSettled([session(e),instruments(e)]);
@@ -1355,6 +1432,7 @@ async function scan(e,{send=true}={}){
     if(!hist.length||now-hist[hist.length-1].t>=120000)hist.push({t:now,p:quality.price,v:quality.volume,oi:quality.oi});next[key]=hist;
     const verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
     if(verdict.status==='RESEARCH_WATCH'){
+     result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange};
      result.researchCandidates++;
      if(result.strategyWatches.length<8)result.strategyWatches.push(verdict);
     }else result.strategyWaitReasons[verdict.reason]=(result.strategyWaitReasons[verdict.reason]||0)+1;
@@ -1379,7 +1457,7 @@ async function scan(e,{send=true}={}){
  result.kvWritesAttempted=kvWriteCount;result.kvWritesSkipped=kvWriteSkipped;
  // Publish a useful health checkpoint before alerts, including zero-candidate scans.
  // A single normal scan now uses one rolling-state write and one summary write.
- result.scanHealthy=result.contracts>0&&result.quoted===result.contracts&&result.quoteFresh===result.quoted&&result.issues.length===0&&result.kvStateSaved===true;
+ result.scanHealthy=result.contracts>0&&result.quoted>0&&result.quoteFresh>0&&result.issues.length===0&&result.kvStateSaved===true;result.fullQuoteCoverage=result.quoted===result.contracts&&result.quoteFresh===result.quoted;
  result.readyForVerifiedTradingSignals=false;
  result.scanSummarySaved=false;
  result.scanSummarySaved=await put(e,'scan:last',{...result,scanSummarySaved:true},86400);
@@ -1413,7 +1491,7 @@ async function scan(e,{send=true}={}){
  // CRITICAL: sendDirectionalAlerts checks scanHealthy. This must be computed
  // BEFORE calling it; otherwise a successful first scan silently blocks all BUY
  // CE/PE alerts because the field is undefined until the end of the function.
- result.scanHealthy=result.contracts>0&&result.quoted===result.contracts&&result.quoteFresh===result.quoted&&result.issues.length===0&&result.kvStateSaved===true&&result.scanSummarySaved===true;
+ result.scanHealthy=result.contracts>0&&result.quoted>0&&result.quoteFresh>0&&result.issues.length===0&&result.kvStateSaved===true&&result.scanSummarySaved===true;result.fullQuoteCoverage=result.quoted===result.contracts&&result.quoteFresh===result.quoted;
  if(send){
   const alertKey='directional-alerts:'+day();
   if((await get(e,alertKey))===null){
@@ -1591,6 +1669,45 @@ async function discover(e){
  await put(e,id,proposal,86400*90);await put(e,'discovery:index',[...index,id].slice(-50),86400*90);
  const result={at:Date.now(),id,proposal};await put(e,'discovery:last',result,6*3600);
  return {stored:true,...result,warning:'AI hypothesis only. Use /validate nifty or /validate sensex for limited index-only research proxy backtests. No strategy promotion or trading signal.'};
+}
+// Autonomous research scheduler: bounded, resumable and fail-closed. It does not
+// equate an index-only proxy with an option strategy or authorize live signals.
+async function autonomousResearchCycle(e){
+ const now=Date.now(), key='research:auto:last';
+ if(!hasKV(e))return {status:'SKIPPED',reason:'KV_UNAVAILABLE',signalsEnabled:false};
+ const previous=await get(e,key);
+ if(previous?.at && now-Number(previous.at)<20*3600000)return {status:'SKIPPED',reason:'DAILY_RESEARCH_ALREADY_ATTEMPTED',previous,signalsEnabled:false};
+ // Write before making network calls to avoid repeated AI requests on cron retries.
+ const result={at:now,status:'STARTED',stages:[],signalsEnabled:false,ordersPlaced:false};
+ await put(e,key,result,86400*4);
+ try{
+  const proposed=await discover(e);
+  result.stages.push({name:'AI_DISCOVERY',status:proposed.stored?'STORED':proposed.duplicate?'DUPLICATE':'CACHED',id:proposed.id||null});
+ }catch(err){result.stages.push({name:'AI_DISCOVERY',status:'FAILED',reason:String(err.message||err).slice(0,120)})}
+ for(const index of ['NIFTY','SENSEX']){
+  try{
+   const validated=await validateHypotheses(e,index);
+   result.stages.push({name:'HISTORICAL_PROXY_'+index,status:'COMPLETED',tested:validated.tested||0,optionPremiumValidated:false});
+   // Automatically preregister eligible hypotheses BEFORE future observations arrive.
+   // Historical index-proxy tests never authorize option signals or strategy promotion.
+   for(const candidate of (Array.isArray(validated.results)?validated.results:[]).slice(0,5)){
+    if(candidate.researchEvidence!=='MINIMUM_COUNTS_MET_NOT_VALIDATED'){
+     result.stages.push({name:'FORWARD_ENROLL_'+index,status:'SKIPPED_INSUFFICIENT_HISTORY',id:candidate.id});
+     continue;
+    }
+    try{
+     const enrolled=await forwardRegister(e,index,candidate.id);
+     result.stages.push({name:'FORWARD_ENROLL_'+index,status:enrolled.ok?(enrolled.alreadyRegistered?'ALREADY_REGISTERED':'REGISTERED'):'BLOCKED',id:candidate.id,reason:enrolled.ok?null:enrolled.error});
+    }catch(enrollErr){
+     result.stages.push({name:'FORWARD_ENROLL_'+index,status:'FAILED',id:candidate.id,reason:String(enrollErr.message||enrollErr).slice(0,120)});
+    }
+   }
+  }catch(err){result.stages.push({name:'HISTORICAL_PROXY_'+index,status:'FAILED',reason:String(err.message||err).slice(0,120)})}
+ }
+ result.status=result.stages.some(x=>['FAILED','BLOCKED'].includes(x.status))?'PARTIAL':'COMPLETED';
+ result.finishedAt=Date.now();
+ await put(e,key,result,86400*4);
+ return result;
 }
 async function discoveryReport(e){const keys=(await get(e,'discovery:index'))||[];const rows=(await Promise.all(keys.slice(-12).map(k=>get(e,k)))).filter(Boolean);return {version:VERSION,countInRecentIndex:keys.length,proposals:rows.map(x=>({name:x.name,family:x.family,status:x.status,requiredData:x.requiredData,generatedAt:x.generatedAt})),note:'Generated hypotheses are NOT trained, backtested, verified, or active. Curated public project README excerpts may inform new hypotheses, but strategies are not imported, audited, backtested, or active.'}}
 
@@ -2322,12 +2439,21 @@ function integratedPerformance(trades){
 function integratedOptionGate(x){
  const reasons=[];
  if(!x||!['CE','PE'].includes(x.side))reasons.push('SIDE_INVALID');
- if(!x?.expiry||!(Date.parse(x.expiry+'T15:30:00+05:30')>Date.now()))reasons.push('EXPIRY_INVALID');
- if(!(Number.isFinite(x?.bid)&&Number.isFinite(x?.ask)&&x.bid>0&&x.ask>=x.bid))reasons.push('BID_ASK_INVALID');
+ // The expiry is an exchange-local calendar date, not a UTC midnight instant.
+ const expiry=typeof x?.expiry==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(x.expiry)?Date.parse(x.expiry+'T15:30:00+05:30'):NaN;
+ if(!Number.isFinite(expiry)||expiry<=Date.now()||new Date(expiry).toISOString().slice(0,10)==='')reasons.push('EXPIRY_INVALID');
+ const bid=x?.bid,ask=x?.ask;
+ if(!(Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>=bid))reasons.push('BID_ASK_INVALID');
+ else if((ask-bid)/((ask+bid)/2)*100>2)reasons.push('SPREAD_TOO_WIDE');
  if(!(Number.isFinite(x?.volume)&&x.volume>0&&Number.isFinite(x?.oi)&&x.oi>0))reasons.push('VOLUME_OI_MISSING');
- if(!(Number.isFinite(x?.delta)&&Number.isFinite(x?.theta)&&Number.isFinite(x?.gamma)&&Number.isFinite(x?.iv)))reasons.push('GREEKS_UNVERIFIED');
+ if(!(Number.isFinite(x?.delta)&&Math.abs(x.delta)<=1&&Math.abs(x.delta)>0&&Number.isFinite(x?.theta)&&Number.isFinite(x?.gamma)&&x.gamma>=0&&Number.isFinite(x?.iv)&&x.iv>0))reasons.push('GREEKS_UNVERIFIED');
+ // A quote without an exchange timestamp must not be treated as fresh.
+ const timestamp=x?.quoteTimestamp;
+ if(!Number.isFinite(timestamp))reasons.push('QUOTE_TIMESTAMP_MISSING');
+ else if(timestamp>Date.now()+5000||Date.now()-timestamp>10000)reasons.push('QUOTE_STALE');
  return {eligible:reasons.length===0,reasons};
 }
+
 function integratedSignalGate(x){
  const reasons=[];
  if(!x?.historicallyValidated)reasons.push('BACKTEST_UNVERIFIED');
@@ -2359,6 +2485,9 @@ async function integratedTenModuleAudit(e){
   validRiskCase:integratedRiskGate({sessionOpen:true,quoteAgeMs:0,spreadPct:1,volume:10,oi:20}).allowed,
   missingGreeks:!integratedOptionGate({side:'CE',expiry:'2099-01-01',bid:100,ask:101,volume:100,oi:100}).eligible,
   invalidExpiry:!integratedOptionGate({side:'CE',expiry:'2020-01-01',bid:100,ask:101,volume:100,oi:100,delta:0.5,theta:-1,gamma:0.01,iv:20}).eligible,
+  wideOptionSpread:!integratedOptionGate({side:'CE',expiry:'2099-01-01',bid:100,ask:105,volume:100,oi:100,delta:0.5,theta:-1,gamma:0.01,iv:20,quoteTimestamp:Date.now()}).eligible,
+  freshVerifiedOption:integratedOptionGate({side:'CE',expiry:'2099-01-01',bid:100,ask:101,volume:100,oi:100,delta:0.5,theta:-1,gamma:0.01,iv:20,quoteTimestamp:Date.now()}).eligible,
+  staleOptionQuote:!integratedOptionGate({side:'CE',expiry:'2099-01-01',bid:100,ask:101,volume:100,oi:100,delta:0.5,theta:-1,gamma:0.01,iv:20,quoteTimestamp:Date.now()-20000}).eligible,
   noUnverifiedSignal:!integratedSignalGate({historicallyValidated:false,forwardValidated:false}).sendBuySell,
   performanceMath:(()=>{const p=integratedPerformance([{net:100,costsIncluded:true},{net:-40,costsIncluded:true}]);return p.netPnL===60&&p.maxDrawdown===40&&p.profitFactor===2.5})()
  };
@@ -2368,7 +2497,115 @@ async function integratedTenModuleAudit(e){
  return result;
 }
 
-async function handle(e,u){const m=u.message||u.edited_message;if(String(m?.chat?.id)!==String(e.TELEGRAM_CHAT_ID))return;const raw=String(m.text||'').trim();if(!raw)return;const cmd=raw.split(/\s+/)[0].split('@')[0].toLowerCase();let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud '+VERSION+' — scheduled scan diagnostics, 3-minute research scan\n/status configuration\n/aimodel pretrained model configuration\n/testangel broker login test\n/scan live option research watch\n/nifty /sensex AI checklist\n/briefing pre-market news\n/news dated news headlines\n/newsquality news feed freshness\n/dataquality data limitations\n/readiness honest deployment readiness\n/diagnostics config, broker-data and signal readiness\n/liveprobe broker login, AI inference and Telegram configuration\n/marketprobe live spot and option quote data verification\n/livereadiness — fail-closed combined broker coverage audit\n/scanstatus actual scheduled scan result (read-only)\n/strategywatch observation-based strategy research\n/fullcheck single-command live system diagnostics\n/batchcheck combined scanner, news, strategy and paper audit\n/batchprobe batch audit plus live AI/broker checks\n/finalcheck consolidated configuration and honest signal-readiness gate\n/paper /performance paper research counts\n/forwardaudit — independent forward-test readiness and blockers\n/forwardstart nifty hypothesis:ID — preregister an historically tested research hypothesis\n/forwardregistry — list frozen forward research registrations\n/forwardintegrity — audit frozen specs and baseline provenance\n/forwardobserve nifty hypothesis:ID — capture new post-registration CLOSED index candles\n/forwardobservations nifty hypothesis:ID — view observation count\n/forwardperformance nifty hypothesis:ID — index proxy performance\n/forwardauto — latest automatic collection status\n/brain — research brain status\n/discover — generate one AI research hypothesis (not a signal)\n/hypotheses — list stored research hypotheses\n/validate nifty or sensex — historical index-only proxy validation\n/strategies — strategy knowledge and data requirements\n/opensource — public documentation source health\n/researchbatch — ten historical-data checks for both indices (read-only)\n/backtest nifty or /backtest sensex — historical benchmark\n/marketintel nifty or /marketintel sensex — 1m/3m/5m/15m index research\n/options nifty or /options sensex — broker OI, PCR, Greeks coverage\n/decision nifty or /decision sensex — integrated evidence and WAIT gate\n/evidence nifty or /evidence sensex — explainable multi-source research bias (not a trade signal)\n/researchgate nifty or /researchgate sensex — validation audit and no-promotion gate\n/signals — observed shadow signal lifecycle, NOT trade signals\n/signalpreview nifty or /signalpreview sensex — clearly simulated Telegram alert format\n/signalstatus — automatic AI-assisted candidate alert status\n/pipelinecheck nifty or sensex — independent evidence readiness audit\n/refreshresearch nifty or sensex — refresh broker candles and option metrics (read-only)\n/calendar — configured trading session and scheduling status\n/calendarrefresh — retry official NSE F&O calendar retrieval (read-only)\n/holidayaudit — explain manual vs official holiday match\n/batchsafety — ten independent calendar and safety checks\n/brokerbatch — read-only broker login, quote input gates and market probe\n/quickstatus — single concise status and experimental alerts\n/scanissues — exact scan failures, quote coverage and alert blockers\n/offlineaudit — holiday-safe Angel login and instrument master integration audit\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/aimodel')out=`Pretrained Cloudflare Workers AI model: ${aiModel(e)}\nNo self-learning or automatic model changes. Model availability must be tested on deployment.`;else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode AI_ASSISTED_RESEARCH_ALERTS ${VERSION}\nHoliday calendar ${calendarConfigured(e)?'configured':'MISSING — scheduled scans blocked'}`;else if(cmd==='/signalpreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=signalPreview(name)}else if(cmd==='/pipelinecheck'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await pipelineReadiness(e,name),null,2)}else if(cmd==='/refreshresearch'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';const jobs=await Promise.allSettled([marketIntelligence(e,name),optionsIntelligence(e,name)]);out=JSON.stringify({index:name,at:new Date().toISOString(),marketIntelligence:jobs[0].status==='fulfilled'?'REFRESHED':String(jobs[0].reason?.message||jobs[0].reason).slice(0,160),optionsIntelligence:jobs[1].status==='fulfilled'?'REFRESHED':String(jobs[1].reason?.message||jobs[1].reason).slice(0,160),readiness:await pipelineReadiness(e,name),signalsEnabled:false,ordersPlaced:false},null,2)}else if(cmd==='/signalstatus'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,directionalReview:r?.directionalReview||null,directionalAlertsSent:r?.directionalAlertsSent||0,directionalAlertsSkipped:r?.directionalAlertsSkipped||'',issues:r?.issues||[],verifiedProductionSignals:false,note:'Snapshot-based signals are not independently validated; no orders.'},null,2)}else if(cmd==='/testangel'){try{await session(e);out='✅ Angel login succeeded. No orders placed. Quote access separately unverified.'}catch(err){out='❌ Angel login failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scanQuotesOnly(e),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await groundedAnalysis(e,cmd==='/nifty'?'NIFTY':'SENSEX');else if(cmd==='/briefing')out=await briefing(e);else if(cmd==='/brain')out=JSON.stringify(await brainReport(e),null,2);else if(cmd==='/learning')out='Disabled: pretrained AI only; no self-learning.';else if(cmd==='/strategies')out=JSON.stringify(strategyReadiness(),null,2);else if(cmd==='/discover'){try{out=JSON.stringify(await discover(e),null,2)}catch(err){out='Research discovery unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/hypotheses'){try{out=JSON.stringify(await discoveryReport(e),null,2)}catch(err){out='Hypothesis registry unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/opensource'){try{out=JSON.stringify(openSourceReport(await openSourceKnowledge(e)),null,2)}catch(err){out='Open-source documentation unavailable: '+String(err.message).slice(0,200)}}else if(cmd==='/integratedaudit')out=JSON.stringify(await integratedTenModuleAudit(e),null,2);else if(cmd==='/researchbatch'){out=JSON.stringify(await unifiedResearchBatch(e),null,2)}else if(cmd==='/backtest'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await backtestResearch(e,name),null,2)}catch(err){out='Backtest unavailable: '+String(err.message).slice(0,250)}}else if(cmd==='/validate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await validateHypotheses(e,name),null,2)}catch(err){out='Research validation unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/marketintel'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await marketIntelligence(e,name),null,2)}catch(err){out='Multi-timeframe research unavailable: '+String(err.message).slice(0,240)}}else if(cmd==='/newsquality'){const n=await newsDigest(e);out=JSON.stringify({at:new Date(n.at).toISOString(),coverage:n.coverage,sources:n.sourceStatus,issues:n.issues,latest:n.items.slice(0,3),staleFallback:!!n.staleFallback,verifiedArticles:false,economicCalendarIntegrated:false},null,2)}else if(cmd==='/news'){const n=await newsDigest(e);out='📰 NEWS HEADLINE CONTEXT (not independently verified)\n'+n.items.slice(0,8).map(x=>'• '+x.source+': '+x.title).join('\n')+'\nIssues: '+(n.issues.join('; ')||'none')+'\nNot an entry signal.';}else if(cmd==='/options'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{const o=await optionsIntelligence(e,name);out=JSON.stringify({...o,chain:o.chain?.slice(0,8)},null,2)}catch(err){out='Options intelligence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/decision'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await integratedResearch(e,name),null,2)}else if(cmd==='/evidence'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await decisionEvidence(e,name),null,2)}catch(err){out='Evidence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/researchgate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await researchGate(e,name),null,2)}else if(cmd==='/signals')out=JSON.stringify(await lifecycleReport(e),null,2);else if(cmd==='/calendar')out=calendarMessage(e)+'\nLast refresh: '+JSON.stringify(await get(e,calendarAuditKey)||{status:'NOT_ATTEMPTED'});else if(cmd==='/calendarrefresh')out=JSON.stringify({version:VERSION,refresh:await refreshExchangeCalendar(e,{force:true}),audit:await get(e,calendarAuditKey),calendarConfigured:calendarConfigured(e),nseOnly:true,bseVerified:false,ordersPlaced:false},null,2);else if(cmd==='/scanstatus')out=JSON.stringify(await scanStatus(e),null,2);else if(cmd==='/strategywatch'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,watches:r?.strategyWatches||[],aiReview:r?.aiReview||null,waitReasons:r?.strategyWaitReasons||{},verifiedBuySellSignals:false,note:'Research only; snapshots are not candles. No live recommendations or orders.'},null,2)}else if(cmd==='/batchcheck'||cmd==='/batchprobe')out=JSON.stringify(await batchAudit(e,cmd==='/batchprobe'),null,2);else if(cmd==='/scanissues')out=JSON.stringify(await pipelineTriage(e),null,2);else if(cmd==='/offlineaudit')out=JSON.stringify(await offlineIntegrationAudit(e),null,2);else if(cmd==='/quickstatus'){const x=await get(e,'scan:last');out=JSON.stringify({version:VERSION,marketOpen:marketOpen(e),session:sessionConfig(e),holidayEvidence:holidayEvidence(e),lastScanAt:x?.at||null,scanHealthy:!!x?.scanHealthy,experimentalBuySellAlertsSent:x?.directionalAlertsSent||0,experimentalAlertsSkipped:x?.directionalAlertsSkipped||'NO_SCAN',signalMode:'EXPERIMENTAL_ONLY_NOT_VALIDATED',ordersEnabled:false},null,2)}else if(cmd==='/brokerbatch')out=JSON.stringify(await brokerBatchAudit(e),null,2);else if(cmd==='/batchsafety')out=JSON.stringify(batchSafetyAudit(e),null,2);else if(cmd==='/holidayaudit')out=JSON.stringify({version:VERSION,session:sessionConfig(e),evidence:holidayEvidence(e),safety:'Holiday match does not automatically authorize trading'},null,2);else if(cmd==='/repaircheck'){const [n,d,st]=await Promise.allSettled([newsDigest(e),systemDiagnostics(e),scanStatus(e)]);const value=r=>r.status==='fulfilled'?r.value:{error:String(r.reason?.message||r.reason).slice(0,150)};const news=value(n);out=JSON.stringify({version:VERSION,at:new Date().toISOString(),modules:{news:{sources:news.sourceStatus||[],relevantHeadlines:news.items?.length||0,staleFallback:!!news.staleFallback,issues:news.issues||[],sample:(news.items||[]).slice(0,3)},angel:{credentialsConfigured:cfg(e).length===0,loginNotProbed:true},niftyAndSensex:{scanner:value(st),dataStatus:'LIVE_MARKET_PROBE_REQUIRED'},ai:{binding:!!e.AI,productionStrategyValidated:false},paper:{automaticResearchOnly:true},telegram:{transportConfigured:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID},risk:{realOrdersDisabled:true,signalsFailClosed:true}},diagnostics:value(d),verifiedProductionSignals:false,ordersPlaced:false},null,2);}else if(cmd==='/fullcheck')out=JSON.stringify(await fullCheck(e),null,2);else if(cmd==='/finalcheck')out=JSON.stringify(staticAudit(e),null,2);else if(cmd==='/diagnostics')out=JSON.stringify(await systemDiagnostics(e),null,2);else if(cmd==='/liveprobe')out=JSON.stringify(await liveProbe(e),null,2);else if(cmd==='/livereadiness'){const probe=await marketDataProbe(e);const report=assessLiveReadiness({probe,marketOpen:marketOpen(e),calendarConfigured:calendarConfigured(e)});out=JSON.stringify({...report,aiVerified:false,telegramDelivered:false,note:'AI and Telegram cannot be certified by a broker-only probe; use /liveprobe and verify delivery independently.'},null,2)}else if(cmd==='/marketprobe')out=JSON.stringify(await marketDataProbe(e),null,2);else if(cmd==='/readiness'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,worker:true,kv:hasKV(e),aiBinding:!!e.AI,missingSecrets:cfg(e),holidayCalendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),lastScan:r,spotAwareContractSelection:true,singleSnapshotWatchAlertsDisabled:true,verifiedLiveSignals:false,shadowLifecycleTracking:true,historicalBenchmarkAvailable:true,multiTimeframeResearchAvailable:true,aiProxyValidationAvailable:true,verifiedHistoricalBacktests:false,verifiedGreeks:false,verifiedUnderlyingConfirmation:false,quoteTimestampGate:true,verifiedNews:false,datedHeadlineFreshnessGate:true,verifiedStrategySelfImprovement:false,aiHypothesisGeneration:true,automaticStrategyPromotion:false,curatedOpenSourceReadmeRetrieval:true,automatedOrders:false},null,2)}else if(cmd==='/dataquality'){const r=await get(e,'scan:last');out=JSON.stringify({lastScan:r,checks:'Fresh broker timestamp, OI and bid/ask spread required for research alerts. Quotes without parseable timestamps are counted but excluded from research lifecycle updates. Basic historical research exists; production-grade backtesting, verified Greeks and verified news are not established.'},null,2)}else if(cmd==='/forwardstart'){const parts=raw.split(/\s+/);const name=String(parts[1]||'').toUpperCase();out=JSON.stringify(await forwardRegister(e,name,parts[2]||''),null,2)}else if(cmd==='/forwardregistry')out=JSON.stringify(await forwardRegistry(e),null,2);else if(cmd==='/forwardintegrity')out=JSON.stringify(await forwardIntegrity(e),null,2);else if(cmd==='/forwardobserve'){const p=raw.split(/\s+/);try{out=JSON.stringify(await forwardObserve(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}catch(err){out='Forward observation failed: '+String(err.message).slice(0,180)}}else if(cmd==='/forwardobservations'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardObservations(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/forwardperformance'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardPerformance(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/papercandidate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(assessPaperCandidate({index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/paperresearchstart'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await registerResearchPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/autopaper'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await autoSelectPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/attributedperformance'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await attributedPerformance(e.STATE,name),null,2)}else if(cmd==='/attributedpaperstart'){const p=raw.split(/\s+/);try{const index=String(p[1]||'').toUpperCase();out=JSON.stringify(await registerAttributedPaper(e.STATE,index,p[2],{exchange:p[3],token:p[4],symbol:p[5],side:p[6],expiry:p[7],lotSize:Number(p[8])},{stop:Number(p[9]),target:Number(p[10]),lots:Number(p[11]||1)}),null,2)}catch(err){out='Attributed paper registration rejected: '+String(err.message)}}else if(cmd==='/strategyreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await lastStrategyReview(e.STATE,name),null,2)}else if(cmd==='/strategyselect'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await paperStrategySelectionReport(e.STATE,name),null,2)}else if(cmd==='/premiumreport'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await trackerReport(e.STATE,name),null,2)}else if(cmd==='/premiumregister'){const p=raw.split(/\s+/);const name=String(p[1]||'').toUpperCase();try{out=JSON.stringify(await trackerRegister(e.STATE,name,{exchange:p[2],token:p[3],symbol:p[4],side:p[5],expiry:p[6],lotSize:Number(p[7])},{stop:Number(p[8]),target:Number(p[9]),lots:Number(p[10]||1)}),null,2)}catch(err){out='Paper registration rejected: '+String(err.message)}}else if(cmd==='/forwardauto')out=JSON.stringify(await get(e,'forward:lastAuto')||{status:'NO_AUTOMATIC_COLLECTION_YET'},null,2);else if(cmd==='/optiongate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(evaluateOptionEvidence({underlying:name,options:await get(e,'options:'+name),market:await get(e,'marketintel:'+name),marketOpen:marketOpen(e),forwardCertified:false}),null,2)}else if(cmd==='/forwardaudit')out=JSON.stringify(await forwardAudit(e),null,2);else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else if(cmd.startsWith('/'))out=`Unknown JANGGO command: ${cmd}\nUse /help. Trading commands are never routed to general AI.`;else out=await ai(e,raw);await telegram(e,out)}
+
+// Historical option-premium walk-forward research. Never places orders or promotes signals.
+function optionReplay(candles,{feePerRoundTrip=40,slippagePct=0.001,quantity=1}={}){
+ if(!Array.isArray(candles)||candles.length<90)throw Error('At least 90 historical option candles required');
+ if(!Number.isInteger(quantity)||quantity<1||!Number.isFinite(feePerRoundTrip)||feePerRoundTrip<0||!Number.isFinite(slippagePct)||slippagePct<0||slippagePct>0.1)throw Error('INVALID_REPLAY_ASSUMPTIONS');
+ const split=Math.floor(candles.length*.7),trades=[];
+ // Historical bars must not be from the future or span an impossible intraday gap.
+ // Session/overnight gaps are permitted; intraday gaps are disclosed below.
+ const audit={largeGaps:0,maxGapMinutes:0,firstAt:null,lastAt:null};
+ const auditNow=Date.now();
+ // Never train on a trade whose exit crosses the chronological holdout boundary.
+ // Require strictly increasing timestamps and valid option OHLC before replay.
+ for(let k=0;k<candles.length;k++){const b=candles[k];if(!Number.isFinite(b.t)||!Number.isFinite(b.o)||!Number.isFinite(b.h)||!Number.isFinite(b.l)||!Number.isFinite(b.c)||b.l<=0||b.h<b.l||b.o<b.l||b.o>b.h||b.c<b.l||b.c>b.h||(k>0&&b.t<=candles[k-1].t))throw Error('INVALID_OPTION_CANDLE_AT_'+k)}
+ for(let k=0;k<candles.length;k++){
+  const b=candles[k];
+  if(b.t>auditNow+300000)throw Error('FUTURE_OPTION_CANDLE_AT_'+k);
+  if(k){const minutes=(b.t-candles[k-1].t)/60000;
+   if(minutes>5.5){audit.largeGaps++;audit.maxGapMinutes=Math.max(audit.maxGapMinutes,minutes)}
+  }
+ }
+ audit.firstAt=new Date(candles[0].t).toISOString();
+ audit.lastAt=new Date(candles[candles.length-1].t).toISOString();
+ // Deterministic research baseline, not an AI-discovered profitable strategy.
+ // Signal uses only bars up to i; entry is next bar open. Stop wins on same-bar ambiguity.
+ for(let i=22;i<candles.length-1;){
+  const a=candles.slice(i-20,i).map(x=>x.c),mean=a.reduce((x,y)=>x+y,0)/a.length;
+  const current=candles[i];
+  if(!(current.c>mean&&current.c>candles[i-1].h)){i++;continue}
+  const entryBar=candles[i+1],entry=entryBar.o*(1+slippagePct);
+  // A train trade must exit before holdout begins; skip boundary-crossing candidates.
+  if(i+1<split&&i+13>=split){i=split;continue}
+  if(!Number.isFinite(entry)||entry<=0){i++;continue}
+  const stop=entry*.96,target=entry*1.08;
+  let exit=entry,reason='end',exitIndex=i+1;
+  // Intraday-only replay: never carry a position into the next IST session.
+  // A next-day entry bar is not a valid execution for yesterday's signal.
+  const istDay=t=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(t));
+  const entryDay=istDay(entryBar.t);
+  if(istDay(current.t)!==entryDay){i++;continue}
+  // Prevent a TRAIN entry from reading or exiting on HOLDOUT bars.
+  let lastIndex=Math.min(candles.length-1,i+12,i+1<split?split-1:candles.length-1);
+  // No new simulated option positions in the last 15 minutes of regular NSE trading.
+  // This replay covers regular sessions; special-session execution requires its own calendar.
+  const istClockMinutes=t=>{const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(t));return Number(parts.find(x=>x.type==='hour').value)*60+Number(parts.find(x=>x.type==='minute').value)};
+  const entryMinute=istClockMinutes(entryBar.t);
+  if(entryMinute<9*60+15||entryMinute>=15*60+15){i++;continue}
+  while(lastIndex>i+1&&(istDay(candles[lastIndex].t)!==entryDay||istClockMinutes(candles[lastIndex].t)>=15*60+30))lastIndex--;
+  if(istDay(candles[lastIndex].t)!==entryDay||istClockMinutes(candles[lastIndex].t)>=15*60+30){i++;continue}
+  for(let j=i+1;j<=lastIndex;j++){
+   const b=candles[j];
+   if(istDay(b.t)!==entryDay)break;
+   exitIndex=j;
+   // A gap below stop fills at the worse available open, never at an
+   // impossible stop price. A gap above target fills conservatively at target.
+   // On entry bar the buy occurs at open, so no pre-entry prices are used.
+   if(b.o<=stop){exit=b.o*(1-slippagePct);reason='gap_stop';break}
+   if(b.o>=target){exit=target*(1-slippagePct);reason='gap_target';break}
+   // Stop takes precedence when both levels occur in the same OHLC bar.
+   if(b.l<=stop){exit=stop*(1-slippagePct);reason='stop';break}
+   if(b.h>=target){exit=target*(1-slippagePct);reason='target';break}
+   exit=b.c*(1-slippagePct);reason='time';
+  }
+  // If the holding horizon ends without SL/target, close at that bar's close.
+  // Earlier versions accidentally retained the entry price for some exits.
+  if(reason==='end'){exit=candles[exitIndex].c*(1-slippagePct);reason='session_close'}
+  const gross=(exit-entry)*quantity,net=gross-feePerRoundTrip;
+  trades.push({entryAt:entryBar.t,exitAt:candles[exitIndex].t,entry:+entry.toFixed(3),exit:+exit.toFixed(3),gross:+gross.toFixed(2),net:+net.toFixed(2),reason,segment:i+1<split?'TRAIN':'HOLDOUT'});
+  i=Math.max(i+1,exitIndex+1);
+ }
+ const summary=rows=>{const wins=rows.filter(x=>x.net>0),loss=rows.filter(x=>x.net<0),profit=wins.reduce((v,x)=>v+x.net,0),lossAbs=-loss.reduce((v,x)=>v+x.net,0);let equity=0,peak=0,drawdown=0;for(const x of rows){equity+=x.net;peak=Math.max(peak,equity);drawdown=Math.max(drawdown,peak-equity)}return {trades:rows.length,netPnl:+equity.toFixed(2),winRate:rows.length?+(100*wins.length/rows.length).toFixed(2):null,profitFactor:lossAbs>0?+(profit/lossAbs).toFixed(3):null,maxDrawdown:+drawdown.toFixed(2)}};
+ return {candles:candles.length,dataAudit:audit,splitAt:new Date(candles[split].t).toISOString(),train:summary(trades.filter(x=>x.segment==='TRAIN')),holdout:summary(trades.filter(x=>x.segment==='HOLDOUT')),recentTrades:trades.slice(-8),assumptions:{quantity,feePerRoundTrip,slippagePct,stopPct:4,targetPct:8},limitations:['Historical option OHLC is not executable bid/ask quotes; stop gaps filled at worse open','Synthetic slippage and fees, not broker-confirmed charges','No verified Greeks or liquidity; no autonomous strategy validation','Chronological train/holdout boundary trades excluded','One contract only, short sample, selection bias possible','Intraday-only replay: entry and exit must occur in the same IST session','Regular-session entries restricted to 09:15–15:14 IST; exits before 15:30 IST','TRAIN replay cannot read HOLDOUT bars','Research only; no orders or production signals']};
+}
+function offlineReplayRegression(){
+ const base=Date.now()-120*300000;
+ const bars=Array.from({length:110},(_,i)=>{const o=100+i*.1;return {t:base+i*300000,o,h:o+2,l:o-2,c:o+1}});
+ const checks={};
+ const attempt=(name,arr,expected)=>{try{optionReplay(arr);checks[name]=expected==='OK'}catch(err){checks[name]=String(err.message).startsWith(expected)}};
+ attempt('validSequence',bars,'OK');
+ attempt('duplicateTimestamp',bars.map((x,i)=>i===8?{...x,t:bars[7].t}:x),'INVALID_OPTION_CANDLE');
+ attempt('invalidOHLC',bars.map((x,i)=>i===8?{...x,l:x.h+1}:x),'INVALID_OPTION_CANDLE');
+ attempt('futureBar',bars.map((x,i)=>i===109?{...x,t:Date.now()+3600000}:x),'FUTURE_OPTION_CANDLE');
+ attempt('shortHistory',bars.slice(0,50),'At least 90');
+ // Valid synthetic bars spanning a session boundary must never produce overnight trades.
+ try{
+  const start=Date.parse('2026-11-05T09:15:00+05:30');
+  const sessionBars=Array.from({length:180},(_,i)=>{
+   const day=i<90?0:1,slot=i%90;
+   const t=start+day*86400000+slot*300000;
+   const o=100+i*.15;return {t,o,h:o+2,l:o-2,c:o+1};
+  });
+  const r=optionReplay(sessionBars);
+  checks.intradayReplay=r.recentTrades.every(x=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata'}).format(new Date(x.entryAt))===new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata'}).format(new Date(x.exitAt)));
+ }catch(e){checks.intradayReplay=false}
+
+ try{optionReplay(bars,{quantity:0});checks.invalidQuantity=false}catch(e){checks.invalidQuantity=e.message==='INVALID_REPLAY_ASSUMPTIONS'}
+ return {passed:Object.values(checks).filter(Boolean).length,total:Object.keys(checks).length,checks,liveTested:false};
+}
+async function optionBacktest(e,raw){
+ const args=raw.trim().split(/\s+/),exchange=String(args[1]||'').toUpperCase(),token=String(args[2]||'');
+ const quantity=Number(args[3]||1),fee=Number(args[4]||40);
+ if(!['NFO','BFO'].includes(exchange)||!/^\d{2,12}$/.test(token)||!Number.isInteger(quantity)||quantity<1||quantity>100000||!Number.isFinite(fee)||fee<0||fee>10000)throw Error('Usage: /optionbacktest NFO|BFO TOKEN [quantity] [roundTripFeeINR]');
+ const jwt=await session(e),end=new Date(),start=new Date(end.getTime()-7*86400000);
+ const response=await historicalRequest('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData',{method:'POST',headers:{...angelHeaders(e),Authorization:'Bearer '+jwt},body:JSON.stringify({exchange,symboltoken:token,interval:'FIVE_MINUTE',fromdate:istDateTime(start),todate:istDateTime(end)})},{label:'OPTION_PREMIUM_RESEARCH'});
+ const candles=normalizeAngelCandles(response.data,{intervalMs:300000});
+ const result={version:VERSION,mode:'HISTORICAL_OPTION_RESEARCH_ONLY',exchange,token,source:'Angel One historical option premium candles',...optionReplay(candles,{quantity,feePerRoundTrip:fee})};
+ await put(e,'optionbacktest:last',result,86400*3);return result;
+}
+
+async function handle(e,u){const m=u.message||u.edited_message;if(String(m?.chat?.id)!==String(e.TELEGRAM_CHAT_ID))return;const raw=String(m.text||'').trim();if(!raw)return;const cmd=raw.split(/\s+/)[0].split('@')[0].toLowerCase();let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud '+VERSION+' — scheduled scan diagnostics, 3-minute research scan\n/status configuration\n/aimodel pretrained model configuration\n/testangel broker login test\n/scan live option research watch\n/nifty /sensex AI checklist\n/briefing pre-market news\n/news dated news headlines\n/newsquality news feed freshness\n/dataquality data limitations\n/readiness honest deployment readiness\n/diagnostics config, broker-data and signal readiness\n/liveprobe broker login, AI inference and Telegram configuration\n/marketprobe live spot and option quote data verification\n/livereadiness — fail-closed combined broker coverage audit\n/scanstatus actual scheduled scan result (read-only)\n/strategywatch observation-based strategy research\n/fullcheck single-command live system diagnostics\n/batchcheck combined scanner, news, strategy and paper audit\n/batchprobe batch audit plus live AI/broker checks\n/finalcheck consolidated configuration and honest signal-readiness gate\n/paper /performance paper research counts\n/forwardaudit — independent forward-test readiness and blockers\n/forwardstart nifty hypothesis:ID — preregister an historically tested research hypothesis\n/forwardregistry — list frozen forward research registrations\n/forwardintegrity — audit frozen specs and baseline provenance\n/forwardobserve nifty hypothesis:ID — capture new post-registration CLOSED index candles\n/forwardobservations nifty hypothesis:ID — view observation count\n/forwardperformance nifty hypothesis:ID — index proxy performance\n/forwardauto — latest automatic collection status\n/brain — research brain status\n/discover — generate one AI research hypothesis (not a signal)\n/hypotheses — list stored research hypotheses\n/validate nifty or sensex — historical index-only proxy validation\n/strategies — strategy knowledge and data requirements\n/opensource — public documentation source health\n/researchbatch — ten historical-data checks for both indices (read-only)\n/backtest nifty or /backtest sensex — historical benchmark\n/optionbacktest NFO|BFO TOKEN [quantity] [roundTripFeeINR] — historical option premium replay\n/replaycheck — six offline option replay regression checks\n/marketintel nifty or /marketintel sensex — 1m/3m/5m/15m index research\n/options nifty or /options sensex — broker OI, PCR, Greeks coverage\n/decision nifty or /decision sensex — integrated evidence and WAIT gate\n/evidence nifty or /evidence sensex — explainable multi-source research bias (not a trade signal)\n/researchgate nifty or /researchgate sensex — validation audit and no-promotion gate\n/signals — observed shadow signal lifecycle, NOT trade signals\n/signalpreview nifty or /signalpreview sensex — clearly simulated Telegram alert format\n/signalstatus — automatic AI-assisted candidate alert status\n/pipelinecheck nifty or sensex — independent evidence readiness audit\n/refreshresearch nifty or sensex — refresh broker candles and option metrics (read-only)\n/calendar — configured trading session and scheduling status\n/calendarrefresh — retry official NSE F&O calendar retrieval (read-only)\n/holidayaudit — explain manual vs official holiday match\n/batchsafety — ten independent calendar and safety checks\n/brokerbatch — read-only broker login, quote input gates and market probe\n/quickstatus — single concise status and experimental alerts\n/scanissues — exact scan failures, quote coverage and alert blockers\n/offlineaudit — holiday-safe Angel login and instrument master integration audit\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/aimodel')out=`Pretrained Cloudflare Workers AI model: ${aiModel(e)}\nNo self-learning or automatic model changes. Model availability must be tested on deployment.`;else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode AI_ASSISTED_RESEARCH_ALERTS ${VERSION}\nHoliday calendar ${calendarConfigured(e)?'configured':'MISSING — scheduled scans blocked'}`;else if(cmd==='/signalpreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=signalPreview(name)}else if(cmd==='/pipelinecheck'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await pipelineReadiness(e,name),null,2)}else if(cmd==='/refreshresearch'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';const jobs=await Promise.allSettled([marketIntelligence(e,name),optionsIntelligence(e,name)]);out=JSON.stringify({index:name,at:new Date().toISOString(),marketIntelligence:jobs[0].status==='fulfilled'?'REFRESHED':String(jobs[0].reason?.message||jobs[0].reason).slice(0,160),optionsIntelligence:jobs[1].status==='fulfilled'?'REFRESHED':String(jobs[1].reason?.message||jobs[1].reason).slice(0,160),readiness:await pipelineReadiness(e,name),signalsEnabled:false,ordersPlaced:false},null,2)}else if(cmd==='/signalstatus'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,directionalReview:r?.directionalReview||null,directionalAlertsSent:r?.directionalAlertsSent||0,directionalAlertsSkipped:r?.directionalAlertsSkipped||'',issues:r?.issues||[],verifiedProductionSignals:false,note:'Snapshot-based signals are not independently validated; no orders.'},null,2)}else if(cmd==='/testangel'){try{await session(e);out='✅ Angel login succeeded. No orders placed. Quote access separately unverified.'}catch(err){out='❌ Angel login failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scanQuotesOnly(e),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await groundedAnalysis(e,cmd==='/nifty'?'NIFTY':'SENSEX');else if(cmd==='/briefing')out=await briefing(e);else if(cmd==='/brain')out=JSON.stringify(await brainReport(e),null,2);else if(cmd==='/learning')out='Disabled: pretrained AI only; no self-learning.';else if(cmd==='/strategies')out=JSON.stringify(strategyReadiness(),null,2);else if(cmd==='/discover'){try{out=JSON.stringify(await discover(e),null,2)}catch(err){out='Research discovery unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/hypotheses'){try{out=JSON.stringify(await discoveryReport(e),null,2)}catch(err){out='Hypothesis registry unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/opensource'){try{out=JSON.stringify(openSourceReport(await openSourceKnowledge(e)),null,2)}catch(err){out='Open-source documentation unavailable: '+String(err.message).slice(0,200)}}else if(cmd==='/replaycheck')out=JSON.stringify(offlineReplayRegression(),null,2);else if(cmd==='/optionbacktest'){try{out=JSON.stringify(await optionBacktest(e,raw),null,2)}catch(err){out='Option backtest unavailable: '+String(err.message).slice(0,230)}}else if(cmd==='/integratedaudit')out=JSON.stringify(await integratedTenModuleAudit(e),null,2);else if(cmd==='/researchbatch'){out=JSON.stringify(await unifiedResearchBatch(e),null,2)}else if(cmd==='/backtest'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await backtestResearch(e,name),null,2)}catch(err){out='Backtest unavailable: '+String(err.message).slice(0,250)}}else if(cmd==='/validate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await validateHypotheses(e,name),null,2)}catch(err){out='Research validation unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/marketintel'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await marketIntelligence(e,name),null,2)}catch(err){out='Multi-timeframe research unavailable: '+String(err.message).slice(0,240)}}else if(cmd==='/newsquality'){const n=await newsDigest(e);out=JSON.stringify({at:new Date(n.at).toISOString(),coverage:n.coverage,sources:n.sourceStatus,issues:n.issues,latest:n.items.slice(0,3),staleFallback:!!n.staleFallback,verifiedArticles:false,economicCalendarIntegrated:false},null,2)}else if(cmd==='/news'){const n=await newsDigest(e);out='📰 NEWS HEADLINE CONTEXT (not independently verified)\n'+n.items.slice(0,8).map(x=>'• '+x.source+': '+x.title).join('\n')+'\nIssues: '+(n.issues.join('; ')||'none')+'\nNot an entry signal.';}else if(cmd==='/options'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{const o=await optionsIntelligence(e,name);out=JSON.stringify({...o,chain:o.chain?.slice(0,8)},null,2)}catch(err){out='Options intelligence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/decision'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await integratedResearch(e,name),null,2)}else if(cmd==='/evidence'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await decisionEvidence(e,name),null,2)}catch(err){out='Evidence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/researchgate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await researchGate(e,name),null,2)}else if(cmd==='/signals')out=JSON.stringify(await lifecycleReport(e),null,2);else if(cmd==='/calendar')out=calendarMessage(e)+'\nLast refresh: '+JSON.stringify(await get(e,calendarAuditKey)||{status:'NOT_ATTEMPTED'});else if(cmd==='/calendarrefresh')out=JSON.stringify({version:VERSION,refresh:await refreshExchangeCalendar(e,{force:true}),audit:await get(e,calendarAuditKey),calendarConfigured:calendarConfigured(e),nseOnly:true,bseVerified:false,ordersPlaced:false},null,2);else if(cmd==='/scanstatus')out=JSON.stringify(await scanStatus(e),null,2);else if(cmd==='/strategywatch'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,watches:r?.strategyWatches||[],aiReview:r?.aiReview||null,waitReasons:r?.strategyWaitReasons||{},verifiedBuySellSignals:false,note:'Research only; snapshots are not candles. No live recommendations or orders.'},null,2)}else if(cmd==='/batchcheck'||cmd==='/batchprobe')out=JSON.stringify(await batchAudit(e,cmd==='/batchprobe'),null,2);else if(cmd==='/scanissues')out=JSON.stringify(await pipelineTriage(e),null,2);else if(cmd==='/offlineaudit')out=JSON.stringify(await offlineIntegrationAudit(e),null,2);else if(cmd==='/quickstatus'){const x=await get(e,'scan:last');out=JSON.stringify({version:VERSION,marketOpen:marketOpen(e),session:sessionConfig(e),holidayEvidence:holidayEvidence(e),lastScanAt:x?.at||null,scanHealthy:!!x?.scanHealthy,experimentalBuySellAlertsSent:x?.directionalAlertsSent||0,experimentalAlertsSkipped:x?.directionalAlertsSkipped||'NO_SCAN',signalMode:'EXPERIMENTAL_ONLY_NOT_VALIDATED',ordersEnabled:false},null,2)}else if(cmd==='/brokerbatch')out=JSON.stringify(await brokerBatchAudit(e),null,2);else if(cmd==='/batchsafety')out=JSON.stringify(batchSafetyAudit(e),null,2);else if(cmd==='/holidayaudit')out=JSON.stringify({version:VERSION,session:sessionConfig(e),evidence:holidayEvidence(e),safety:'Holiday match does not automatically authorize trading'},null,2);else if(cmd==='/repaircheck'){const [n,d,st]=await Promise.allSettled([newsDigest(e),systemDiagnostics(e),scanStatus(e)]);const value=r=>r.status==='fulfilled'?r.value:{error:String(r.reason?.message||r.reason).slice(0,150)};const news=value(n);out=JSON.stringify({version:VERSION,at:new Date().toISOString(),modules:{news:{sources:news.sourceStatus||[],relevantHeadlines:news.items?.length||0,staleFallback:!!news.staleFallback,issues:news.issues||[],sample:(news.items||[]).slice(0,3)},angel:{credentialsConfigured:cfg(e).length===0,loginNotProbed:true},niftyAndSensex:{scanner:value(st),dataStatus:'LIVE_MARKET_PROBE_REQUIRED'},ai:{binding:!!e.AI,productionStrategyValidated:false},paper:{automaticResearchOnly:true},telegram:{transportConfigured:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID},risk:{realOrdersDisabled:true,signalsFailClosed:true}},diagnostics:value(d),verifiedProductionSignals:false,ordersPlaced:false},null,2);}else if(cmd==='/fullcheck')out=JSON.stringify(await fullCheck(e),null,2);else if(cmd==='/finalcheck')out=JSON.stringify(staticAudit(e),null,2);else if(cmd==='/diagnostics')out=JSON.stringify(await systemDiagnostics(e),null,2);else if(cmd==='/liveprobe')out=JSON.stringify(await liveProbe(e),null,2);else if(cmd==='/livereadiness'){const probe=await marketDataProbe(e);const report=assessLiveReadiness({probe,marketOpen:marketOpen(e),calendarConfigured:calendarConfigured(e)});out=JSON.stringify({...report,aiVerified:false,telegramDelivered:false,note:'AI and Telegram cannot be certified by a broker-only probe; use /liveprobe and verify delivery independently.'},null,2)}else if(cmd==='/marketprobe')out=JSON.stringify(await marketDataProbe(e),null,2);else if(cmd==='/readiness'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,worker:true,kv:hasKV(e),aiBinding:!!e.AI,missingSecrets:cfg(e),holidayCalendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),lastScan:r,spotAwareContractSelection:true,singleSnapshotWatchAlertsDisabled:true,verifiedLiveSignals:false,shadowLifecycleTracking:true,historicalBenchmarkAvailable:true,multiTimeframeResearchAvailable:true,aiProxyValidationAvailable:true,verifiedHistoricalBacktests:false,verifiedGreeks:false,verifiedUnderlyingConfirmation:false,quoteTimestampGate:true,verifiedNews:false,datedHeadlineFreshnessGate:true,verifiedStrategySelfImprovement:false,aiHypothesisGeneration:true,automaticStrategyPromotion:false,curatedOpenSourceReadmeRetrieval:true,automatedOrders:false},null,2)}else if(cmd==='/dataquality'){const r=await get(e,'scan:last');out=JSON.stringify({lastScan:r,checks:'Fresh broker timestamp, OI and bid/ask spread required for research alerts. Quotes without parseable timestamps are counted but excluded from research lifecycle updates. Basic historical research exists; production-grade backtesting, verified Greeks and verified news are not established.'},null,2)}else if(cmd==='/forwardstart'){const parts=raw.split(/\s+/);const name=String(parts[1]||'').toUpperCase();out=JSON.stringify(await forwardRegister(e,name,parts[2]||''),null,2)}else if(cmd==='/forwardregistry')out=JSON.stringify(await forwardRegistry(e),null,2);else if(cmd==='/forwardintegrity')out=JSON.stringify(await forwardIntegrity(e),null,2);else if(cmd==='/forwardobserve'){const p=raw.split(/\s+/);try{out=JSON.stringify(await forwardObserve(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}catch(err){out='Forward observation failed: '+String(err.message).slice(0,180)}}else if(cmd==='/forwardobservations'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardObservations(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/forwardperformance'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardPerformance(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/papercandidate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(assessPaperCandidate({index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/paperresearchstart'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await registerResearchPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/autopaper'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await autoSelectPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/attributedperformance'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await attributedPerformance(e.STATE,name),null,2)}else if(cmd==='/attributedpaperstart'){const p=raw.split(/\s+/);try{const index=String(p[1]||'').toUpperCase();out=JSON.stringify(await registerAttributedPaper(e.STATE,index,p[2],{exchange:p[3],token:p[4],symbol:p[5],side:p[6],expiry:p[7],lotSize:Number(p[8])},{stop:Number(p[9]),target:Number(p[10]),lots:Number(p[11]||1)}),null,2)}catch(err){out='Attributed paper registration rejected: '+String(err.message)}}else if(cmd==='/strategyreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await lastStrategyReview(e.STATE,name),null,2)}else if(cmd==='/strategyselect'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await paperStrategySelectionReport(e.STATE,name),null,2)}else if(cmd==='/premiumreport'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await trackerReport(e.STATE,name),null,2)}else if(cmd==='/premiumregister'){const p=raw.split(/\s+/);const name=String(p[1]||'').toUpperCase();try{out=JSON.stringify(await trackerRegister(e.STATE,name,{exchange:p[2],token:p[3],symbol:p[4],side:p[5],expiry:p[6],lotSize:Number(p[7])},{stop:Number(p[8]),target:Number(p[9]),lots:Number(p[10]||1)}),null,2)}catch(err){out='Paper registration rejected: '+String(err.message)}}else if(cmd==='/forwardauto')out=JSON.stringify(await get(e,'forward:lastAuto')||{status:'NO_AUTOMATIC_COLLECTION_YET'},null,2);else if(cmd==='/optiongate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(evaluateOptionEvidence({underlying:name,options:await get(e,'options:'+name),market:await get(e,'marketintel:'+name),marketOpen:marketOpen(e),forwardCertified:false}),null,2)}else if(cmd==='/forwardaudit')out=JSON.stringify(await forwardAudit(e),null,2);else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else if(cmd.startsWith('/'))out=`Unknown JANGGO command: ${cmd}\nUse /help. Trading commands are never routed to general AI.`;else out=await ai(e,raw);await telegram(e,out)}
 // V103: manually registered paper contracts; scheduled quotes only, never real orders.
 async function premiumTrackerAuto(e){
  if(!hasKV(e)||!marketOpen(e))return;
@@ -2384,18 +2621,1129 @@ async function premiumTrackerAuto(e){
   }catch(err){log('premium tracker '+name,err)}
  }
 }
+// Offline-testable, fail-closed operational health classifier. Never authorizes orders/signals.
+function classifyOperationalHealth({now=Date.now(),marketOpen=false,cron=null,scan=null,paper=null,forward=null,failure=null}={}){
+ // Reject future timestamps, malformed dates and missing cycle records instead of reporting healthy.
+ const age=(record)=>{const timestamp=Date.parse(record?.at||'');return Number.isFinite(timestamp)&&timestamp<=now&&timestamp>=0?now-timestamp:null};
+ const cronAgeMs=age(cron),scanAgeMs=age(scan),paperAgeMs=age(paper),forwardAgeMs=age(forward);
+ const issues=[];
+ if(marketOpen){
+  if(cronAgeMs===null||cronAgeMs>10*60000)issues.push('CRON_MISSING_OR_STALE');
+  if(scanAgeMs===null||scanAgeMs>6*60000)issues.push('SCAN_MISSING_OR_STALE');
+  else if(scan?.scanHealthy!==true)issues.push('SCAN_UNHEALTHY');
+  // An unrecorded or stale paper/forward cycle is not proof that it failed;
+  // flag as unverified rather than silently certifying the pipeline.
+  if(paperAgeMs===null||paperAgeMs>15*60000)issues.push('PAPER_CYCLE_NOT_VERIFIED');
+  else if(paper?.status==='FAILED')issues.push('PAPER_CYCLE_FAILED');
+  if(forwardAgeMs===null||forwardAgeMs>15*60000)issues.push('FORWARD_CYCLE_NOT_VERIFIED');
+  else if(forward?.status==='FAILED')issues.push('FORWARD_CYCLE_FAILED');
+ }
+ const failureAgeMs=age(failure);
+ if(failureAgeMs!==null&&failureAgeMs<24*3600000)issues.push('RECENT_SCHEDULED_FAILURE');
+ if(failure?.at&&failureAgeMs===null)issues.push('INVALID_FAILURE_TIMESTAMP');
+ return {status:issues.length?'ATTENTION_REQUIRED':marketOpen?'OBSERVATION_HEALTHY':'MARKET_CLOSED_NOT_TESTED',issues,cronAgeMs,scanAgeMs,paperAgeMs,forwardAgeMs,productionSignalsCertified:false,ordersEnabled:false};
+}
+function operationalHealthRegression(){
+ const now=Date.parse('2026-11-10T09:00:00Z');const at=new Date(now-60000).toISOString();
+ const base={now,marketOpen:true,cron:{at},scan:{at,scanHealthy:true},paper:{at,status:'COMPLETED'},forward:{at,status:'COMPLETED'}};
+ const cases=[
+  ['healthy',classifyOperationalHealth(base).status==='OBSERVATION_HEALTHY'],
+  ['stale scan',classifyOperationalHealth({...base,scan:{at:new Date(now-7*60000).toISOString(),scanHealthy:true}}).issues.includes('SCAN_MISSING_OR_STALE')],
+  ['unhealthy scan',classifyOperationalHealth({...base,scan:{at,scanHealthy:false}}).issues.includes('SCAN_UNHEALTHY')],
+  ['failed paper',classifyOperationalHealth({...base,paper:{at,status:'FAILED'}}).issues.includes('PAPER_CYCLE_FAILED')],
+  ['failed forward',classifyOperationalHealth({...base,forward:{at,status:'FAILED'}}).issues.includes('FORWARD_CYCLE_FAILED')],
+  ['recent failure',classifyOperationalHealth({...base,failure:{at}}).issues.includes('RECENT_SCHEDULED_FAILURE')],
+  ['closed is not verified',classifyOperationalHealth({...base,marketOpen:false}).status==='MARKET_CLOSED_NOT_TESTED'],
+  ['future timestamps fail stale',classifyOperationalHealth({...base,scan:{at:new Date(now+60000).toISOString(),scanHealthy:true}}).issues.includes('SCAN_MISSING_OR_STALE')],
+  ['missing paper cycle',classifyOperationalHealth({...base,paper:null}).issues.includes('PAPER_CYCLE_NOT_VERIFIED')],
+  ['missing forward cycle',classifyOperationalHealth({...base,forward:null}).issues.includes('FORWARD_CYCLE_NOT_VERIFIED')],
+  ['stale paper cycle',classifyOperationalHealth({...base,paper:{at:new Date(now-16*60000).toISOString(),status:'COMPLETED'}}).issues.includes('PAPER_CYCLE_NOT_VERIFIED')],
+  ['future paper timestamp',classifyOperationalHealth({...base,paper:{at:new Date(now+1000).toISOString(),status:'COMPLETED'}}).issues.includes('PAPER_CYCLE_NOT_VERIFIED')],
+  ['invalid failure timestamp',classifyOperationalHealth({...base,failure:{at:'not-a-date'}}).issues.includes('INVALID_FAILURE_TIMESTAMP')],
+ ];return {passed:cases.filter(x=>x[1]).length,total:cases.length,cases:cases.map(([name,pass])=>({name,pass})),ordersEnabled:false};
+}
+
+// Offline deterministic evidence-gate regression; synthetic values are NEVER signals.
+function optionGateRegression(){
+ const now=Date.parse('2026-11-10T06:00:00.000Z');
+ const expiry='2026-11-26T10:00:00.000Z';
+ const base={underlying:'NIFTY',at:new Date(now).toISOString(),spot:25000,chain:[{symbol:'SYNTHETIC_CE',side:'CE',strike:24900,expiry,quoteAt:new Date(now).toISOString(),fresh:'FRESH',ltp:180,oi:10000,volume:900,spreadPct:0.4,delta:0.6,gamma:0.001,theta:-8,vega:2}]};
+ const market={underlying:'NIFTY',at:new Date(now).toISOString(),frames:[{timeframe:'5m',trend:'UP'},{timeframe:'15m',trend:'UP'}]};
+ const run=(changes={},marketChanges={},open=true,cert=false)=>evaluateOptionEvidence({underlying:'NIFTY',options:{...base,...changes},market:{...market,...marketChanges},now,marketOpen:open,forwardCertified:cert});
+ const cases=[
+  ['closed_session',run({}, {},false).reasons.includes('MARKET_NOT_OPEN')],
+  ['stale_chain',run({at:new Date(now-120000).toISOString()}).reasons.includes('OPTION_SNAPSHOT_STALE')],
+  ['future_chain',run({at:new Date(now+6000).toISOString()}).reasons.includes('OPTION_SNAPSHOT_STALE')],
+  ['stale_index',run({},{at:new Date(now-360000).toISOString()}).reasons.includes('INDEX_EVIDENCE_STALE')],
+  ['conflicting_timeframes',run({},{frames:[{timeframe:'5m',trend:'UP'},{timeframe:'15m',trend:'DOWN'}]}).reasons.includes('MULTITIMEFRAME_DIRECTION_UNCONFIRMED')],
+  ['wide_spread',run({chain:[{...base.chain[0],spreadPct:3}]}).reasons.includes('NO_FRESH_LIQUID_ITM_CONTRACT_WITH_GREEKS')],
+  ['missing_greeks',run({chain:[{...base.chain[0],delta:null}]}).reasons.includes('NO_FRESH_LIQUID_ITM_CONTRACT_WITH_GREEKS')],
+  ['expired_contract',run({chain:[{...base.chain[0],expiry:'2026-11-09T10:00:00.000Z'}]}).reasons.includes('NO_FRESH_LIQUID_ITM_CONTRACT_WITH_GREEKS')],
+  ['forward_uncertified',run().reasons.includes('INDEPENDENT_OPTION_FORWARD_CERTIFICATION_MISSING')],
+  ['no_production_signal_even_certified',run({}, {},true,true).productionSignalAuthorized===false],
+  ['valid_research_candidate',run().researchCandidate?.symbol==='SYNTHETIC_CE'],
+  ['orders_never_authorized',run({}, {},true,true).ordersAuthorized===false]
+ ];return {passed:cases.filter(c=>c[1]).length,total:cases.length,cases:cases.map(([name,pass])=>({name,pass})),syntheticOnly:true,ordersEnabled:false};
+}
+
+// Deterministic cross-module safety regression: no external APIs, orders or messages.
+function integratedSafetyRegression(){
+ const full={historicallyValidated:true,forwardValidated:true,freshBrokerEvidence:true,optionEvidence:true,aiReviewPassed:true};
+ const cases=[];
+ const check=(name,condition)=>cases.push({name,pass:Boolean(condition)});
+ for(const [key,reason] of [
+  ['historicallyValidated','BACKTEST_UNVERIFIED'],
+  ['forwardValidated','FORWARD_TEST_UNVERIFIED'],
+  ['freshBrokerEvidence','BROKER_EVIDENCE_UNVERIFIED'],
+  ['optionEvidence','OPTION_EVIDENCE_UNVERIFIED'],
+  ['aiReviewPassed','AI_REVIEW_UNVERIFIED']]){
+   const test={...full,[key]:false};
+   check('reject_'+key,!integratedSignalGate(test).sendBuySell&&integratedSignalGate(test).reasons.includes(reason));
+ }
+ check('reject_empty',integratedSignalGate(null).reasons.length===5);
+ check('reject_missing_fields',!integratedSignalGate({historicallyValidated:true}).sendBuySell);
+ check('all_evidence_is_necessary_not_production_certification',integratedSignalGate(full).sendBuySell===true);
+ const options=optionGateRegression();
+ check('option_gate_suite_passes',options.passed===options.total);
+ const operations=operationalHealthRegression();
+ check('operational_suite_passes',operations.passed===operations.total);
+ return {passed:cases.filter(x=>x.pass).length,total:cases.length,cases,syntheticOnly:true,ordersEnabled:false,
+  note:'Passing the evidence predicate is NOT a production signal certification. Live market, broker, strategy provenance and Telegram delivery require separate verification.'};
+}
+async function productionBlockerAudit(e){
+ const [scan,forward,paper]=await Promise.all([get(e,'scan:last'),get(e,'forward:lastAuto'),get(e,'paper:cycle:last')]);
+ const age=(v)=>{const t=Date.parse(v?.at||'');return Number.isFinite(t)?Math.round((Date.now()-t)/1000):null};
+ const issues=[];
+ if(!marketOpen(e))issues.push('SESSION_CLOSED_OR_HOLIDAY');
+ if(!scan?.scanHealthy||age(scan)===null||age(scan)<0||age(scan)>300)issues.push('FRESH_HEALTHY_SCAN_UNVERIFIED');
+ if(!forward||forward.status==='FAILED')issues.push('FORWARD_COLLECTION_UNVERIFIED');
+ if(!paper||paper.status!=='COMPLETED')issues.push('PAPER_CYCLE_UNVERIFIED');
+ // No deployment-independent evidence of certified options forward performance is stored.
+ issues.push('INDEPENDENT_OPTION_STRATEGY_CERTIFICATION_UNVERIFIED');
+ issues.push('LIVE_TELEGRAM_ENTRY_EXIT_DELIVERY_UNVERIFIED');
+ return {at:new Date().toISOString(),productionReady:false,ordersEnabled:false,issues,
+  lastScanAgeSeconds:age(scan),lastPaperAgeSeconds:age(paper),lastForwardAgeSeconds:age(forward),
+  nextAction:'Resolve blockers with independently verifiable evidence; do not infer certification from synthetic self-tests.'};
+}
+
+
+// Persistent paper-state integrity audit. Read-only: never opens positions or sends alerts.
+function auditPaperState(index,s,now=Date.now()){
+ const issues=[];const fail=(reason)=>issues.push(reason);
+ if(!s||typeof s!=='object'||Array.isArray(s))return {index,ok:false,issues:['INVALID_STATE_OBJECT']};
+ if(s.position&&s.pending)fail('POSITION_AND_PENDING_SIMULTANEOUS');
+ if(s.position&&!s.enabled)fail('OPEN_POSITION_TRACKER_DISABLED');
+ if(s.pending&&!s.enabled)fail('PENDING_TRACKER_DISABLED');
+ if(s.trades!==undefined&&!Array.isArray(s.trades))fail('INVALID_TRADE_HISTORY');
+ const position=s.position;
+ if(position){
+  for(const field of ['entry','stop','target','quantity','openedAt'])if(!Number.isFinite(position[field]))fail('INVALID_POSITION_'+field.toUpperCase());
+  if(Number.isFinite(position.entry)&&Number.isFinite(position.stop)&&position.stop>=position.entry)fail('INVALID_POSITION_STOP');
+  if(Number.isFinite(position.entry)&&Number.isFinite(position.target)&&position.target<=position.entry)fail('INVALID_POSITION_TARGET');
+  if(!Number.isSafeInteger(position.quantity)||position.quantity<=0)fail('INVALID_POSITION_QUANTITY');
+  if(Number.isFinite(position.openedAt)&&position.openedAt>now+2000)fail('FUTURE_POSITION');
+ }
+ const ids=new Set();let lastClose=-Infinity;
+ for(const t of Array.isArray(s.trades)?s.trades:[]){
+  if(!t||!Number.isFinite(t.openedAt)||!Number.isFinite(t.closedAt)||t.closedAt<t.openedAt){fail('INVALID_TRADE_TIMELINE');continue}
+  if(t.openedAt<lastClose)fail('OVERLAPPING_TRADES');
+  lastClose=Math.max(lastClose,t.closedAt);
+  if(t.closedAt>now+2000)fail('FUTURE_CLOSED_TRADE');
+  if(!Number.isFinite(t.net)||!Number.isFinite(t.gross)||!Number.isFinite(t.costs)||Math.abs(t.gross-t.costs-t.net)>0.011)fail('INVALID_TRADE_ACCOUNTING');
+  const id=t.tradeId||[index,t.symbol,t.openedAt,t.closedAt].join(':');if(ids.has(id))fail('DUPLICATE_TRADE');ids.add(id);
+ }
+ if(position&&Number.isFinite(position.openedAt)&&position.openedAt<lastClose)fail('OPEN_POSITION_OVERLAPS_HISTORY');
+ return {index,ok:issues.length===0,issues:[...new Set(issues)],tradeCount:Array.isArray(s.trades)?s.trades.length:null,openPosition:!!position,pending:!!s.pending};
+}
+function paperIntegritySelftest(){
+ const now=Date.now(),base={enabled:true,pending:null,position:null,trades:[]};
+ const trade={symbol:'TEST',openedAt:now-30000,closedAt:now-20000,gross:100,costs:40,net:60};
+ const position={entry:100,stop:90,target:120,quantity:25,openedAt:now-10000};
+ const tests=[
+ ['valid_empty',auditPaperState('NIFTY',base,now).ok],
+ ['valid_trade',auditPaperState('NIFTY',{...base,trades:[trade]},now).ok],
+ ['valid_open',auditPaperState('NIFTY',{...base,position},now).ok],
+ ['reject_simultaneous',!auditPaperState('NIFTY',{...base,position,pending:{symbol:'TEST'}},now).ok],
+ ['reject_disabled',!auditPaperState('NIFTY',{...base,enabled:false,position},now).ok],
+ ['reject_duplicate',!auditPaperState('NIFTY',{...base,trades:[trade,trade]},now).ok],
+ ['reject_accounting',!auditPaperState('NIFTY',{...base,trades:[{...trade,net:100}]},now).ok],
+ ['reject_future',!auditPaperState('NIFTY',{...base,position:{...position,openedAt:now+60000}},now).ok],
+ ['reject_overlapping',!auditPaperState('NIFTY',{...base,trades:[trade,{...trade,openedAt:now-25000,closedAt:now-10000}]},now).ok],
+ ['reject_invalid_history',!auditPaperState('NIFTY',{...base,trades:{}},now).ok],
+ ];return {passed:tests.filter(x=>x[1]).length,total:tests.length,cases:tests.map(([name,pass])=>({name,pass})),syntheticOnly:true,ordersEnabled:false};
+}
+async function persistedPaperIntegrity(e){
+ if(!hasKV(e))return {ok:false,reason:'KV_UNAVAILABLE',ordersEnabled:false};
+ const results=[];
+ for(const index of ['NIFTY','SENSEX']){
+  try{const raw=await e.STATE.get('premium:tracker:'+index,'json');results.push({...auditPaperState(index,raw||{enabled:false,position:null,pending:null,trades:[]}),statePresent:raw!==null})}
+  catch(err){results.push({index,ok:false,issues:['KV_READ_FAILED'],error:String(err.message||err).slice(0,100)})}
+ }
+ return {ok:results.every(r=>r.ok),results,readOnly:true,ordersEnabled:false,note:'Consistency audit only; does not certify paper fills or live signals'};
+}
+
+
+
+// Evidence-based automatic research review. Approval is paper-research-only;
+// never enables production BUY/SELL alerts or broker orders.
+function assessResearchPromotion(candidate, now=Date.now()) {
+ const reasons=[];
+ const validNumber=(x)=>typeof x==='number'&&Number.isFinite(x);
+ if(!candidate||typeof candidate!=='object')return {approved:false,reasons:['INVALID_CANDIDATE'],productionSignalsEnabled:false};
+ if(!/^[A-Za-z0-9_.:-]{3,80}$/.test(String(candidate.id||'')))reasons.push('INVALID_ID');
+ if(!['NIFTY','SENSEX'].includes(candidate.index))reasons.push('INVALID_INDEX');
+ if(!candidate.frozenSpecHash||!/^[a-f0-9]{64}$/i.test(candidate.frozenSpecHash))reasons.push('MISSING_FROZEN_SPEC_HASH');
+ const h=candidate.holdout||{},f=candidate.forward||{};
+ if(h.source!=='BROKER_OPTION_PREMIUM'||h.outOfSample!==true)reasons.push('HOLDOUT_NOT_INDEPENDENT_OPTION_DATA');
+ if(!Number.isSafeInteger(h.trades)||h.trades<30)reasons.push('INSUFFICIENT_HOLDOUT_TRADES');
+ if(!validNumber(h.netProfit)||h.netProfit<=0||!validNumber(h.profitFactor)||h.profitFactor<1.2)reasons.push('HOLDOUT_NOT_PROFITABLE');
+ if(!validNumber(h.maxDrawdown)||h.maxDrawdown<0||h.maxDrawdown>5000)reasons.push('HOLDOUT_DRAWDOWN');
+ if(f.source!=='BROKER_OPTION_PREMIUM'||f.afterRegistration!==true)reasons.push('FORWARD_NOT_INDEPENDENT');
+ if(!Number.isSafeInteger(f.trades)||f.trades<20)reasons.push('INSUFFICIENT_FORWARD_TRADES');
+ if(!validNumber(f.netProfit)||f.netProfit<=0||!validNumber(f.profitFactor)||f.profitFactor<1.1)reasons.push('FORWARD_NOT_PROFITABLE');
+ if(!validNumber(f.maxDrawdown)||f.maxDrawdown<0||f.maxDrawdown>5000)reasons.push('FORWARD_DRAWDOWN');
+ if(candidate.costsVerified!==true)reasons.push('COSTS_UNVERIFIED');
+ if(candidate.optionQuotesVerified!==true)reasons.push('OPTION_QUOTES_UNVERIFIED');
+ if(candidate.expiryValidated!==true)reasons.push('EXPIRY_UNVERIFIED');
+ const registered=Date.parse(candidate.registeredAt||''), evaluated=Date.parse(candidate.evaluatedAt||'');
+ if(!Number.isFinite(registered)||!Number.isFinite(evaluated)||registered>evaluated||evaluated>now||now-evaluated>7*86400000)reasons.push('INVALID_EVIDENCE_TIMELINE');
+ return {approved:reasons.length===0,reasons,scope:'PAPER_RESEARCH_ONLY',productionSignalsEnabled:false,ordersEnabled:false};
+}
+async function researchPromotionAudit(e){
+ const results={};
+ if(!hasKV(e))return {status:'BLOCKED',reason:'KV_UNAVAILABLE',productionSignalsEnabled:false};
+ for(const index of ['NIFTY','SENSEX']){
+  try{
+   const raw=await get(e,'research:promotion-evidence:'+index);
+   const candidates=Array.isArray(raw)?raw.slice(0,30):[];
+   results[index]=candidates.map(c=>({id:String(c?.id||'').slice(0,80),...assessResearchPromotion(c)}));
+  }catch(err){results[index]=[{approved:false,reasons:['KV_READ_FAILED'],productionSignalsEnabled:false}]}
+ }
+ return {status:'AUDITED',results,automaticEvidenceReview:true,automaticProductionPromotion:false,ordersEnabled:false};
+}
+function researchPromotionSelftest(){
+ const now=Date.now();
+ const good={id:'candidate_001',index:'NIFTY',frozenSpecHash:'a'.repeat(64),registeredAt:new Date(now-86400000).toISOString(),evaluatedAt:new Date(now-1000).toISOString(),holdout:{source:'BROKER_OPTION_PREMIUM',outOfSample:true,trades:35,netProfit:1000,profitFactor:1.5,maxDrawdown:200},forward:{source:'BROKER_OPTION_PREMIUM',afterRegistration:true,trades:22,netProfit:300,profitFactor:1.2,maxDrawdown:100},costsVerified:true,optionQuotesVerified:true,expiryValidated:true};
+ const cases=[['valid_paper_research',assessResearchPromotion(good,now).approved],['missing_forward',!assessResearchPromotion({...good,forward:{}},now).approved],['missing_holdout',!assessResearchPromotion({...good,holdout:{}},now).approved],['missing_quotes',!assessResearchPromotion({...good,optionQuotesVerified:false},now).approved],['missing_costs',!assessResearchPromotion({...good,costsVerified:false},now).approved],['bad_timeline',!assessResearchPromotion({...good,evaluatedAt:new Date(now+100000).toISOString()},now).approved],['never_production',assessResearchPromotion(good,now).productionSignalsEnabled===false]];
+ return {passed:cases.filter(x=>x[1]).length,total:cases.length,cases:cases.map(([name,pass])=>({name,pass})),syntheticOnly:true};
+}
+
+// Automatic paper-research evidence review; never authorizes production signals.
+// Decisions are idempotently persisted per candidate and reevaluated on each scheduled run.
+async function runPaperResearchReview(e){
+ const at=new Date().toISOString(), outcomes=[];
+ if(!hasKV(e))return {at,status:'BLOCKED',reason:'KV_UNAVAILABLE',outcomes,productionSignalsEnabled:false};
+ for(const index of ['NIFTY','SENSEX']){
+  let raw;
+  try{raw=await get(e,'research:promotion-evidence:'+index)}
+  catch(err){outcomes.push({index,status:'READ_ERROR',error:String(err.message||err).slice(0,120)});continue}
+  if(!Array.isArray(raw)){outcomes.push({index,status:'NO_EVIDENCE'});continue}
+  for(const candidate of raw.slice(0,30)){
+   const review=assessResearchPromotion(candidate);
+   const id=String(candidate?.id||'');
+   // Only validated identifiers can be used as KV suffixes.
+   if(!/^[A-Za-z0-9_.:-]{3,80}$/.test(id)){outcomes.push({index,status:'REJECTED',reasons:['INVALID_ID']});continue}
+   const record={id,index,at,status:review.approved?'PAPER_RESEARCH_ELIGIBLE':'REJECTED',reasons:review.reasons,productionSignalsEnabled:false,ordersEnabled:false,scope:'PAPER_RESEARCH_ONLY'};
+   try{await put(e,'research:review:'+index+':'+id,record,86400*30);outcomes.push(record)}
+   catch(err){outcomes.push({index,id,status:'WRITE_ERROR',error:String(err.message||err).slice(0,120)})}
+  }
+ }
+ const result={at,status:outcomes.some(x=>x.status==='WRITE_ERROR'||x.status==='READ_ERROR')?'DEGRADED':'REVIEWED',outcomes,productionSignalsEnabled:false,ordersEnabled:false};
+ try{await put(e,'research:review:last',result,86400*7)}catch(err){result.status='DEGRADED';result.persistenceError=String(err.message||err).slice(0,120)}
+ return result;
+}
+// Automatic post-registration strategy lifecycle. Index proxy results are NOT
+// option-premium evidence. All states are explicit and fail closed.
+function classifyForwardCandidate(reg, performance, now=Date.now()){
+ const reasons=[];
+ if(!reg || !/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(reg.id||'')))reasons.push('INVALID_REGISTRATION');
+ const t=Date.parse(reg?.registeredAt||'');
+ if(!Number.isFinite(t)||t>now||now-t>90*86400000)reasons.push('INVALID_REGISTRATION_TIME');
+ if(!reg?.frozenTestSpec||!reg?.baselineHistoricalSignature)reasons.push('UNFROZEN_STRATEGY');
+ if(performance?.ok!==true)reasons.push('NO_VALID_FORWARD_EVALUATION');
+ if(!Number.isSafeInteger(performance?.completedProxyTrades)||performance.completedProxyTrades<20)reasons.push('INSUFFICIENT_FORWARD_PROXY_TRADES');
+ if(!Number.isFinite(performance?.profitFactor)||performance.profitFactor<1.2)reasons.push('PROXY_PROFIT_FACTOR_LOW');
+ if(!Number.isFinite(performance?.grossTotalPct)||performance.grossTotalPct<=0)reasons.push('PROXY_NOT_PROFITABLE');
+ if(!Number.isFinite(performance?.maxDrawdownGrossPct)||performance.maxDrawdownGrossPct<0||performance.maxDrawdownGrossPct>10)reasons.push('PROXY_DRAWDOWN_HIGH');
+ if(performance?.eligibleForSignals!==false)reasons.push('INVALID_FORWARD_SCOPE');
+ const qualifiedProxy=reasons.length===0;
+ return {state:qualifiedProxy?'INDEX_PROXY_RESEARCH_PASSED':'FORWARD_RESEARCH_PENDING',qualifiedProxy,reasons,
+  requiresOptionPremiumHoldout:true,requiresVerifiedForwardOptionFills:true,
+  approvedForSignals:false,ordersEnabled:false};
+}
+async function automaticForwardQualification(e){
+ const at=new Date().toISOString(), outcomes=[];
+ if(!hasKV(e))return {at,status:'BLOCKED',reason:'KV_UNAVAILABLE',outcomes,signalsEnabled:false};
+ let keys;
+ try{keys=await get(e,'forward:registrations')}catch(err){return {at,status:'BLOCKED',reason:'REGISTRY_READ_ERROR',outcomes,signalsEnabled:false}}
+ if(!Array.isArray(keys))return {at,status:'BLOCKED',reason:'INVALID_REGISTRY',outcomes,signalsEnabled:false};
+ for(const key of [...new Set(keys)].slice(-12)){
+  const m=/^forward:registration:(NIFTY|SENSEX):(hypothesis:[a-zA-Z0-9:_-]{1,100})$/.exec(String(key));
+  if(!m){outcomes.push({status:'INVALID_REGISTRY_KEY'});continue}
+  const [,index,id]=m;
+  try{
+   const reg=await get(e,key);
+   if(reg?.id!==id||reg?.underlying!==index){outcomes.push({index,id,status:'REGISTRATION_MISMATCH'});continue}
+   const performance=await forwardPerformance(e,index,id);
+   const assessment=classifyForwardCandidate(reg,performance);
+   const record={at,index,id,...assessment,completedProxyTrades:performance?.completedProxyTrades||0};
+   if(!await put(e,`research:forward-qualification:${index}:${id}`,record,86400*30))throw Error('QUALIFICATION_WRITE_FAILED');
+   outcomes.push(record);
+  }catch(err){outcomes.push({index,id,status:'ERROR',reason:String(err?.message||err).slice(0,120)})}
+ }
+ const result={at,status:outcomes.some(x=>x.status==='ERROR')?'DEGRADED':'COMPLETED',outcomes,signalsEnabled:false,ordersEnabled:false};
+ try{await put(e,'research:forward-qualification:last',result,86400*7)}catch(err){result.status='DEGRADED';result.persistenceFailed=true}
+ return result;
+}
+function forwardQualificationSelftest(){
+ const now=Date.now();
+ const reg={id:'hypothesis:sample',registeredAt:new Date(now-86400000).toISOString(),frozenTestSpec:{kind:'test'},baselineHistoricalSignature:'frozen'};
+ const perf={ok:true,completedProxyTrades:24,profitFactor:1.5,grossTotalPct:3,maxDrawdownGrossPct:2,eligibleForSignals:false};
+ const cases=[
+  ['qualified_proxy_only',classifyForwardCandidate(reg,perf,now).qualifiedProxy],
+  ['never_production',!classifyForwardCandidate(reg,perf,now).approvedForSignals],
+  ['insufficient_trades',!classifyForwardCandidate(reg,{...perf,completedProxyTrades:19},now).qualifiedProxy],
+  ['missing_registration',!classifyForwardCandidate(null,perf,now).qualifiedProxy],
+  ['bad_drawdown',!classifyForwardCandidate(reg,{...perf,maxDrawdownGrossPct:20},now).qualifiedProxy],
+  ['unprofitable',!classifyForwardCandidate(reg,{...perf,grossTotalPct:-1},now).qualifiedProxy],
+  ['invalid_scope',!classifyForwardCandidate(reg,{...perf,eligibleForSignals:true},now).qualifiedProxy],
+  ['future_registration',!classifyForwardCandidate({...reg,registeredAt:new Date(now+86400000).toISOString()},perf,now).qualifiedProxy],
+  ['unfrozen',!classifyForwardCandidate({...reg,frozenTestSpec:null},perf,now).qualifiedProxy]
+ ];
+ return {passed:cases.filter(x=>x[1]).length,total:cases.length,cases:cases.map(([name,pass])=>({name,pass})),syntheticOnly:true};
+}
+
+// Persisted strategy transition: qualified index proxies enter PAPER_RESEARCH only.
+// A deterministic idempotency key prevents repeated scheduled promotions.
+function paperPromotionDecision(qualification, registration, now=Date.now()){
+ const reasons=[];
+ if(qualification?.qualifiedProxy!==true || qualification?.state!=='INDEX_PROXY_RESEARCH_PASSED')reasons.push('FORWARD_PROXY_NOT_QUALIFIED');
+ if(qualification?.approvedForSignals!==false || qualification?.ordersEnabled!==false)reasons.push('UNSAFE_QUALIFICATION_SCOPE');
+ if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(qualification?.id||'')))reasons.push('INVALID_ID');
+ if(!['NIFTY','SENSEX'].includes(qualification?.index))reasons.push('INVALID_INDEX');
+ if(registration?.id!==qualification?.id || registration?.underlying!==qualification?.index)reasons.push('REGISTRATION_MISMATCH');
+ if(!registration?.frozenTestSpec || !registration?.baselineHistoricalSignature)reasons.push('UNFROZEN_SPEC');
+ const at=Date.parse(qualification?.at||'');
+ if(!Number.isFinite(at)||at>now||now-at>48*3600000)reasons.push('STALE_QUALIFICATION');
+ return {eligible:reasons.length===0,reasons,scope:'PAPER_RESEARCH_ONLY',productionSignalsEnabled:false,ordersEnabled:false};
+}
+async function automaticPaperPromotion(e){
+ const at=new Date().toISOString(),outcomes=[];
+ if(!hasKV(e))return {at,status:'BLOCKED_KV',outcomes,productionSignalsEnabled:false};
+ const latest=await get(e,'research:forward-qualification:last');
+ if(!latest || latest.status!=='COMPLETED' || !Array.isArray(latest.outcomes))return {at,status:'NO_COMPLETED_QUALIFICATION',outcomes,productionSignalsEnabled:false};
+ for(const q of latest.outcomes.slice(-12)){
+  if(!['NIFTY','SENSEX'].includes(q?.index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(q?.id||'')))continue;
+  try{
+   const reg=await get(e,`forward:registration:${q.index}:${q.id}`);
+   const decision=paperPromotionDecision(q,reg);
+   if(!decision.eligible){outcomes.push({index:q.index,id:q.id,status:'BLOCKED',reasons:decision.reasons});continue}
+   const key=`research:paper-promotion:${q.index}:${q.id}`;
+   const previous=await get(e,key);
+   if(previous?.status==='PAPER_RESEARCH_APPROVED'){
+    outcomes.push({index:q.index,id:q.id,status:'ALREADY_REGISTERED'});continue;
+   }
+   const record={index:q.index,id:q.id,at,status:'PAPER_RESEARCH_APPROVED',registrationAt:reg.registeredAt,
+    baselineHistoricalSignature:reg.baselineHistoricalSignature,scope:'PAPER_RESEARCH_ONLY',
+    productionSignalsEnabled:false,ordersEnabled:false,optionPremiumVerified:false};
+   if(!await put(e,key,record,86400*90))throw Error('PAPER_PROMOTION_WRITE_FAILED');
+   outcomes.push({index:q.index,id:q.id,status:'PAPER_RESEARCH_APPROVED'});
+  }catch(err){outcomes.push({index:q.index,id:q.id,status:'ERROR',reason:String(err?.message||err).slice(0,120)})}
+ }
+ const report={at,status:outcomes.some(x=>x.status==='ERROR')?'DEGRADED':'COMPLETED',outcomes,productionSignalsEnabled:false,ordersEnabled:false};
+ try{if(!await put(e,'research:paper-promotion:last',report,86400*7))report.status='DEGRADED'}catch(err){report.status='DEGRADED'}
+ return report;
+}
+function paperPromotionSelftest(){
+ const now=Date.now(),id='hypothesis:demo';
+ const reg={id,underlying:'NIFTY',frozenTestSpec:{kind:'test'},baselineHistoricalSignature:'fixed'};
+ const q={id,index:'NIFTY',qualifiedProxy:true,state:'INDEX_PROXY_RESEARCH_PASSED',approvedForSignals:false,ordersEnabled:false,at:new Date(now).toISOString()};
+ const tests=[['qualified_paper_only',paperPromotionDecision(q,reg,now).eligible],
+ ['no_production',paperPromotionDecision(q,reg,now).productionSignalsEnabled===false],
+ ['reject_failed_forward',!paperPromotionDecision({...q,qualifiedProxy:false},reg,now).eligible],
+ ['reject_stale',!paperPromotionDecision({...q,at:new Date(now-49*3600000).toISOString()},reg,now).eligible],
+ ['reject_mismatch',!paperPromotionDecision(q,{...reg,id:'hypothesis:other'},now).eligible],
+ ['reject_unfrozen',!paperPromotionDecision(q,{...reg,frozenTestSpec:null},now).eligible],
+ ['reject_unsafe_scope',!paperPromotionDecision({...q,approvedForSignals:true},reg,now).eligible],
+ ['reject_bad_index',!paperPromotionDecision({...q,index:'BANKNIFTY'},reg,now).eligible]];
+ return {passed:tests.filter(t=>t[1]).length,total:tests.length,cases:tests.map(([name,pass])=>({name,pass})),syntheticOnly:true};
+}
+// Cross-module release gate. Read-only: never promotes strategies, sends alerts or orders.
+function evaluateReleaseEvidence(x, now=Date.now()) {
+ const issues=[];
+ const check=(ok,reason)=>{if(!ok)issues.push(reason)};
+ const timestamp=(v,maxAge)=>{const t=Date.parse(v||'');return Number.isFinite(t)&&t<=now&&now-t<=maxAge};
+ check(x.kv===true,'KV_UNAVAILABLE');
+ check(x.ai===true,'AI_BINDING_UNAVAILABLE');
+ check(x.broker===true,'BROKER_CREDENTIALS_MISSING');
+ check(x.telegram===true,'TELEGRAM_CONFIGURATION_MISSING');
+ check(x.calendar===true,'CALENDAR_NOT_CONFIGURED');
+ check(x.ordersEnabled===false,'REAL_ORDERS_MUST_REMAIN_DISABLED');
+ check(x.marketOpen===true,'MARKET_CLOSED_OR_HOLIDAY');
+ check(x.scan?.scanHealthy===true,'SCAN_NOT_HEALTHY');
+ check(timestamp(x.scan?.at,5*60000),'SCAN_NOT_FRESH');
+ check(Number(x.scan?.quoteFresh)>0,'NO_FRESH_BROKER_QUOTES');
+ check(x.paperIntegrity?.ok===true,'PAPER_STATE_NOT_VERIFIED');
+ check(x.strategy?.approved===true && x.strategy?.holdoutVerified===true && x.strategy?.forwardVerified===true,'STRATEGY_NOT_INDEPENDENTLY_VALIDATED');
+ check(x.option?.fresh===true && x.option?.spreadVerified===true && x.option?.greeksVerified===true && x.option?.expiryVerified===true,'OPTION_EVIDENCE_INCOMPLETE');
+ check(x.signal?.aiReviewed===true && x.signal?.riskApproved===true,'SIGNAL_NOT_REVIEWED');
+ check(x.delivery?.ready===true,'ALERT_DELIVERY_NOT_READY');
+ return {ready:issues.length===0,issues,checkedAt:new Date(now).toISOString(),readOnly:true,ordersEnabled:false,notice:'Diagnostic gate only. Does not enable or send production signals.'};
+}
+async function releaseEvidenceAudit(e){
+ const [scan, n, s, paper] = await Promise.all([
+  get(e,'scan:last'),get(e,'strategy:approved:NIFTY'),get(e,'strategy:approved:SENSEX'),persistedPaperIntegrity(e)
+ ]);
+ // No speculative mapping from arbitrary stored objects to independently certified evidence.
+ const evidence={kv:hasKV(e),ai:!!e.AI,broker:cfg(e).length===0,
+  telegram:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID,
+  calendar:calendarConfigured(e),ordersEnabled:false,marketOpen:marketOpen(e),scan,
+  paperIntegrity:paper,strategy:{approved:false,holdoutVerified:false,forwardVerified:false},
+  option:{fresh:false,spreadVerified:false,greeksVerified:false,expiryVerified:false},
+  signal:{aiReviewed:false,riskApproved:false},delivery:{ready:false}};
+ const result=evaluateReleaseEvidence(evidence);
+ return {...result,indices:{NIFTY:{storedCandidate:!!n,independentlyCertified:false},SENSEX:{storedCandidate:!!s,independentlyCertified:false}},verifiedProductionSignals:false};
+}
+function releaseGateSelftest(){
+ const now=Date.parse('2026-11-10T08:00:00.000Z');
+ const base={kv:true,ai:true,broker:true,telegram:true,calendar:true,ordersEnabled:false,marketOpen:true,
+  scan:{scanHealthy:true,at:new Date(now-1000).toISOString(),quoteFresh:2},paperIntegrity:{ok:true},
+  strategy:{approved:true,holdoutVerified:true,forwardVerified:true},
+  option:{fresh:true,spreadVerified:true,greeksVerified:true,expiryVerified:true},
+  signal:{aiReviewed:true,riskApproved:true},delivery:{ready:true}};
+ const cases=[['valid_evidence',base,true],
+  ['missing_kv',{...base,kv:false},false],['missing_ai',{...base,ai:false},false],
+  ['missing_broker',{...base,broker:false},false],['missing_telegram',{...base,telegram:false},false],
+  ['missing_calendar',{...base,calendar:false},false],['real_orders_on',{...base,ordersEnabled:true},false],
+  ['market_closed',{...base,marketOpen:false},false],['scan_unhealthy',{...base,scan:{...base.scan,scanHealthy:false}},false],
+  ['stale_scan',{...base,scan:{...base.scan,at:new Date(now-360000).toISOString()}},false],
+  ['future_scan',{...base,scan:{...base.scan,at:new Date(now+1000).toISOString()}},false],
+  ['no_quotes',{...base,scan:{...base.scan,quoteFresh:0}},false],
+  ['corrupt_paper',{...base,paperIntegrity:{ok:false}},false],
+  ['no_holdout',{...base,strategy:{...base.strategy,holdoutVerified:false}},false],
+  ['no_forward',{...base,strategy:{...base.strategy,forwardVerified:false}},false],
+  ['missing_greeks',{...base,option:{...base.option,greeksVerified:false}},false],
+  ['wide_spread',{...base,option:{...base.option,spreadVerified:false}},false],
+  ['invalid_expiry',{...base,option:{...base.option,expiryVerified:false}},false],
+  ['ai_not_reviewed',{...base,signal:{...base.signal,aiReviewed:false}},false],
+  ['risk_not_approved',{...base,signal:{...base.signal,riskApproved:false}},false],
+  ['delivery_down',{...base,delivery:{ready:false}},false]];
+
+ const results=cases.map(([name,input,expected])=>({name,pass:evaluateReleaseEvidence(input,now).ready===expected}));
+ return {passed:results.filter(r=>r.pass).length,total:results.length,cases:results,syntheticOnly:true,ordersEnabled:false};
+}
+
+
+// Evidence-based strategy certification: never infer real option results from index proxies.
+function certifyOptionStrategyEvidence(x,now=Date.now()){
+ const blockers=[];
+ const validDate=v=>Number.isFinite(Date.parse(v||''))&&Date.parse(v)<=now&&Date.parse(v)>now-120*86400000;
+ if(!x||!['NIFTY','SENSEX'].includes(x.index))blockers.push('INVALID_INDEX');
+ if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(x?.id||'')))blockers.push('INVALID_STRATEGY_ID');
+ if(!x?.frozenSpecHash||typeof x.frozenSpecHash!=='string')blockers.push('MISSING_FROZEN_SPEC');
+ if(!validDate(x?.registeredAt))blockers.push('INVALID_REGISTRATION');
+ const h=x?.historical, f=x?.forward;
+ for(const [label,v,min] of [['HISTORICAL',h,30],['FORWARD',f,20]]){
+  if(!v||v.instrumentType!=='OPTION_PREMIUM'||v.underlying!==x?.index||v.strategyId!==x?.id)blockers.push(label+'_PROVENANCE');
+  if(!Number.isInteger(v?.trades)||v.trades<min)blockers.push(label+'_INSUFFICIENT_TRADES');
+  if(!Number.isFinite(v?.netProfitAfterCosts)||v.netProfitAfterCosts<=0)blockers.push(label+'_NOT_PROFITABLE_AFTER_COSTS');
+  if(!Number.isFinite(v?.profitFactor)||v.profitFactor<1.2)blockers.push(label+'_WEAK_PROFIT_FACTOR');
+  if(!Number.isFinite(v?.maxDrawdown)||v.maxDrawdown<0||v.maxDrawdown>0.15)blockers.push(label+'_DRAWDOWN');
+  if(v?.costsVerified!==true||v?.bidAskFillModel!==true)blockers.push(label+'_UNVERIFIED_EXECUTION_COSTS');
+  if(!validDate(v?.completedAt))blockers.push(label+'_INVALID_COMPLETION');
+  if(!v?.datasetHash||!v?.tradeLedgerHash)blockers.push(label+'_MISSING_AUDIT_HASHES');
+ }
+ if(validDate(h?.completedAt)&&validDate(f?.completedAt)&&Date.parse(h.completedAt)>=Date.parse(f.completedAt))blockers.push('HISTORICAL_FORWARD_ORDER');
+ if(validDate(x?.registeredAt)&&validDate(f?.completedAt)&&Date.parse(x.registeredAt)>=Date.parse(f.completedAt))blockers.push('FORWARD_BEFORE_REGISTRATION');
+ if(h?.datasetHash&&h.datasetHash===f?.datasetHash)blockers.push('TRAIN_FORWARD_DATA_OVERLAP');
+ if(x?.independentQuoteEvidence!==true)blockers.push('NO_INDEPENDENT_BROKER_QUOTES');
+ if(x?.greeksEvidence!==true)blockers.push('NO_VERIFIED_GREEKS');
+ if(x?.riskAuditPassed!==true)blockers.push('RISK_AUDIT_MISSING');
+ return {certified:blockers.length===0,blockers,scope:'EVIDENCE_EVALUATION_ONLY',ordersEnabled:false};
+}
+function certificationRegression(){
+ const now=Date.now(),iso=d=>new Date(now-d*86400000).toISOString(),id='hypothesis:demo';
+ const mk=(trades,completedAt,hash)=>({instrumentType:'OPTION_PREMIUM',underlying:'NIFTY',strategyId:id,trades,netProfitAfterCosts:1200,profitFactor:1.6,maxDrawdown:0.07,costsVerified:true,bidAskFillModel:true,completedAt,datasetHash:hash,tradeLedgerHash:'ledger-'+hash});
+ const good={index:'NIFTY',id,frozenSpecHash:'sha256:demo',registeredAt:iso(15),historical:mk(40,iso(20),'train'),forward:mk(25,iso(2),'forward'),independentQuoteEvidence:true,greeksEvidence:true,riskAuditPassed:true};
+ const cases=[['valid_evidence',good,true],['no_greeks',{...good,greeksEvidence:false},false],['proxy_only',{...good,historical:{...good.historical,instrumentType:'INDEX_PROXY'}},false],['overlap',{...good,forward:{...good.forward,datasetHash:'train'}},false],['low_trades',{...good,forward:{...good.forward,trades:2}},false],['no_costs',{...good,historical:{...good.historical,costsVerified:false}},false],['unprofitable',{...good,forward:{...good.forward,netProfitAfterCosts:-1}},false],['bad_risk',{...good,riskAuditPassed:false},false],['missing_quotes',{...good,independentQuoteEvidence:false},false],['wrong_strategy',{...good,forward:{...good.forward,strategyId:'hypothesis:other'}},false]];
+ const results=cases.map(([name,v,expected])=>({name,pass:certifyOptionStrategyEvidence(v,now).certified===expected}));
+ return {passed:results.filter(x=>x.pass).length,total:results.length,cases:results,syntheticOnly:true,productionSignalsEnabled:false};
+}
+async function certificationAudit(e){
+ const records=[];
+ for(const index of ['NIFTY','SENSEX']){
+  const last=await get(e,'research:paper-promotion:last');
+  for(const r of (last?.outcomes||[]).filter(x=>x.index===index).slice(-8)){
+   const evidence=await get(e,`research:option-evidence:${index}:${r.id}`);
+   const assessment=certifyOptionStrategyEvidence(evidence);
+   records.push({index,id:r.id,...assessment,evidenceFound:!!evidence});
+  }
+ }
+ return {at:new Date().toISOString(),records,certified:records.filter(x=>x.certified).length,productionSignalsEnabled:false,note:'Audit only; no production promotion or Telegram trade alert is authorized.'};
+}
+
+// Evidence attestation: cross-check claims against independently stored, immutable
+// option-premium trade ledgers. A candidate's own booleans or summary numbers are
+// not proof of real execution or of independent out-of-sample evaluation.
+function validateOptionTradeLedger(ledger,index,id,minimum){
+ const problems=[];
+ if(!ledger||ledger.index!==index||ledger.strategyId!==id||ledger.instrumentType!=='OPTION_PREMIUM')problems.push('LEDGER_PROVENANCE');
+ const trades=ledger?.trades;
+ if(!Array.isArray(trades)||trades.length<minimum||trades.length>10000)return {ok:false,problems:[...problems,'LEDGER_TRADE_COUNT'],metrics:null};
+ const ids=new Set();let net=0,peak=0,equity=0,maxDD=0,grossWin=0,grossLoss=0;
+ let first=Infinity,last=-Infinity;
+ for(const t of trades){
+  const entry=Date.parse(t?.entryAt||''),exit=Date.parse(t?.exitAt||'');
+  if(typeof t?.id!=='string'||!t.id||ids.has(t.id))problems.push('DUPLICATE_OR_INVALID_TRADE_ID');
+  ids.add(t?.id);
+  if(!Number.isFinite(entry)||!Number.isFinite(exit)||entry>=exit||exit>Date.now())problems.push('INVALID_TRADE_TIMELINE');
+  first=Math.min(first,entry);last=Math.max(last,exit);
+  if(!['CE','PE'].includes(t?.side)||!Number.isFinite(t?.entryPremium)||t.entryPremium<=0||!Number.isFinite(t?.exitPremium)||t.exitPremium<0||!Number.isSafeInteger(t?.quantity)||t.quantity<=0)problems.push('INVALID_OPTION_TRADE');
+  if(t?.quoteSource!=='ANGEL_ONE'||!t?.entryQuoteAt||!t?.exitQuoteAt||!t?.contractToken||!t?.expiry)problems.push('MISSING_BROKER_QUOTE_PROVENANCE');
+  // Broker provenance must be temporally plausible, not just non-empty strings.
+  const eq=Date.parse(t?.entryQuoteAt||''),xq=Date.parse(t?.exitQuoteAt||'');
+  if(!Number.isFinite(eq)||!Number.isFinite(xq)||!Number.isFinite(entry)||!Number.isFinite(exit)||
+     Math.abs(entry-eq)>15000||Math.abs(exit-xq)>15000||eq>Date.now()||xq>Date.now())problems.push('UNVERIFIED_QUOTE_TIMESTAMPS');
+  const expiryText=String(t?.expiry||'');
+  const expiryMs=/^\d{4}-\d{2}-\d{2}$/.test(expiryText)?Date.parse(expiryText+'T23:59:59+05:30'):NaN;
+  if(!Number.isFinite(expiryMs)||!Number.isFinite(entry)||entry>expiryMs||exit>expiryMs)problems.push('INVALID_OPTION_EXPIRY');
+  if(!/^[0-9]{1,20}$/.test(String(t?.contractToken||'')))problems.push('INVALID_CONTRACT_TOKEN');
+  const fee=t?.feesINR,slippage=t?.slippageINR;
+  if(!Number.isFinite(fee)||fee<0||!Number.isFinite(slippage)||slippage<0)problems.push('UNVERIFIED_COSTS');
+  const pnl=(t.exitPremium-t.entryPremium)*t.quantity-fee-slippage;
+  if(!Number.isFinite(pnl)||!Number.isFinite(t.netINR)||Math.abs(pnl-t.netINR)>0.02)problems.push('TRADE_PNL_MISMATCH');
+  if(Number.isFinite(pnl)){net+=pnl;equity+=pnl;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,peak-equity);if(pnl>=0)grossWin+=pnl;else grossLoss-=pnl;}
+ }
+ if(!Number.isFinite(first)||!Number.isFinite(last))problems.push('INVALID_LEDGER_DATES');
+ const metrics={trades:trades.length,netProfitAfterCosts:net,profitFactor:grossLoss>0?grossWin/grossLoss:(grossWin>0?999:0),maxDrawdownINR:maxDD,firstAt:Number.isFinite(first)?new Date(first).toISOString():null,lastAt:Number.isFinite(last)?new Date(last).toISOString():null};
+ return {ok:problems.length===0,problems:[...new Set(problems)],metrics};
+}
+async function attestCandidateFromKV(e,index,id){
+ const reasons=[];
+ const evidence=await get(e,`research:option-evidence:${index}:${id}`);
+ if(!evidence)return {index,id,eligible:false,reasons:['NO_OPTION_EVIDENCE'],signalAuthorized:false};
+ const claimed=certifyOptionStrategyEvidence(evidence);
+ reasons.push(...claimed.blockers);
+ const historical=await get(e,`research:verified-ledger:historical:${index}:${id}`);
+ const forward=await get(e,`research:verified-ledger:forward:${index}:${id}`);
+ const h=validateOptionTradeLedger(historical,index,id,30);
+ const f=validateOptionTradeLedger(forward,index,id,20);
+ if(!h.ok)reasons.push(...h.problems.map(x=>'HISTORICAL_'+x));
+ if(!f.ok)reasons.push(...f.problems.map(x=>'FORWARD_'+x));
+ if(h.ok&&f.ok){
+  if(Date.parse(h.metrics.lastAt)>=Date.parse(f.metrics.firstAt))reasons.push('HOLDOUT_FORWARD_OVERLAP');
+  for(const [label,calc,reported] of [['HISTORICAL',h.metrics,evidence.historical],['FORWARD',f.metrics,evidence.forward]]){
+   if(calc.trades!==reported?.trades||Math.abs(calc.netProfitAfterCosts-reported?.netProfitAfterCosts)>0.02||Math.abs(calc.profitFactor-reported?.profitFactor)>0.02)reasons.push(label+'_SUMMARY_MISMATCH');
+  }
+ }
+ // These are research attestations, never permission for automatic financial recommendations.
+ return {index,id,eligible:reasons.length===0,reasons:[...new Set(reasons)],historical:h.metrics,forward:f.metrics,signalAuthorized:false,ordersEnabled:false};
+}
+function attestationRegression(){
+ const now=Date.now(),iso=m=>new Date(now-m*60000).toISOString();
+ const make=(n)=>({index:'NIFTY',strategyId:'hypothesis:demo',instrumentType:'OPTION_PREMIUM',trades:Array.from({length:n},(_,i)=>({id:'t'+i,entryAt:iso(1000-i*2),exitAt:iso(999-i*2),side:'CE',entryPremium:100,exitPremium:102,quantity:25,feesINR:5,slippageINR:1,netINR:44,quoteSource:'ANGEL_ONE',entryQuoteAt:iso(1000-i*2),exitQuoteAt:iso(999-i*2),contractToken:'123',expiry:'2026-11-26'}))});
+ const good=make(30),bad=make(30);bad.trades[1].id=bad.trades[0].id;
+ const wrong=make(30);wrong.trades[0].netINR=999;
+ const staleQuote=make(30);staleQuote.trades[0].entryQuoteAt=iso(1200);
+ const badExpiry=make(30);badExpiry.trades[0].expiry='2020-01-01';
+ const badToken=make(30);badToken.trades[0].contractToken='NOT_A_TOKEN';
+ const cases=[['stale_quote_rejected',!validateOptionTradeLedger(staleQuote,'NIFTY','hypothesis:demo',30).ok],['expired_contract_rejected',!validateOptionTradeLedger(badExpiry,'NIFTY','hypothesis:demo',30).ok],['invalid_token_rejected',!validateOptionTradeLedger(badToken,'NIFTY','hypothesis:demo',30).ok],['valid_ledger',validateOptionTradeLedger(good,'NIFTY','hypothesis:demo',30).ok],['duplicate_rejected',!validateOptionTradeLedger(bad,'NIFTY','hypothesis:demo',30).ok],['pnl_mismatch_rejected',!validateOptionTradeLedger(wrong,'NIFTY','hypothesis:demo',30).ok],['missing_ledger_rejected',!validateOptionTradeLedger(null,'NIFTY','hypothesis:demo',30).ok],['insufficient_trades_rejected',!validateOptionTradeLedger(make(3),'NIFTY','hypothesis:demo',30).ok]];
+ return {passed:cases.filter(x=>x[1]).length,total:cases.length,cases:cases.map(([name,pass])=>({name,pass})),syntheticOnly:true};
+}
+
+function isApprovedPromotionOutcome(item){
+ if(!item||typeof item!=='object')return false;
+ return item.status==='PAPER_RESEARCH_APPROVED' || item.status==='ALREADY_REGISTERED';
+}
+// Scheduled, fail-closed evidence certification. Paper approval never implies signal approval.
+async function automaticEvidenceCertification(e){
+ const at=new Date().toISOString(), results=[];
+ const promotions=await get(e,'research:paper-promotion:last');
+ const seen=new Set();
+ for(const item of (Array.isArray(promotions?.outcomes)?promotions.outcomes:[]).slice(-40)){
+  const index=item?.index,id=item?.id;
+  // Only explicit, successfully persisted paper approvals enter certification.
+  // Never certify rejected, errored, or ambiguous promotion outcomes.
+  if(!isApprovedPromotionOutcome(item))continue;
+  if(!['NIFTY','SENSEX'].includes(index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(id||'')))continue;
+  const k=index+':'+id;
+  if(seen.has(k))continue;
+  seen.add(k);
+  let decision;
+  try{
+   const persistedApproval=await get(e,`research:paper-promotion:${index}:${id}`);
+   if(persistedApproval?.status!=='PAPER_RESEARCH_APPROVED') {results.push({index,id,certifiedEvidence:false,blockers:['NO_PERSISTED_PAPER_APPROVAL'],signalAuthorized:false,ordersEnabled:false,at});continue;}
+   const evidence=await get(e,`research:option-evidence:${index}:${id}`);
+   const assessment=certifyOptionStrategyEvidence(evidence);
+   const attestation=await attestCandidateFromKV(e,index,id);
+   // Never grant signal authorization based solely on self-reported evidence.
+   decision={index,id,certifiedEvidence:assessment.certified && attestation.eligible,blockers:[...assessment.blockers,...attestation.reasons],
+    ledgerAttested:attestation.eligible,evidencePresent:!!evidence,signalAuthorized:false,ordersEnabled:false,at};
+  }catch(err){decision={index,id,certifiedEvidence:false,blockers:['EVIDENCE_READ_FAILED'],signalAuthorized:false,ordersEnabled:false,at};}
+  results.push(decision);
+ }
+ const report={at,status:results.length?'EVALUATED':'NO_CANDIDATES',results,
+  evidenceQualified:results.filter(r=>r.certifiedEvidence).length,
+  productionSignalsEnabled:false,ordersEnabled:false};
+ const saved=await put(e,'research:certification:last',report,86400*7);
+ if(!saved)throw Error('CERTIFICATION_AUDIT_PERSISTENCE_FAILED');
+ return report;
+}
+// Evidence-qualified candidates are recorded for review, never silently activated.
+function candidateDecision(cert, now=Date.now()){
+ const blockers=[];
+ if(!cert||!['NIFTY','SENSEX'].includes(cert.index))blockers.push('INVALID_INDEX');
+ if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(cert?.id||'')))blockers.push('INVALID_ID');
+ if(cert?.certifiedEvidence!==true)blockers.push('NOT_CERTIFIED');
+ if(cert?.ledgerAttested!==true)blockers.push('LEDGER_NOT_ATTESTED');
+ if(cert?.evidencePresent!==true)blockers.push('EVIDENCE_MISSING');
+ if(!Array.isArray(cert?.blockers)||cert.blockers.length)blockers.push('CERTIFICATION_BLOCKERS');
+ const ts=Date.parse(cert?.at||'');
+ if(!Number.isFinite(ts)||ts>now+60000||now-ts>86400000)blockers.push('STALE_CERTIFICATION');
+ return {eligible:blockers.length===0,blockers,signalAuthorized:false,ordersEnabled:false};
+}
+async function automaticCandidateReview(e){
+ const at=new Date().toISOString(),report=await get(e,'research:certification:last');
+ const results=[],seen=new Set();
+ if(!report||!Array.isArray(report.results)){
+  const out={at,status:'NO_CERTIFICATION_REPORT',results,productionSignalsEnabled:false,ordersEnabled:false};
+  if(!await put(e,'research:candidate-review:last',out,604800))throw Error('CANDIDATE_REVIEW_SAVE_FAILED');
+  return out;
+ }
+ for(const cert of report.results.slice(0,100)){
+  const key=String(cert?.index)+':'+String(cert?.id);
+  if(seen.has(key))continue;
+  seen.add(key);
+  const assessment=candidateDecision(cert);
+  const item={index:cert?.index,id:cert?.id,status:assessment.eligible?'EVIDENCE_QUALIFIED_REVIEW_ONLY':'BLOCKED',
+   blockers:assessment.blockers,signalAuthorized:false,ordersEnabled:false,at};
+  // Do not create production approvals. Persist a read-only candidate review record.
+  if(assessment.eligible){
+   const persisted=await put(e,'research:candidate-review:'+cert.index+':'+cert.id,item,604800);
+   if(!persisted){item.status='BLOCKED';item.blockers=['PERSISTENCE_FAILED'];}
+  }
+  results.push(item);
+ }
+ const out={at,status:results.length?'REVIEWED':'NO_CANDIDATES',results,
+  qualified:results.filter(x=>x.status==='EVIDENCE_QUALIFIED_REVIEW_ONLY').length,
+  productionSignalsEnabled:false,ordersEnabled:false};
+ if(!await put(e,'research:candidate-review:last',out,604800))throw Error('CANDIDATE_REVIEW_SAVE_FAILED');
+ return out;
+}
+// Production-signal strategy approval is separate from live signal authorization.
+// Approval requires re-reading the independently attested evidence, not trusting a cached summary.
+function productionApprovalDecision(candidate, attestation, evidence, now=Date.now()){
+ const blockers=[...candidateDecision(candidate,now).blockers];
+ if(!attestation?.eligible || attestation?.reasons?.length)blockers.push('INDEPENDENT_LEDGER_ATTESTATION_FAILED');
+ const certified=certifyOptionStrategyEvidence(evidence,now);
+ if(!certified.certified)blockers.push(...certified.blockers.map(x=>'EVIDENCE_'+x));
+ if(evidence?.index!==candidate?.index||evidence?.id!==candidate?.id)blockers.push('EVIDENCE_IDENTITY_MISMATCH');
+ if(!attestation?.historical||!attestation?.forward)blockers.push('LEDGER_METRICS_MISSING');
+ if(attestation?.historical?.trades<30||attestation?.forward?.trades<20)blockers.push('LEDGER_SAMPLE_INSUFFICIENT');
+ if(attestation?.historical?.netProfitAfterCosts<=0||attestation?.forward?.netProfitAfterCosts<=0)blockers.push('LEDGER_NET_LOSS');
+ return {approved:blockers.length===0,blockers:[...new Set(blockers)],ordersEnabled:false};
+}
+async function automaticProductionStrategyApproval(e){
+ const at=new Date().toISOString();
+ const candidates=await get(e,'research:certification:last');
+ const results=[];const seen=new Set();
+ for(const c of (Array.isArray(candidates?.results)?candidates.results:[]).slice(0,100)){
+  const key=String(c?.index)+':'+String(c?.id);
+  if(seen.has(key))continue;seen.add(key);
+  const item={index:c?.index,id:c?.id,at,status:'BLOCKED',blockers:[],ordersEnabled:false};
+  try{
+   const valid=candidateDecision(c);
+   if(!valid.eligible){item.blockers=valid.blockers;results.push(item);continue;}
+   const persisted=await get(e,`research:paper-promotion:${c.index}:${c.id}`);
+   if(persisted?.status!=='PAPER_RESEARCH_APPROVED'){
+    item.blockers=['PAPER_APPROVAL_NOT_PERSISTED'];results.push(item);continue;
+   }
+   const evidence=await get(e,`research:option-evidence:${c.index}:${c.id}`);
+   const attested=await attestCandidateFromKV(e,c.index,c.id);
+   const decision=productionApprovalDecision(c,attested,evidence);
+   item.blockers=decision.blockers;
+   if(decision.approved){
+    // A strategy can be approved for consideration by a separate live signal gate;
+    // it cannot itself place orders or send BUY/SELL recommendations.
+    item.status='PRODUCTION_STRATEGY_APPROVED';
+    item.scope='STRATEGY_ELIGIBILITY_ONLY';
+    item.evidenceHash=evidence.frozenSpecHash;
+    item.validUntil=new Date(Date.now()+6*3600000).toISOString();
+    if(!await put(e,`research:production-approval:${c.index}:${c.id}`,item,21600)){
+     item.status='BLOCKED';item.blockers=['APPROVAL_PERSISTENCE_FAILED'];
+    }
+   }
+  }catch(err){item.status='BLOCKED';item.blockers=['APPROVAL_EVALUATION_ERROR'];}
+  results.push(item);
+ }
+ const out={at,status:'EVALUATED',results,approved:results.filter(x=>x.status==='PRODUCTION_STRATEGY_APPROVED').length,
+  signalPipelineEnabled:false,ordersEnabled:false};
+ if(!await put(e,'research:production-approval:last',out,86400))throw Error('PRODUCTION_APPROVAL_REPORT_SAVE_FAILED');
+ return out;
+}
+function productionApprovalSelftest(){
+ const now=Date.now(),iso=d=>new Date(now-d*86400000).toISOString(),id='hypothesis:demo';
+ const ledger=(trades,date,hash)=>({instrumentType:'OPTION_PREMIUM',underlying:'NIFTY',strategyId:id,trades,netProfitAfterCosts:200,profitFactor:1.5,maxDrawdown:0.05,costsVerified:true,bidAskFillModel:true,completedAt:date,datasetHash:hash,tradeLedgerHash:'ledger-'+hash});
+ const evidence={index:'NIFTY',id,frozenSpecHash:'sha256:test',registeredAt:iso(15),historical:ledger(35,iso(20),'train'),forward:ledger(25,iso(2),'forward'),independentQuoteEvidence:true,greeksEvidence:true,riskAuditPassed:true};
+ const c={index:'NIFTY',id,certifiedEvidence:true,ledgerAttested:true,evidencePresent:true,blockers:[],at:iso(0)};
+ const a={eligible:true,reasons:[],historical:{trades:35,netProfitAfterCosts:200},forward:{trades:25,netProfitAfterCosts:200}};
+ const cases=[['valid',c,a,evidence,true],['missing_ledger',c,null,evidence,false],['missing_greeks',c,a,{...evidence,greeksEvidence:false},false],['loss',c,{...a,forward:{...a.forward,netProfitAfterCosts:-10}},evidence,false],['wrong_id',c,a,{...evidence,id:'hypothesis:other'},false],['stale',{...c,at:iso(2)},a,evidence,false],['not_certified',{...c,certifiedEvidence:false},a,evidence,false],['missing_forward',c,a,{...evidence,forward:null},false]];
+ const results=cases.map(([name,x,y,z,expected])=>({name,pass:productionApprovalDecision(x,y,z,now).approved===expected}));
+ return {passed:results.filter(x=>x.pass).length,total:results.length,results,syntheticOnly:true,ordersEnabled:false};
+}
+function candidateReviewSelftest(){
+ const now=Date.now(),good={index:'NIFTY',id:'hypothesis:demo',certifiedEvidence:true,ledgerAttested:true,
+  evidencePresent:true,blockers:[],at:new Date(now).toISOString()};
+ const cases=[
+  ['valid_review_only',good,true],['no_index',{...good,index:'BANKNIFTY'},false],
+  ['invalid_id',{...good,id:'../../oops'},false],['not_certified',{...good,certifiedEvidence:false},false],
+  ['no_ledger',{...good,ledgerAttested:false},false],['no_evidence',{...good,evidencePresent:false},false],
+  ['has_blockers',{...good,blockers:['MISSING_QUOTE']},false],
+  ['missing_blockers',{...good,blockers:undefined},false],
+  ['future_timestamp',{...good,at:new Date(now+120000).toISOString()},false],
+  ['stale_timestamp',{...good,at:new Date(now-90000000).toISOString()},false],
+  ['missing_timestamp',{...good,at:undefined},false],['null_candidate',null,false]
+ ];
+ const checks=cases.map(([name,c,expected])=>{const d=candidateDecision(c,now);return {name,pass:d.eligible===expected&&d.signalAuthorized===false&&d.ordersEnabled===false}});
+ return {passed:checks.filter(x=>x.pass).length,total:checks.length,checks,syntheticOnly:true};
+}
+function certificationWorkflowRegression(){
+ const checks=[
+  ['rejected_promotion_blocked',!isApprovedPromotionOutcome({status:'REJECTED'})],
+  ['error_promotion_blocked',!isApprovedPromotionOutcome({status:'ERROR'})],
+  ['approved_promotion_allowed',isApprovedPromotionOutcome({status:'PAPER_RESEARCH_APPROVED'})],
+  ['registered_promotion_allowed',isApprovedPromotionOutcome({status:'ALREADY_REGISTERED'})],
+  ['missing_evidence_blocks',!certifyOptionStrategyEvidence(null).certified],
+  ['missing_forward_blocks',!certifyOptionStrategyEvidence({index:'NIFTY',id:'hypothesis:test'}).certified],
+  ['no_order_execution',certifyOptionStrategyEvidence(null).ordersEnabled===false],
+  ['no_implicit_production_approval',certifyOptionStrategyEvidence(null).scope==='EVIDENCE_EVALUATION_ONLY']
+ ];
+ return {passed:checks.filter(x=>x[1]).length,total:checks.length,cases:checks.map(([name,pass])=>({name,pass})),syntheticOnly:true};
+}
+
+// VERIFIED SIGNAL CANDIDATE ENGINE: strategy approval is necessary but never sufficient.
+// It intentionally cannot infer a BUY/SELL from a research WATCH or an AI narrative.
+// Batch-15: independent consistency checks for evidence-bearing signal records.
+// This gate is fail-closed and never places real orders or fabricates quotes.
+function signalEvidenceConsistency({approval,contract,quote,spot,signal,now=Date.now()}={}){
+ const issues=[];
+ const bad=(code,condition)=>{if(condition)issues.push(code)};
+ const index=signal?.index;
+ bad('INDEX_EXCHANGE_MISMATCH',!!contract&&((index==='NIFTY'&&contract.exchange!=='NFO')||(index==='SENSEX'&&contract.exchange!=='BFO')));
+ bad('CONTRACT_SIDE_MISSING',!['CE','PE'].includes(contract?.side));
+ bad('SIGNAL_TIME_MISSING',!Number.isFinite(Date.parse(signal?.at||'')));
+ const signalAt=Date.parse(signal?.at||'');
+ bad('SIGNAL_TIME_IN_FUTURE',Number.isFinite(signalAt)&&signalAt>now+2000);
+ bad('SIGNAL_TOO_OLD',Number.isFinite(signalAt)&&now-signalAt>60000);
+ const quoteAt=Date.parse(quote?.at||'');
+ bad('SIGNAL_QUOTE_TIME_SKEW',Number.isFinite(signalAt)&&Number.isFinite(quoteAt)&&Math.abs(signalAt-quoteAt)>15000);
+ const spotAt=Date.parse(spot?.at||'');
+ bad('SPOT_OPTION_TIME_SKEW',Number.isFinite(spotAt)&&Number.isFinite(quoteAt)&&Math.abs(spotAt-quoteAt)>15000);
+ bad('BID_ASK_LAST_INCONSISTENT',Number.isFinite(quote?.price)&&Number.isFinite(quote?.bid)&&Number.isFinite(quote?.ask)&&(quote.price<quote.bid*0.95||quote.price>quote.ask*1.05));
+ bad('EMPTY_STRATEGY_ID',typeof signal?.strategyId!=='string'||!signal.strategyId.trim());
+ bad('CERTIFICATION_ID_MISMATCH',!!approval?.certificationId&&signal?.strategyCertificationId!==approval.certificationId);
+ bad('INVALID_EVIDENCE_REFERENCE',![signal?.historicalEvidenceId,signal?.forwardEvidenceId,signal?.brokerQuoteEvidenceId].every(x=>typeof x==='string'&&x.length>=6&&x.length<=256));
+ bad('INVALID_REASON',typeof signal?.reason!=='string'||signal.reason.trim().length<8||signal.reason.length>800);
+ bad('INVALID_QUANTITY',!Number.isSafeInteger(Number(signal?.lots)*Number(contract?.lotSize))||Number(signal?.lots)*Number(contract?.lotSize)<=0);
+ bad('STOP_TOO_CLOSE_TO_ZERO',Number.isFinite(signal?.stop)&&signal.stop<0.05);
+ bad('TARGET_RISK_REWARD_INVALID',Number.isFinite(signal?.stop)&&Number.isFinite(signal?.target)&&Number.isFinite(quote?.ask)&&signal?.action!=='EXIT'&&signal.target-quote.ask<0.5*(quote.ask-signal.stop));
+ return [...new Set(issues)];
+}
+function verifiedSignalDecision({approval,contract,quote,spot,signal,now=Date.now(),sessionOpen=false,ledgerHealthy=false}={}){
+ const blockers=signalEvidenceConsistency({approval,contract,quote,spot,signal,now});
+ if(!sessionOpen)blockers.push('SESSION_CLOSED');
+ if(!ledgerHealthy)blockers.push('PAPER_LEDGER_UNHEALTHY');
+ if(approval?.status!=='PRODUCTION_STRATEGY_APPROVED')blockers.push('STRATEGY_NOT_APPROVED');
+ const until=Date.parse(approval?.validUntil||'');
+ if(!Number.isFinite(until)||until<=now)blockers.push('APPROVAL_EXPIRED');
+ if(!['NIFTY','SENSEX'].includes(contract?.underlying))blockers.push('INVALID_INDEX');
+ if(!['CE','PE'].includes(contract?.side))blockers.push('INVALID_OPTION_SIDE');
+ if(!['NFO','BFO'].includes(contract?.exchange)||!/^\d+$/.test(String(contract?.token||'')))blockers.push('INVALID_CONTRACT');
+ if(!contract?.symbol||!Number.isFinite(Date.parse(contract?.expiry))||Date.parse(contract.expiry)<=now)blockers.push('EXPIRED_OR_UNKNOWN_EXPIRY');
+ if(!Number.isFinite(quote?.bid)||!Number.isFinite(quote?.ask)||quote.bid<=0||quote.ask<quote.bid)blockers.push('INVALID_BID_ASK');
+ else if((quote.ask-quote.bid)/quote.ask>0.02)blockers.push('SPREAD_TOO_WIDE');
+ if(!Number.isFinite(quote?.price)||quote.price<=0)blockers.push('INVALID_PREMIUM');
+ if(!Number.isFinite(quote?.oi)||quote.oi<=0||!Number.isFinite(quote?.volume)||quote.volume<=0)blockers.push('LIQUIDITY_UNVERIFIED');
+ const ts=Date.parse(quote?.at||'');
+ if(!Number.isFinite(ts)||ts>now+2000||now-ts>15000)blockers.push('STALE_OPTION_QUOTE');
+ const st=Date.parse(spot?.at||'');
+ if(!Number.isFinite(st)||st>now+2000||now-st>15000||!Number.isFinite(spot?.price)||spot.price<=0)blockers.push('STALE_SPOT_QUOTE');
+ if(!['BUY_CE','BUY_PE','EXIT','WAIT'].includes(signal?.action))blockers.push('INVALID_ACTION');
+ if(signal?.action==='BUY_CE'&&contract?.side!=='CE'||signal?.action==='BUY_PE'&&contract?.side!=='PE')blockers.push('SIDE_MISMATCH');
+ if(signal?.strategyId!==approval?.id||signal?.index!==approval?.index||signal?.index!==contract?.underlying)blockers.push('STRATEGY_ID_MISMATCH');
+ if(signal?.validated!==true||signal?.independentEvidence!==true)blockers.push('SIGNAL_NOT_INDEPENDENTLY_VALIDATED');
+ if(!Number.isFinite(signal?.stop)||!Number.isFinite(signal?.target)||signal.stop<=0||signal.stop>=quote?.price||signal.target<=quote?.price)blockers.push('INVALID_RISK_LEVELS');
+ if(!Number.isFinite(signal?.confidence)||signal.confidence<0||signal.confidence>1)blockers.push('INVALID_CONFIDENCE');
+ if(signal?.action==='WAIT')blockers.push('NO_DIRECTIONAL_SIGNAL');
+ if(!Number.isFinite(quote?.ask)||!Number.isFinite(signal?.stop)||!Number.isFinite(signal?.target)||signal?.action==='BUY_CE'||signal?.action==='BUY_PE'){
+  if(['BUY_CE','BUY_PE'].includes(signal?.action)&&Number.isFinite(quote?.ask)&&Number.isFinite(signal?.stop)&&Number.isFinite(signal?.target)&&(signal.stop>=quote.ask||signal.target<=quote.ask))blockers.push('NON_EXECUTABLE_ENTRY_LEVELS');
+ }
+ if(Number.isFinite(Date.parse(approval?.validUntil||''))&&Date.parse(approval.validUntil)>now+366*86400000)blockers.push('IMPLAUSIBLE_APPROVAL_EXPIRY');
+ if(Number.isFinite(Date.parse(contract?.expiry||''))&&Date.parse(contract.expiry)>now+366*86400000)blockers.push('IMPLAUSIBLE_CONTRACT_EXPIRY');
+ // Additional independent evidence gates. Never trust an AI-generated `validated`
+ // flag alone; require immutable, externally produced evidence references.
+ if(!Number.isSafeInteger(Number(contract?.lotSize))||Number(contract.lotSize)<=0)blockers.push('INVALID_LOT_SIZE');
+ if(!Number.isSafeInteger(Number(signal?.lots))||Number(signal.lots)<=0)blockers.push('INVALID_LOTS');
+ if(!Number.isFinite(quote?.delta)||Math.abs(quote.delta)>1)blockers.push('GREEKS_UNVERIFIED');
+ if(!Number.isFinite(quote?.iv)||quote.iv<=0||quote.iv>5)blockers.push('IV_UNVERIFIED');
+ if(!Number.isFinite(quote?.bidSize)||quote.bidSize<=0||!Number.isFinite(quote?.askSize)||quote.askSize<=0)blockers.push('DEPTH_UNVERIFIED');
+ if(!Number.isFinite(signal?.maxLossInr)||signal.maxLossInr<=0)blockers.push('RISK_BUDGET_MISSING');
+ if(!Number.isFinite(signal?.dailyLossRemainingInr)||signal.dailyLossRemainingInr<signal.maxLossInr)blockers.push('DAILY_RISK_EXCEEDED');
+ if(!Number.isFinite(signal?.chargesInr)||signal.chargesInr<0)blockers.push('CHARGES_UNVERIFIED');
+ if(!signal?.historicalEvidenceId||!signal?.forwardEvidenceId||signal.historicalEvidenceId===signal.forwardEvidenceId)blockers.push('INDEPENDENT_TEST_EVIDENCE_MISSING');
+ if(!signal?.brokerQuoteEvidenceId||!signal?.strategyCertificationId)blockers.push('BROKER_OR_CERTIFICATION_EVIDENCE_MISSING');
+ if(signal?.action==='EXIT'&&!signal?.openPositionId)blockers.push('EXIT_POSITION_NOT_IDENTIFIED');
+ if(['BUY_CE','BUY_PE'].includes(signal?.action)&&signal?.openPositionId)blockers.push('ENTRY_WHILE_POSITION_OPEN');
+ if(Number.isFinite(quote?.ask)&&Number.isFinite(signal?.lots)&&Number.isFinite(contract?.lotSize)&&Number.isFinite(signal?.maxLossInr)&&Number.isFinite(signal?.stop)){
+  const maxPremiumLoss=Math.max(0,quote.ask-signal.stop)*signal.lots*contract.lotSize;
+  if(maxPremiumLoss>signal.maxLossInr)blockers.push('STOP_RISK_EXCEEDS_BUDGET');
+ }
+
+ // Batch 20: additional independent safety and evidence consistency checks.
+ const entry=['BUY_CE','BUY_PE'].includes(signal?.action);
+ const safeId=x=>typeof x==='string'&&/^[a-zA-Z0-9:_-]{3,128}$/.test(x);
+ if(!safeId(signal?.historicalEvidenceId))blockers.push('INVALID_HISTORICAL_EVIDENCE_ID');
+ if(!safeId(signal?.forwardEvidenceId))blockers.push('INVALID_FORWARD_EVIDENCE_ID');
+ if(!safeId(signal?.brokerQuoteEvidenceId))blockers.push('INVALID_QUOTE_EVIDENCE_ID');
+ if(!safeId(signal?.strategyCertificationId))blockers.push('INVALID_CERTIFICATION_ID');
+ if(signal?.strategyCertificationId!==approval?.certificationId)blockers.push('CERTIFICATION_ID_MISMATCH');
+ if(signal?.historicalEvidenceId!==approval?.historicalEvidenceId)blockers.push('HISTORICAL_EVIDENCE_MISMATCH');
+ if(signal?.forwardEvidenceId!==approval?.forwardEvidenceId)blockers.push('FORWARD_EVIDENCE_MISMATCH');
+ if(signal?.brokerQuoteEvidenceId!==quote?.evidenceId)blockers.push('QUOTE_EVIDENCE_MISMATCH');
+ if(contract?.exchange!==(contract?.underlying==='NIFTY'?'NFO':'BFO'))blockers.push('INDEX_EXCHANGE_MISMATCH');
+ if(signal?.contractToken!==String(contract?.token||''))blockers.push('SIGNAL_CONTRACT_MISMATCH');
+ if(signal?.contractSymbol!==contract?.symbol)blockers.push('SIGNAL_SYMBOL_MISMATCH');
+ if(signal?.action==='EXIT'&&signal?.positionContractToken!==String(contract?.token||''))blockers.push('EXIT_CONTRACT_MISMATCH');
+ if(entry&&signal?.openPositionId)blockers.push('POSITION_ALREADY_OPEN');
+ if(entry&&(!Number.isFinite(signal?.riskReward)||signal.riskReward<1))blockers.push('MINIMUM_REWARD_RISK');
+ if(entry&&Number.isFinite(signal?.stop)&&Number.isFinite(signal?.target)&&Number.isFinite(quote?.ask)&&quote.ask>signal.stop){
+  const rr=(signal.target-quote.ask)/(quote.ask-signal.stop);
+  if(rr<1||Math.abs(rr-signal.riskReward)>0.15)blockers.push('REWARD_RISK_INCONSISTENT');
+ }
+ if(entry&&Number.isFinite(signal?.maxLossInr)&&Number.isFinite(signal?.chargesInr)&&signal.chargesInr>=signal.maxLossInr)blockers.push('COSTS_EXCEED_RISK_BUDGET');
+ if(entry&&Number.isFinite(quote?.askSize)&&Number.isFinite(signal?.lots)&&Number.isFinite(contract?.lotSize)&&quote.askSize<signal.lots*contract.lotSize)blockers.push('INSUFFICIENT_ASK_DEPTH');
+ if(entry&&Number.isFinite(signal?.capitalAvailableInr)&&Number.isFinite(quote?.ask)&&Number.isFinite(signal?.lots)&&Number.isFinite(contract?.lotSize)&&signal.capitalAvailableInr<quote.ask*signal.lots*contract.lotSize+Math.max(0,signal.chargesInr||0))blockers.push('INSUFFICIENT_PAPER_CAPITAL');
+ if(entry&&(!Number.isFinite(signal?.capitalAvailableInr)||signal.capitalAvailableInr<=0))blockers.push('PAPER_CAPITAL_UNVERIFIED');
+ if(!Number.isFinite(Date.parse(signal?.at||''))||Date.parse(signal.at)>now+2000||now-Date.parse(signal.at)>15000)blockers.push('SIGNAL_TIMESTAMP_INVALID');
+ return {authorized:blockers.length===0&&signal?.action!=='WAIT',decision:blockers.length?'WAIT':signal?.action,blockers:[...new Set(blockers)],ordersEnabled:false};
+}
+// Independent evidence is required; the scanner never invents a trade signal.
+// Delivery is deliberately at-most-once: ambiguous Telegram outcomes are held
+// for operator reconciliation, not blindly retried.
+function productionAlertMessage(record){
+ const {signal:s,contract:c,quote:q}=record;
+ if(!['BUY_CE','BUY_PE','EXIT'].includes(s.action))throw Error('UNSUPPORTED_SIGNAL_ACTION');
+ return `📊 JANGGO VERIFIED PAPER SIGNAL\n${s.index} ${s.action}\n${c.symbol} (${c.exchange})\nPremium ₹${q.price} | Bid ₹${q.bid} | Ask ₹${q.ask}\nSL ₹${s.stop} | Target ₹${s.target}\nConfidence ${(s.confidence*100).toFixed(1)}%\nStrategy ${s.strategyId}\nReason: ${s.reason}\nEvidence ${s.brokerQuoteEvidenceId}\n⚠️ Signals only. No broker order.`;
+}
+function productionDeliveryKey(index,record){
+ const s=record?.signal||{};
+ const parts=[index,s.strategyId,s.action,s.contractToken,s.at,s.brokerQuoteEvidenceId];
+ if(parts.some(x=>typeof x!=='string'||!x||x.length>256))throw Error('INVALID_DELIVERY_IDENTITY');
+ return 'signal:delivery:'+parts.map(x=>encodeURIComponent(x)).join(':');
+}
+// Evidence intake bridge: never constructs a signal from AI prose or a research WATCH.
+// A separate independent validator may persist a fully attested candidate under
+// signal:independent:<INDEX>. This bridge checks its integrity and promotes it to
+// the existing delivery pipeline only when it is current and broker reconciled.
+// Independent signal intake consistency checks: no self-attested provenance.
+function independentIntakeChecks(candidate,index,scan,approval,paper,now=Date.now()){
+ const s=candidate?.signal||{}, c=candidate?.contract||{}, q=candidate?.quote||{}, sp=candidate?.spot||{};
+ const errors=[]; const fail=(name,test)=>{if(test)errors.push(name)};
+ const signalAt=Date.parse(s.at||''),quoteAt=Date.parse(q.at||''),spotAt=Date.parse(sp.at||'');
+ fail('INDEX_MISMATCH',s.index!==index);
+ fail('INDEX_NOT_SUPPORTED',!['NIFTY','SENSEX'].includes(index));
+ fail('BROKER_NOT_RECONCILED',candidate?.brokerReconciled!==true);
+ fail('INDEPENDENT_VALIDATOR_MISSING',candidate?.independentValidatorPassed!==true);
+ fail('APPROVAL_MISSING',approval?.status!=='PRODUCTION_STRATEGY_APPROVED');
+ fail('STRATEGY_MISMATCH',s.strategyId!==approval?.id);
+ fail('APPROVAL_INDEX_MISMATCH',approval?.index!==index);
+ fail('APPROVAL_EXPIRED',!Number.isFinite(Date.parse(approval?.validUntil||''))||Date.parse(approval.validUntil)<=now);
+ fail('SCAN_UNHEALTHY',scan?.scanHealthy!==true||scan?.scanSummarySaved!==true);
+ fail('SCAN_STALE',!Number.isFinite(Date.parse(scan?.at||''))||now-Date.parse(scan.at)>60000||now<Date.parse(scan.at)-2000);
+ fail('SIGNAL_STALE',!Number.isFinite(signalAt)||now-signalAt>15000||signalAt>now+2000);
+ fail('QUOTE_STALE',!Number.isFinite(quoteAt)||now-quoteAt>15000||quoteAt>now+2000);
+ fail('SPOT_STALE',!Number.isFinite(spotAt)||now-spotAt>15000||spotAt>now+2000);
+ fail('SIGNAL_QUOTE_SKEW',Number.isFinite(signalAt)&&Number.isFinite(quoteAt)&&Math.abs(signalAt-quoteAt)>15000);
+ fail('CONTRACT_MISMATCH',String(s.contractToken||'')!==String(c.token||'')||s.contractSymbol!==c.symbol);
+ fail('CONTRACT_EXCHANGE_MISMATCH',c.exchange!==(index==='NIFTY'?'NFO':'BFO'));
+ fail('QUOTE_EVIDENCE_MISMATCH',s.brokerQuoteEvidenceId!==q.evidenceId);
+ fail('PAPER_LEDGER_UNHEALTHY',paper?.healthy!==true);
+ fail('NO_DIRECTIONAL_ACTION',!['BUY_CE','BUY_PE','EXIT'].includes(s.action));
+ fail('INVALID_PREMIUM',!Number.isFinite(q.price)||q.price<=0);
+ return errors;
+}
+function independentIntakeSelftest(){
+ const now=Date.now(),at=new Date(now-1000).toISOString();
+ const base={index:'NIFTY',scan:{scanHealthy:true,scanSummarySaved:true,at},approval:{id:'strategy-1',index:'NIFTY',status:'PRODUCTION_STRATEGY_APPROVED',validUntil:new Date(now+3600000).toISOString()},paper:{healthy:true},candidate:{brokerReconciled:true,independentValidatorPassed:true,signal:{index:'NIFTY',strategyId:'strategy-1',action:'BUY_CE',at,contractToken:'123',contractSymbol:'NIFTYCE',brokerQuoteEvidenceId:'quote-1'},contract:{token:'123',symbol:'NIFTYCE',exchange:'NFO'},quote:{at,price:100,evidenceId:'quote-1'},spot:{at,price:25000}}};
+ const cases=[
+ ['INDEX_MISMATCH',x=>x.candidate.signal.index='SENSEX'],
+ ['INDEX_NOT_SUPPORTED',x=>x.index='BANKNIFTY'],
+ ['BROKER_NOT_RECONCILED',x=>x.candidate.brokerReconciled=false],
+ ['INDEPENDENT_VALIDATOR_MISSING',x=>x.candidate.independentValidatorPassed=false],
+ ['APPROVAL_MISSING',x=>x.approval.status='PENDING'],
+ ['STRATEGY_MISMATCH',x=>x.candidate.signal.strategyId='other'],
+ ['APPROVAL_INDEX_MISMATCH',x=>x.approval.index='SENSEX'],
+ ['APPROVAL_EXPIRED',x=>x.approval.validUntil=new Date(now-1).toISOString()],
+ ['SCAN_UNHEALTHY',x=>x.scan.scanHealthy=false],
+ ['SCAN_STALE',x=>x.scan.at=new Date(now-90000).toISOString()],
+ ['SIGNAL_STALE',x=>x.candidate.signal.at=new Date(now-90000).toISOString()],
+ ['QUOTE_STALE',x=>x.candidate.quote.at=new Date(now-90000).toISOString()],
+ ['SPOT_STALE',x=>x.candidate.spot.at=new Date(now-90000).toISOString()],
+ ['SIGNAL_QUOTE_SKEW',x=>{x.candidate.quote.at=new Date(now-14900).toISOString();x.candidate.signal.at=new Date(now+1500).toISOString()}],
+ ['CONTRACT_MISMATCH',x=>x.candidate.contract.token='456'],
+ ['CONTRACT_EXCHANGE_MISMATCH',x=>x.candidate.contract.exchange='BFO'],
+ ['QUOTE_EVIDENCE_MISMATCH',x=>x.candidate.quote.evidenceId='other'],
+ ['PAPER_LEDGER_UNHEALTHY',x=>x.paper.healthy=false],
+ ['NO_DIRECTIONAL_ACTION',x=>x.candidate.signal.action='WAIT'],
+ ['INVALID_PREMIUM',x=>x.candidate.quote.price=0]
+ ];
+ const results=cases.map(([name,mutate])=>{const x=JSON.parse(JSON.stringify(base));mutate(x);return {name,pass:independentIntakeChecks(x.candidate,x.index,x.scan,x.approval,x.paper,now).includes(name)}});
+ const baseline=independentIntakeChecks(base.candidate,base.index,base.scan,base.approval,base.paper,now);
+ return {passed:results.filter(x=>x.pass).length,total:results.length,baselinePass:baseline.length===0,cases:results,syntheticOnly:true,ordersEnabled:false};
+}
+async function ingestIndependentSignalEvidence(e){
+ const at=new Date().toISOString(),result={at,status:'WAIT',indices:{},promoted:0,ordersEnabled:false};
+ if(!hasKV(e)||!marketOpen(e)){result.reason=!hasKV(e)?'KV_UNAVAILABLE':'SESSION_CLOSED';return result;}
+ const scan=await get(e,'scan:last');
+ const age=Date.now()-Date.parse(scan?.at||'');
+ if(!scan?.scanHealthy||!scan?.scanSummarySaved||!Number.isFinite(age)||age<0||age>60000){result.reason='FRESH_SCAN_REQUIRED';return result;}
+ const approval=await get(e,'research:production-approval:last');
+ for(const index of ['NIFTY','SENSEX']){
+  const row={status:'WAIT',reason:'NO_INDEPENDENT_CANDIDATE'};result.indices[index]=row;
+  try{
+   const candidate=await get(e,'signal:independent:'+index);
+   if(!candidate)continue;
+   const s=candidate.signal;
+   if(s?.index!==index||candidate.brokerReconciled!==true||candidate.independentValidatorPassed!==true){row.reason='INDEPENDENT_ATTESTATION_MISSING';continue;}
+   const approved=(approval?.results||[]).find(x=>x.index===index&&x.id===s.strategyId&&x.status==='PRODUCTION_STRATEGY_APPROVED');
+   const paper=await get(e,'paper:integrity:'+index);
+   const intakeErrors=independentIntakeChecks(candidate,index,scan,approved,paper);
+   if(intakeErrors.length){row.reason='INDEPENDENT_INTAKE_FAILED';row.blockers=intakeErrors;continue;}
+   const verdict=verifiedSignalDecision({approval:approved,contract:candidate.contract,quote:candidate.quote,spot:candidate.spot,signal:s,sessionOpen:true,ledgerHealthy:paper?.healthy===true});
+   if(!verdict.authorized){row.reason='SIGNAL_VALIDATION_FAILED';row.blockers=verdict.blockers;continue;}
+   // A KV write failure must not allow the scheduled delivery pipeline to proceed.
+   const saved=await put(e,'signal:validated:'+index,candidate,120);
+   if(!saved){row.reason='EVIDENCE_PERSISTENCE_FAILED';continue;}
+   row.status='PROMOTED_TO_DELIVERY_REVIEW';row.reason=null;result.promoted++;
+  }catch(err){row.reason='EVIDENCE_INTAKE_ERROR';log('independent evidence intake',err,e);}
+ }
+ result.status=result.promoted?'PROMOTED':'WAIT';
+ await put(e,'signal:evidence-intake:last',result,86400);
+ return result;
+}
+
+// Batch 1: automatically generated, explicitly UNVERIFIED paper research signals.
+// This path never claims production certification and never submits broker orders.
+function paperWatchDecision(w, now=Date.now()) {
+ if(!w||w.status!=='RESEARCH_WATCH'||!['NIFTY','SENSEX'].includes(w.underlying)||!['CE','PE'].includes(w.side))return {ok:false,reason:'INVALID_WATCH'};
+ if(!Number.isFinite(w.referencePremium)||w.referencePremium<=0||!Number.isFinite(w.hypotheticalSL)||!Number.isFinite(w.hypotheticalTarget)||w.hypotheticalSL<=0||w.hypotheticalSL>=w.referencePremium||w.hypotheticalTarget<=w.referencePremium)return {ok:false,reason:'INVALID_LEVELS'};
+ if(!Number.isFinite(w.spotMovePct)||!Number.isFinite(w.premiumMovePct)||!Number.isFinite(w.oiDelta)||w.oiDelta<=0)return {ok:false,reason:'MISSING_MARKET_CONFIRMATION'};
+ if(!Number.isFinite(w.referencePremium)||w.hypotheticalTarget-w.referencePremium<1.2*(w.referencePremium-w.hypotheticalSL))return {ok:false,reason:'LOW_RISK_REWARD'};
+ return {ok:true,action:w.side==='CE'?'PAPER_BUY_CE':'PAPER_BUY_PE'};
+}
+function paperWatchExit(position, observed) {
+ if(!position||position.status!=='OPEN'||!Number.isFinite(observed)||observed<=0||!Number.isFinite(position.entryPremium)||position.entryPremium<=0||!Number.isFinite(position.stop)||!Number.isFinite(position.target)||position.stop<=0||position.stop>=position.entryPremium||position.target<=position.entryPremium)return {exit:false,reason:'INVALID_POSITION_OR_QUOTE'};
+ if(observed<=position.stop)return {exit:true,reason:'STOP_LOSS',price:observed};
+ if(observed>=position.target)return {exit:true,reason:'TARGET',price:observed};
+ return {exit:false,reason:'HOLD'};
+}
+// Durable Object serializes all paper alert decisions. The binding is mandatory:
+// without it scheduled paper alerts fail closed rather than race on eventually consistent KV.
+export class PaperAlertCoordinator {
+ constructor(state,env){this.state=state;this.env=env;this.queue=Promise.resolve();}
+ async fetch(request){
+  if(new URL(request.url).pathname!=='/internal/paper-run')return new Response('Not found',{status:404});
+  const job=this.queue.then(async()=>{
+   // Durable storage is the source of truth for positions; KV is a mirror.
+   const kv=this.env.STATE,storage=this.state.storage;
+   const wrapped={...this.env,STATE:{
+    get:async key=>key.startsWith('research:paper:position:')?(await storage.get(key))??(await kv.get(key)):kv.get(key),
+    put:async(key,value,options)=>{
+     // KV persistence must succeed first; then record durable state before Telegram delivery.
+     await kv.put(key,value,options);
+     if(key.startsWith('research:paper:position:'))await storage.put(key,value);
+    }
+   }};
+   const result=await automaticResearchPaperAlerts(wrapped);
+   return new Response(JSON.stringify(result),{headers:{'content-type':'application/json'}});
+  });
+  this.queue=job.catch(()=>{});
+  try{return await job}catch(err){return new Response(JSON.stringify({status:'BLOCKED',reason:'COORDINATOR_FAILURE'}),{status:503,headers:{'content-type':'application/json'}})}
+ }
+}
+async function coordinatedPaperAlerts(e){
+ if(!e.PAPER_COORDINATOR)return {status:'BLOCKED',reason:'PAPER_COORDINATOR_BINDING_MISSING'};
+ const id=e.PAPER_COORDINATOR.idFromName('janggo-paper-alerts-v1');
+ const response=await e.PAPER_COORDINATOR.get(id).fetch('https://coordinator.internal/internal/paper-run');
+ if(!response.ok)throw Error('PAPER_COORDINATOR_FAILED_'+response.status);
+ return response.json();
+}
+async function automaticResearchPaperAlerts(e) {
+ const at=new Date().toISOString(),report={at,mode:'UNVERIFIED_RESEARCH_PAPER_ONLY',ordersEnabled:false,entries:[],exits:[],blocked:[]};
+ if(!marketOpen(e)||!hasKV(e))return {...report,status:'BLOCKED',reason:!hasKV(e)?'KV_UNAVAILABLE':'SESSION_CLOSED'};
+ const scanState=await get(e,'scan:last');
+ const age=Date.now()-Date.parse(scanState?.at||'');
+ if(!scanState?.scanHealthy||!scanState?.scanSummarySaved||scanState.kvStateSaved!==true||!Number.isFinite(age)||age<0||age>60000)return {...report,status:'BLOCKED',reason:'NO_FRESH_SCAN'};
+ const rolling=await get(e,'rolling:'+day())||{};
+ for(const index of ['NIFTY','SENSEX']) {
+  const key='research:paper:position:'+day()+':'+index; // New trading day has independent paper state
+  const pos=await get(e,key);
+  if(pos?.status==='OPEN') {
+   const history=rolling[pos.exchange+':'+pos.token];
+   const last=Array.isArray(history)?history.at(-1):null;
+   if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<pos.entryAt||last.t<Number(scanState?.at?Date.parse(scanState.at):0)-60000){report.blocked.push(index+':STALE_EXIT_QUOTE');continue;}
+   const decision=paperWatchExit(pos,last.p);
+   if(decision.exit){
+    const closed={...pos,status:'CLOSED',exitAt:last.t,exitPremium:decision.price,exitReason:decision.reason,points:Number((decision.price-pos.entryPremium).toFixed(2)),grossPaperPnl:Number.isFinite(pos.quantity)?Number(((decision.price-pos.entryPremium)*pos.quantity).toFixed(2)):null,delivery:'PENDING'};
+    if(!await put(e,key,closed,86400*7)){report.blocked.push(index+':EXIT_SAVE_FAILED');continue;}
+    const msg=`🧪 JANGGO PAPER RESEARCH EXIT — NOT A VERIFIED TRADE SIGNAL\n${index} ${pos.symbol}\n${decision.reason} | Observed ₹${decision.price.toFixed(2)} | Entry ₹${pos.entryPremium.toFixed(2)} | Premium change ${closed.points}\nNo actual fill or broker order. Quotes are sampled, not independently verified.`;
+    try{const sent=await telegram(e,msg);closed.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';await put(e,key,closed,86400*7);}catch(err){closed.delivery='UNCONFIRMED';await put(e,key,closed,86400*7);}
+    report.exits.push({index,symbol:pos.symbol,reason:decision.reason,delivery:closed.delivery});
+   }
+   continue;
+  }
+  // A closed position cannot reopen within the same day; prevents churn and duplicate notifications.
+  if(pos)continue;
+  const watch=(scanState.strategyWatches||[]).find(w=>w.underlying===index&&paperWatchDecision(w).ok);
+  if(!watch)continue;
+  const ai=(scanState.directionalReview?.decisions||[]).find(d=>d.symbol===watch.symbol);
+  if(!ai){report.blocked.push(index+':AI_REVIEW_MISSING');continue;}
+  if(ai.action!=='WATCH'||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
+  const contract=(scanState.paperContractEvidence||{})[watch.symbol];
+  if(!contract?.token||!contract?.exchange||contract.exchange!==(index==='NIFTY'?'NFO':'BFO')||!/^\d+$/.test(String(contract.token))||!Number.isSafeInteger(Number(contract.lotSize))||Number(contract.lotSize)<=0){report.blocked.push(index+':CONTRACT_EVIDENCE_MISSING');continue;}
+  const history=rolling[contract.exchange+':'+contract.token],last=Array.isArray(history)?history.at(-1):null;
+  if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<Date.parse(scanState.at)-60000){report.blocked.push(index+':QUOTE_MISSING');continue;}
+  if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(Date.parse(contract.expiry))||Date.parse(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
+  if(Math.abs(last.p-watch.referencePremium)/watch.referencePremium>0.03){report.blocked.push(index+':WATCH_PRICE_MISMATCH');continue;}
+  if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
+  const position={status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:last.t,entryPremium:last.p,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
+  if(!await put(e,key,position,86400*7)){report.blocked.push(index+':ENTRY_SAVE_FAILED');continue;}
+  const msg=`🧪 JANGGO PAPER RESEARCH ${watch.side} — NOT A VERIFIED BUY SIGNAL\n${index} ${watch.symbol}\nObserved premium ₹${last.p.toFixed(2)} | Hypothetical SL ₹${position.stop.toFixed(2)} | Target ₹${position.target.toFixed(2)}\nSpot momentum ${watch.spotMovePct}% | OI change ${watch.oiDelta}\nNo broker order. Not independently certified; do not trade from this message.`;
+  try{const sent=await telegram(e,msg);position.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';await put(e,key,position,86400*7);}catch(err){position.delivery='UNCONFIRMED';await put(e,key,position,86400*7);}
+  report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});
+ }
+ report.status='COMPLETED';await put(e,'research:paper:alerts:last',report,86400);return report;
+}
+function paperWatchSelftest(){
+ const w={status:'RESEARCH_WATCH',underlying:'NIFTY',side:'CE',referencePremium:100,hypotheticalSL:97,hypotheticalTarget:105,spotMovePct:0.4,premiumMovePct:2,oiDelta:100};
+ const tests=[['valid',paperWatchDecision(w).ok],['invalid_side',!paperWatchDecision({...w,side:'XX'}).ok],['bad_stop',!paperWatchDecision({...w,hypotheticalSL:110}).ok],['missing_oi',!paperWatchDecision({...w,oiDelta:0}).ok],['low_rr',!paperWatchDecision({...w,hypotheticalTarget:101}).ok],['stop',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},96).reason==='STOP_LOSS'],['target',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},106).reason==='TARGET'],['hold',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},100).exit],['invalid_quote',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},NaN).exit],['invalid_position_levels',!paperWatchExit({status:'OPEN',entryPremium:100,stop:105,target:97},100).exit],['invalid_target',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:NaN},100).exit],['invalid_entry',!paperWatchExit({status:'OPEN',entryPremium:NaN,stop:97,target:105},100).exit],['target_below_entry',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:99},100).exit]];
+ return {passed:tests.filter(x=>x[1]).length,total:tests.length,tests:tests.map(([name,pass])=>({name,pass})),syntheticOnly:true,ordersEnabled:false};
+}
+
+async function productionSignalPipeline(e,{dryRun=true}={}){
+ const at=new Date().toISOString(),out={at,status:'BLOCKED',dryRun,ordersEnabled:false,indices:{},sent:0};
+ if(!hasKV(e)||!marketOpen(e)){out.reason=!hasKV(e)?'KV_UNAVAILABLE':'SESSION_CLOSED';return out;}
+ const last=await get(e,'scan:last'),age=Date.now()-Date.parse(last?.at||'');
+ if(!last?.scanHealthy||!last?.scanSummarySaved||!Number.isFinite(age)||age<0||age>60000){out.reason='SCAN_NOT_VERIFIED_FRESH';return out;}
+ const approved=await get(e,'research:production-approval:last');
+ for(const index of ['NIFTY','SENSEX']){
+  try{
+   const candidates=(approved?.results||[]).filter(x=>x.index===index&&x.status==='PRODUCTION_STRATEGY_APPROVED');
+   const record=await get(e,'signal:validated:'+index);
+   const paper=await get(e,'paper:integrity:'+index);
+   const strategy=candidates.find(x=>x.id===record?.signal?.strategyId);
+   const decision=verifiedSignalDecision({approval:strategy,contract:record?.contract,quote:record?.quote,spot:record?.spot,signal:record?.signal,sessionOpen:marketOpen(e),ledgerHealthy:paper?.healthy===true});
+   const row={decision:decision.decision,blockers:[...decision.blockers],approvedCandidates:candidates.length,delivery:'NOT_ATTEMPTED'};
+   out.indices[index]=row;
+   if(!decision.authorized||dryRun)continue;
+   // Independently produced, immutable quote evidence and matching broker contract
+   // are prerequisites. A generated AI narrative or WATCH cannot reach this path.
+   if(record?.brokerReconciled!==true||record?.independentValidatorPassed!==true){row.decision='WAIT';row.blockers.push('BROKER_RECONCILIATION_OR_INDEPENDENT_VALIDATION_MISSING');continue;}
+   // Telegram alerts are enabled by default; only an explicit operator OFF disables them.
+   // Independent broker, approval, risk, session and paper-ledger gates remain mandatory.
+   if(String(e.ENABLE_VERIFIED_TELEGRAM_SIGNALS||'').toLowerCase()==='false'){row.decision='WAIT';row.blockers.push('TELEGRAM_SIGNALS_OPERATOR_DISABLED');continue;}
+   const key=productionDeliveryKey(index,record);
+   const existing=await get(e,key);
+   if(existing){row.delivery=existing.status||'PREVIOUSLY_RESERVED';row.decision='WAIT';row.blockers.push('ALREADY_RESERVED_OR_DELIVERED');continue;}
+   if(!await put(e,key,{status:'DELIVERY_UNCONFIRMED',at,signalAt:record.signal.at},86400*7)){
+    row.decision='WAIT';row.blockers.push('DELIVERY_RESERVATION_FAILED');continue;
+   }
+   try{
+    const delivery=await telegram(e,productionAlertMessage(record));
+    if(!delivery?.delivered)throw Error('DELIVERY_NOT_CONFIRMED');
+    row.delivery='DELIVERED';out.sent++;
+    if(!await put(e,key,{status:'DELIVERED',at,messageIds:delivery.messageIds||[]},86400*7))row.blockers.push('DELIVERY_RECEIPT_PERSISTENCE_FAILED');
+   }catch(err){row.delivery='DELIVERY_UNCONFIRMED';row.blockers.push('TELEGRAM_DELIVERY_UNCONFIRMED');log('verified signal delivery',err,e);}
+  }catch(err){out.indices[index]={decision:'WAIT',blockers:['PIPELINE_EXCEPTION'],delivery:'NOT_ATTEMPTED'};log('production signal pipeline',err,e);}
+ }
+ out.status=out.sent?'ALERTS_SENT':Object.values(out.indices).some(x=>x.decision!=='WAIT')?'REVIEW_REQUIRED':'WAIT';
+ await put(e,'signal:production-pipeline:last',out,86400);
+ return out;
+}
+function productionDeliverySelftest(){
+ const r={signal:{index:'NIFTY',action:'BUY_CE',strategyId:'strategy:1',contractToken:'123',at:'2026-11-10T09:30:00.000Z',brokerQuoteEvidenceId:'quote:1',confidence:0.8,stop:90,target:120,reason:'Independent validated evidence'},contract:{symbol:'NIFTYCE',exchange:'NFO'},quote:{price:100,bid:99,ask:100}};
+ const tests=[['stable_id',productionDeliveryKey('NIFTY',r)===productionDeliveryKey('NIFTY',r)],['different_tick',productionDeliveryKey('NIFTY',r)!==productionDeliveryKey('NIFTY',{...r,signal:{...r.signal,at:'2026-11-10T09:30:01.000Z'}})],['message_disclaimer',productionAlertMessage(r).includes('No broker order')],['invalid_action_rejected',(()=>{try{productionAlertMessage({...r,signal:{...r.signal,action:'WAIT'}});return false}catch{return true}})()],['missing_identity_rejected',(()=>{try{productionDeliveryKey('NIFTY',{...r,signal:{...r.signal,brokerQuoteEvidenceId:''}});return false}catch{return true}})()]];
+ return {passed:tests.filter(x=>x[1]).length,total:tests.length,cases:tests.map(([name,pass])=>({name,pass})),syntheticOnly:true,ordersEnabled:false};
+}
+function verifiedSignalSelftest(){
+ const now=Date.now(),at=new Date(now-1000).toISOString();
+ const approval={id:'h:1',index:'NIFTY',status:'PRODUCTION_STRATEGY_APPROVED',validUntil:new Date(now+3600000).toISOString(),certificationId:'cert:1',historicalEvidenceId:'hist:1',forwardEvidenceId:'forward:1'};
+ const contract={underlying:'NIFTY',side:'CE',exchange:'NFO',token:'123',symbol:'NIFTYCE',lotSize:25,expiry:new Date(now+86400000).toISOString()};
+ const quote={price:100,bid:99,ask:100,oi:500,volume:200,delta:0.5,iv:0.2,bidSize:50,askSize:50,evidenceId:'quote:1',at};
+ const spot={price:25000,at};
+ const signal={action:'BUY_CE',index:'NIFTY',strategyId:'h:1',validated:true,independentEvidence:true,stop:95,target:110,confidence:0.8,lots:1,maxLossInr:200,dailyLossRemainingInr:1000,chargesInr:20,historicalEvidenceId:'hist:1',forwardEvidenceId:'forward:1',brokerQuoteEvidenceId:'quote:1',strategyCertificationId:'cert:1',contractToken:'123',contractSymbol:'NIFTYCE',riskReward:2,reason:'Validated independent signal evidence',capitalAvailableInr:100000,at};
+ const good={approval,contract,quote,spot,signal,now,sessionOpen:true,ledgerHealthy:true};
+ const cases=[['valid_evidence',good,true],['closed_session',{...good,sessionOpen:false},false],['no_approval',{...good,approval:null},false],['expired_approval',{...good,approval:{...approval,validUntil:new Date(now-1).toISOString()}},false],['stale_option',{...good,quote:{...quote,at:new Date(now-60000).toISOString()}},false],['stale_spot',{...good,spot:{...spot,at:new Date(now-60000).toISOString()}},false],['wide_spread',{...good,quote:{...quote,bid:80}},false],['no_liquidity',{...good,quote:{...quote,oi:0}},false],['wrong_side',{...good,contract:{...contract,side:'PE'}},false],['no_forward_evidence',{...good,signal:{...signal,independentEvidence:false}},false],['ledger_failure',{...good,ledgerHealthy:false},false],['expired_contract',{...good,contract:{...contract,expiry:new Date(now-1).toISOString()}},false],['invalid_stop',{...good,signal:{...signal,stop:105}},false],['strategy_mismatch',{...good,signal:{...signal,strategyId:'other'}},false]];
+ cases.push(
+  ['missing_lot_size',{...good,contract:{...contract,lotSize:0}},false],
+  ['missing_greeks',{...good,quote:{...quote,delta:null}},false],
+  ['missing_depth',{...good,quote:{...quote,askSize:0}},false],
+  ['risk_budget_exceeded',{...good,signal:{...signal,maxLossInr:10}},false],
+  ['daily_loss_exceeded',{...good,signal:{...signal,dailyLossRemainingInr:0}},false],
+  ['missing_costs',{...good,signal:{...signal,chargesInr:-1}},false],
+  ['missing_forward_evidence',{...good,signal:{...signal,forwardEvidenceId:''}},false],
+  ['identical_test_evidence',{...good,signal:{...signal,forwardEvidenceId:'hist:1'}},false],
+  ['missing_broker_evidence',{...good,signal:{...signal,brokerQuoteEvidenceId:''}},false],
+  ['entry_with_open_position',{...good,signal:{...signal,openPositionId:'paper:123'}},false]
+ );
+ const results=cases.map(([name,input,expected])=>({name,pass:verifiedSignalDecision(input).authorized===expected}));
+ return {passed:results.filter(x=>x.pass).length,total:results.length,results,syntheticOnly:true,liveSignalsVerified:false,ordersEnabled:false};
+}
+
 export default {
- async fetch(req,e){e.__kvWritesThisInvocation=0;await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:false,evidenceGate:'FAIL_CLOSED_PENDING_INDEPENDENT_VALIDATION'});if(u.pathname==='/calendar-status')return json({version:VERSION,istDate:day(),istClock:clock(),session:sessionConfig(e),calendarConfigured:calendarConfigured(e),marketOpen:marketOpen(e),lastRefresh:await get(e,calendarAuditKey),lastCronTrigger:await get(e,'cron:last-trigger'),nseOnly:true,bseVerified:false,signalMode:'experimental-research',ordersEnabled:false});if(['/telegram','/telegram-webhook'].includes(u.pathname)&&req.method==='POST'){if(!e.TELEGRAM_WEBHOOK_SECRET||req.headers.get('X-Telegram-Bot-Api-Secret-Token')!==e.TELEGRAM_WEBHOOK_SECRET)return json({error:'forbidden'},403);let update;try{const raw=await req.text();if(raw.length>65536)return json({error:'payload too large'},413);update=JSON.parse(raw);if(!update||typeof update!=='object'||Array.isArray(update))return json({error:'invalid update'},400)}catch{return json({error:'invalid json'},400)}try{await handle(e,update);return json({ok:true})}catch(err){log('webhook',err);return json({error:'handler failed'},500)}}return json({error:'not found'},404)},
- async scheduled(ev,e,ctx){e.__kvWritesThisInvocation=0;ctx.waitUntil((async()=>{
+ async fetch(req,e){e.__kvWritesThisInvocation=0;await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:NIFTY'),SENSEX:await get(e,'research:paper:position:SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
+  const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
+  const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
+  return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),ordersEnabled:false,
+   scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
+   verifiedLiveSignalDelivery:false});
+ }if(u.pathname==='/independent-intake-selftest')return json({version:VERSION,...independentIntakeSelftest()});if(u.pathname==='/production-delivery-selftest')return json({version:VERSION,...productionDeliverySelftest()});if(u.pathname==='/verified-signal-selftest')return json({version:VERSION,...verifiedSignalSelftest()});if(u.pathname==='/signal-evidence-intake-status')return json({version:VERSION,...(await get(e,'signal:evidence-intake:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/production-signal-pipeline')return json({version:VERSION,...await productionSignalPipeline(e,{dryRun:true})});if(u.pathname==='/production-approval-selftest')return json({version:VERSION,...productionApprovalSelftest()});if(u.pathname==='/production-approval-status')return json({version:VERSION,...(await get(e,'research:production-approval:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/candidate-review-selftest')return json({version:VERSION,...candidateReviewSelftest()});if(u.pathname==='/candidate-review-status')return json({version:VERSION,...(await get(e,'research:candidate-review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/attestation-selftest')return json({version:VERSION,...attestationRegression()});if(u.pathname==='/attestation-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN'})});if(u.pathname==='/certification-workflow-selftest')return json({version:VERSION,...certificationWorkflowRegression()});if(u.pathname==='/certification-workflow-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/certification-selftest')return json({version:VERSION,...certificationRegression()});if(u.pathname==='/certification-audit')return json({version:VERSION,...await certificationAudit(e)});if(u.pathname==='/paper-promotion-selftest')return json({version:VERSION,...paperPromotionSelftest()});if(u.pathname==='/paper-promotion-status')return json({version:VERSION,...(await get(e,'research:paper-promotion:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/forward-qualification-selftest')return json({version:VERSION,...forwardQualificationSelftest()});if(u.pathname==='/forward-qualification-status')return json({version:VERSION,...(await get(e,'research:forward-qualification:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/autonomous-research-status')return json({version:VERSION,...(await get(e,'research:auto:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/release-gate-selftest')return json({version:VERSION,...releaseGateSelftest()});if(u.pathname==='/release-gate')return json({version:VERSION,...await releaseEvidenceAudit(e)});if(u.pathname==='/paper-integrity-selftest')return json({version:VERSION,...paperIntegritySelftest()});if(u.pathname==='/paper-integrity')return json({version:VERSION,...await persistedPaperIntegrity(e)});if(u.pathname==='/research-review-status')return json({version:VERSION,...(await get(e,'research:review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/research-promotion-selftest')return json({version:VERSION,...researchPromotionSelftest()});if(u.pathname==='/research-promotion-audit')return json({version:VERSION,...await researchPromotionAudit(e)});if(u.pathname==='/integrated-safety-selftest')return json({version:VERSION,...integratedSafetyRegression()});if(u.pathname==='/production-blockers')return json({version:VERSION,...await productionBlockerAudit(e)});if(u.pathname==='/option-gate-selftest')return json({version:VERSION,...optionGateRegression()});if(u.pathname==='/paper-lifecycle-selftest')return json({version:VERSION,...await __modules['paper-lifecycle-regression.mjs'].runPaperLifecycleRegression()});if(u.pathname==='/operational-selftest')return json({version:VERSION,...operationalHealthRegression()});if(u.pathname==='/operational-health'){const [cron,scan,paper,forward,failure]=await Promise.all([get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last'),get(e,'cron:last-failure')]);return json({version:VERSION,at:new Date().toISOString(),...classifyOperationalHealth({marketOpen:marketOpen(e),cron,scan,paper,forward,failure})});}if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:true,evidenceGate:'INDEPENDENT_EVIDENCE_REQUIRED_BEFORE_ANY_ALERT'});if(u.pathname==='/operations-status'){
+ const [scan,paper,cron]=await Promise.all([get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'cron:last-trigger')]);
+ const age=Date.now()-Date.parse(scan?.at||'');
+ return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),marketOpen:marketOpen(e),lastCron:cron?.at||null,lastScan:scan?.at||null,scanHealthy:scan?.scanHealthy===true,scanFresh:Number.isFinite(age)&&age>=0&&age<5*60000,lastPaperCycle:paper||null,realOrdersEnabled:false,liveSignalsCertified:false});
+ }if(u.pathname==='/recovery-status'){
+  const [failure,cron,scan,paper,forward]=await Promise.all([get(e,'cron:last-failure'),get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last')]);
+  const now=Date.now(),age=t=>{const d=Date.parse(t||'');return Number.isFinite(d)?Math.max(0,Math.floor((now-d)/1000)):null};
+  return json({version:VERSION,at:new Date().toISOString(),ordersEnabled:false,marketOpen:marketOpen(e),lastCronAgeSeconds:age(cron?.at),lastScanAgeSeconds:age(scan?.at),scanHealthy:scan?.scanHealthy===true,paperCycleStatus:paper?.status||'UNKNOWN',paperCycleReason:paper?.reason||null,forwardCycleStatus:forward?.status||'UNKNOWN',forwardCycleReason:forward?.reason||null,lastScheduledFailure:failure||null,warning:'KV is eventually consistent; no exactly-once delivery guarantee'});
+ }
+ if(u.pathname==='/calendar-status')return json({version:VERSION,istDate:day(),istClock:clock(),session:sessionConfig(e),calendarConfigured:calendarConfigured(e),marketOpen:marketOpen(e),lastRefresh:await get(e,calendarAuditKey),lastCronTrigger:await get(e,'cron:last-trigger'),nseOnly:true,bseVerified:false,signalMode:'experimental-research',ordersEnabled:false});if(['/telegram','/telegram-webhook'].includes(u.pathname)&&req.method==='POST'){if(!e.TELEGRAM_WEBHOOK_SECRET||req.headers.get('X-Telegram-Bot-Api-Secret-Token')!==e.TELEGRAM_WEBHOOK_SECRET)return json({error:'forbidden'},403);let update;try{const raw=await req.text();if(raw.length>65536)return json({error:'payload too large'},413);update=JSON.parse(raw);if(!update||typeof update!=='object'||Array.isArray(update))return json({error:'invalid update'},400)}catch{return json({error:'invalid json'},400)}try{
+ // Telegram retries the same update after network failures. KV-backed replay guard
+ // prevents repeated handling of successfully processed updates across invocations.
+ // KV is eventually consistent, so this is not a transactional exactly-once guarantee.
+ const updateId=update.update_id;
+ if(!Number.isSafeInteger(updateId)||updateId<0)return json({error:'invalid update id'},400);
+ if(!hasKV(e))return json({error:'state unavailable; webhook processing paused'},503);
+ const replayKey='telegram:processed:'+String(updateId);
+ if(await get(e,replayKey))return json({ok:true,duplicate:true});
+ await handle(e,update);
+ await put(e,replayKey,{processedAt:new Date().toISOString()},86400*2);
+ return json({ok:true});
+ }catch(err){log('webhook',err);return json({error:'handler failed'},500)}}return json({error:'not found'},404)},
+ async scheduled(ev,e,ctx){e.__kvWritesThisInvocation=0;ctx.waitUntil((async()=>{try{
   await hydrateExchangeCalendar(e);
   await put(e,'cron:last-trigger',{at:new Date().toISOString(),scheduledTime:ev?.scheduledTime||null,marketOpen:marketOpen(e)},86400*3);
+  // Daily autonomous AI hypothesis generation and independent index-proxy research.
+  // Failure never enables signals or prevents the existing scanner.
+  const autonomousResearchTask=autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)}));
+  const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
+  if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
   const cal=await refreshExchangeCalendar(e);
   if(!cal.ok)console.warn('calendar refresh',JSON.stringify(cal));
   // Run notices and scanning independently. A slow Telegram notice must not delay
   // Angel One setup or consume the scanner's timeout budget.
   const noticeTask=(async()=>{try{await sessionNotice(e)}catch(err){log('session notice',err)}})();
   // One sequential writer: paper exits -> strategy review -> new research-paper selection.
-  const paperTask=(async()=>{try{
+  const paperTask=async()=>{try{
    if(!hasKV(e)||!marketOpen(e))return;
    await runScheduledPaperCycle({kv:e.STATE,marketOpen:true,
     track:async index=>{
@@ -2408,16 +3756,29 @@ export default {
      // Paper BUY/SELL notifications only after a recorded simulated state transition.
      // A failed notification never changes the simulated trade state or places orders.
      if(result.status==='PAPER_OPEN'||result.status==='PAPER_CLOSED'){
-      const key='paper:alert:'+index+':'+(result.status==='PAPER_OPEN' ? String(result.symbol)+':'+String(result.entry) : String(result.trade?.tradeId||result.trade?.closedAt||''));
+      const key='paper:alert:'+index+':'+(result.status==='PAPER_OPEN' ? String(result.symbol)+':'+String((await trackerRead(e.STATE,index)).position?.openedAt||'UNKNOWN') : String(result.trade?.tradeId||result.trade?.closedAt||''));
+      // Reserve before sending. A network timeout is ambiguous: never blindly resend.
+      // KV is eventually consistent, so simultaneous cron invocations still need a
+      // single-writer Durable Object for strict exactly-once semantics.
       try{
-       if(!(await get(e,key))){
+       const existing=await get(e,key);
+       if(!existing){
         const msg=result.status==='PAPER_OPEN'
          ? `🧪 PAPER BUY (SIMULATED, NOT LIVE SIGNAL)\n${index} ${result.symbol}\nSimulated entry ₹${result.entry}\nNo broker order. Do not trade from this message.`
          : `🧪 PAPER SELL / EXIT (SIMULATED)\n${index} ${result.trade?.symbol||''}\nSimulated net P&L ${result.trade?.net??'unavailable'}\nNo broker order. Not a verified live signal.`;
-        await telegram(e,msg);
-        await put(e,key,{at:Date.now(),status:result.status},86400);
+        const reserved=await put(e,key,{at:Date.now(),status:'DELIVERY_UNCONFIRMED',tradeStatus:result.status},86400*7);
+        if(!reserved)throw Error('ALERT_RESERVATION_FAILED');
+        try{
+         const delivery=await telegram(e,msg);
+         if(!delivery?.delivered)throw Error('TELEGRAM_DELIVERY_UNCONFIRMED');
+         const recorded=await put(e,key,{at:Date.now(),status:'DELIVERED',tradeStatus:result.status,messageIds:delivery.messageIds},86400*7);
+         if(!recorded)console.warn('paper alert delivered but receipt persistence failed',index);
+        }catch(err){
+         // Keep reserved state to prevent unsafe resend after uncertain delivery.
+         log('paper alert delivery unconfirmed; manual reconciliation required',err,e);
+        }
        }
-      }catch(err){log('paper signal telegram',err)}
+      }catch(err){log('paper signal telegram',err,e)}
      }
      return result;
     },
@@ -2425,11 +3786,26 @@ export default {
     loadEvidence:async index=>({market:await get(e,'marketintel:'+index),options:await get(e,'options:'+index)}),
     select:async(index,{market,options})=>autoSelectPaper(e.STATE,{index,market,options,marketOpen:true})
    });
-  }catch(err){log('scheduled paper cycle',err)}})();
-  const forwardTask=(async()=>{try{await forwardAutoCollect(e)}catch(err){log('forward auto collection',err)}})();
+   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'COMPLETED',scanAt:currentScan?.at||null,ordersPlaced:false},86400);
+  }catch(err){
+   log('scheduled paper cycle',err);
+   try{await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersPlaced:false},86400)}catch(writeErr){log('paper cycle failure persistence',writeErr,e)}
+  }};
+  const forwardTask=(async()=>{
+   try{
+    const result=await forwardAutoCollect(e);
+    await put(e,'forward:cycle:last',{at:new Date().toISOString(),status:'COMPLETED',resultStatus:result?.status||'RETURNED',ordersPlaced:false},86400);
+   }catch(err){
+    log('forward auto collection',err);
+    try{await put(e,'forward:cycle:last',{at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersPlaced:false},86400)}catch(writeErr){log('forward failure persistence',writeErr,e)}
+   }
+  })();
+  // Only a scan completed in THIS invocation can authorize a paper cycle.
+  // A cached scan from a previous cron invocation must never be reused.
+  let currentScan=null;
   const scanTask=(async()=>{
    if(!marketOpen(e))return;
-   try{const r=await scan(e);console.log('scan',JSON.stringify(r))}
+   try{const r=await scan(e);currentScan=r;console.log('scan',JSON.stringify(r))}
    catch(err){
    const failure={version:VERSION,at:new Date().toISOString(),marketOpen:true,mode:'SCHEDULED_SCAN_FAILED',failureStage:'UNHANDLED_SCAN_ERROR',contracts:0,quoted:0,quoteFresh:0,issues:['Scheduled scan: '+String(err?.message||err).slice(0,180)],scanHealthy:false,verifiedBuySellSignals:false,ordersPlaced:false};
    log('scheduled scan',err);
@@ -2437,10 +3813,53 @@ export default {
    try{failure.scanSummarySaved=await put(e,'scan:last',failure,86400)}catch(writeErr){log('scan failure report',writeErr)}
    }
   })();
-  await Promise.allSettled([noticeTask,scanTask,forwardTask,paperTask]);
+  // The paper selector must consume the CURRENT scan, not yesterday's cached
+  // market/options evidence. Run the scan first; failed scans fail closed.
+  await Promise.allSettled([noticeTask,scanTask,forwardTask,autonomousResearchTask]);
+  try{await automaticForwardQualification(e);await automaticPaperPromotion(e);await automaticEvidenceCertification(e);await automaticCandidateReview(e);await automaticProductionStrategyApproval(e)}catch(err){log('forward qualification, paper promotion and certification',err)}
+  // Production-signal evidence is evaluated after research approvals and the
+  // current scan. This is read-only and cannot send alerts or place orders.
+  try {
+   await ingestIndependentSignalEvidence(e);
+   const audit=await productionSignalPipeline(e,{dryRun:false});
+   await put(e,'signal:scheduled-audit:last',{
+    at:new Date().toISOString(),status:audit.status,
+    indices:audit.indices,reason:audit.reason||null,ordersEnabled:false
+   },86400);
+  } catch(err) {
+   log('scheduled production evidence audit',err,e);
+   try {await put(e,'signal:scheduled-audit:last',{
+    at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersEnabled:false
+   },86400)}catch(writeErr){log('scheduled signal audit persistence',writeErr,e)}
+  }
+  // Research paper alerts require this invocation's persisted healthy scan.
+  const scanForResearch=await get(e,'scan:last');
+  if(currentScan?.scanHealthy===true && currentScan?.at===scanForResearch?.at && scanForResearch?.scanSummarySaved===true){
+   try{await coordinatedPaperAlerts(e)}catch(err){log('research paper alerts',err,e)}
+  }
+  const scanState=await get(e,'scan:last');
+  const scanAge=Date.now()-Date.parse(scanState?.at||'');
+  // Require persisted state to match the newly completed scan; if KV write
+  // failed or an overlapping invocation replaced it, fail closed.
+  const sameScan=!!currentScan && !!scanState && currentScan.at===scanState.at;
+  if(sameScan && currentScan.scanHealthy===true && scanState.scanHealthy===true && Number.isFinite(scanAge) && scanAge>=0 && scanAge<5*60000 && marketOpen(e)){
+   await paperTask();
+  }else{
+   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'SKIPPED_NO_CURRENT_PERSISTED_HEALTHY_SCAN',scanAt:scanState?.at||null,sameScan},86400);
+  }
+ }catch(err){
+   // Record a durable, bounded failure report rather than silently losing cron errors.
+   const failure={at:new Date().toISOString(),stage:'SCHEDULED_OUTER',status:'FAILED',error:safeError(err,e).slice(0,180),ordersPlaced:false};
+   console.error('scheduled outer failure',failure.error);
+   try{if(hasKV(e))await put(e,'cron:last-failure',failure,86400*7)}catch(writeErr){log('cron failure persistence',writeErr,e)}
+  }
  })())}
 };
 // Compatibility export for existing Durable Object binding. No order logic.
 export class JanggoEngine {constructor(state,env){this.state=state;this.env=env}async fetch(){return new Response('Engine Running')}}
 
 export { forwardEvaluate };
+
+export { signalEvidenceConsistency, verifiedSignalDecision };
+
+export { independentIntakeSelftest, independentIntakeChecks };
