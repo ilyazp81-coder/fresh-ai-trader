@@ -429,7 +429,14 @@ async function historicalRequest(url,options,{label='historical',timeoutMs=15000
    if(attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
    throw new AngelDataError(response.status===429?'RATE_LIMITED':'BROKER_UNAVAILABLE',response.status);
   }
-  if(response.status===401||response.status===403)throw new AngelDataError('ACCESS_DENIED',response.status);
+  // A broker may use HTTP 403 for throttling as well as permission failures.
+  // Read only a bounded response for classification; never log raw broker data.
+  if(response.status===401||response.status===403){
+   let hint='';try{hint=(await response.text()).slice(0,512).toLowerCase();}catch{}
+   const throttled=response.status===403&&/rate.?limit|too many requests|throttl|exceeded.*limit/.test(hint);
+   if(throttled&&attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
+   throw new AngelDataError(throttled?'RATE_LIMITED':'ACCESS_DENIED',response.status);
+  }
   // Never include raw response or broker credentials in errors/logs.
   let payload;try{const raw=await response.text();if(!raw.trim())throw new Error('empty');payload=JSON.parse(raw);}catch{throw new AngelDataError('NON_JSON_RESPONSE',response.status);}
   if(!response.ok||payload?.status!==true||!Array.isArray(payload?.data))throw new AngelDataError('INVALID_CANDLE_RESPONSE',response.status);
@@ -1389,6 +1396,13 @@ async function pipelineTriage(e){
   quoteStale:r?.quoteStale||0,quoteUnverified:r?.quoteUnverified||0,
   indexResults:r?.indices||{},failureStage:r?.failureStage||null,
   errors:(r?.issues||[]).slice(0,10),problems,aiReview:r?.aiReview||null,
+  strategyDiagnostics:{candidateCount:r?.researchCandidates||0,waitReasons:r?.strategyWaitReasons||{},
+   noCandidatesCause:r?.researchCandidates?'CANDIDATES_EXIST':(!r?'NO_SCAN':r?.scanHealthy?'ALL_OBSERVED_CONTRACTS_REJECTED_BY_STRATEGY_FILTER':'SCAN_NOT_HEALTHY'),
+   aiWasInvokedForCandidates:!!(r?.researchCandidates&&r?.aiReview?.status!=='NO_CANDIDATES'),
+   caution:'Snapshot filters are not independently validated trading strategies; do not loosen solely to generate alerts.'},
+  verificationBlockers:{historicalCandles:'CHECK_MARKETINTEL_SEPARATELY',greeks:'INDEPENDENT_VERIFICATION_REQUIRED',
+   news:'INDEPENDENT_VERIFICATION_REQUIRED',optionPremiumBacktest:'INDEPENDENT_FORWARD_EVIDENCE_REQUIRED',
+   telegramSignalLifecycle:'LIVE_END_TO_END_RECEIPT_REQUIRED',bseFoCalendar:'INDEPENDENT_BSE_VERIFICATION_REQUIRED'},
   experimentalAlertsSent:r?.directionalAlertsSent||0,experimentalAlertsSkipped:r?.directionalAlertsSkipped||null,
   note:'Read-only diagnostics; historical state is not proof of live market data or a validated trade signal.',ordersEnabled:false};
 }
@@ -1550,7 +1564,10 @@ function evaluateSnapshotStrategy({contract, history, spotHistory, quality, now=
  if(h.some((v,i)=>i>0&&v.v<h[i-1].v))return wait('nonmonotonic cumulative volume');
  const premiumMove=(h[3].p/h[0].p-1)*100, spotMove=(sh[3].p/sh[0].p-1)*100;
  const side=contract.side==='CE'?1:contract.side==='PE'?-1:0;
- if(!side||spotMove*side<0.12||premiumMove<1.0||premiumMove>8.0)return wait('underlying/premium momentum disagreement or late entry');
+ if(!side)return wait('invalid option side');
+ if(spotMove*side<0.12)return wait('spot direction insufficient or contradictory');
+ if(premiumMove<1.0)return wait('option premium momentum below minimum');
+ if(premiumMove>8.0)return wait('premium move exceeds late-entry cap');
  if(h[3].oi<=h[0].oi||h[3].v<=h[0].v)return wait('OI/volume expansion missing');
  if(h[3].p<=h[2].p||sh[3].p*side<=sh[2].p*side)return wait('momentum not sustained');
  return {status:'RESEARCH_WATCH',strategy:'spot_option_momentum_oi_v1',symbol:contract.symbol,underlying:contract.underlying,side:contract.side,spotMovePct:round2(spotMove),premiumMovePct:round2(premiumMove),oiDelta:round2(h[3].oi-h[0].oi),referencePremium:round2(h[3].p),hypotheticalSL:round2(h[3].p*.97),hypotheticalTarget:round2(h[3].p*1.05),reason:'4 sequential observations, spot direction, premium momentum, OI and volume expansion; NOT candle/Greeks/backtest validated',executable:false};
@@ -3278,7 +3295,13 @@ async function automaticProductionStrategyApproval(e){
  }
  const out={at,status:'EVALUATED',results,approved:results.filter(x=>x.status==='PRODUCTION_STRATEGY_APPROVED').length,
   signalPipelineEnabled:false,ordersEnabled:false};
- if(!await put(e,'research:production-approval:last',out,86400))throw Error('PRODUCTION_APPROVAL_REPORT_SAVE_FAILED');
+ // This is a diagnostic snapshot, not an approval authority. The shared
+ // per-invocation KV write budget may be exhausted by the preceding scan.
+ // Never turn an optional snapshot into a scheduled-invocation exception.
+ // A missing snapshot must not be interpreted as production approval.
+ const saved=await put(e,'research:production-approval:last',out,86400);
+ out.reportPersistence=saved?'SAVED':((e.__kvWritesThisInvocation||0)>=8?'DEFERRED_WRITE_BUDGET':'FAILED');
+ if(!saved)console.warn('production approval snapshot not saved',out.reportPersistence,'kvWritesUsed',e.__kvWritesThisInvocation||0);
  return out;
 }
 function productionApprovalSelftest(){
@@ -3816,7 +3839,39 @@ export default {
   // The paper selector must consume the CURRENT scan, not yesterday's cached
   // market/options evidence. Run the scan first; failed scans fail closed.
   await Promise.allSettled([noticeTask,scanTask,forwardTask,autonomousResearchTask]);
-  try{await automaticForwardQualification(e);await automaticPaperPromotion(e);await automaticEvidenceCertification(e);await automaticCandidateReview(e);await automaticProductionStrategyApproval(e)}catch(err){log('forward qualification, paper promotion and certification',err)}
+  // Isolate every scheduled research stage: one failure must not suppress later diagnostics.
+  // Persist a concise stage-specific report so recurring errors can be investigated.
+  const researchStages=[
+   ['forwardQualification',automaticForwardQualification],
+   ['paperPromotion',automaticPaperPromotion],
+   ['evidenceCertification',automaticEvidenceCertification],
+   ['candidateReview',automaticCandidateReview],
+   ['productionStrategyApproval',automaticProductionStrategyApproval]
+  ];
+  const researchStageResults=[];
+  for(const [stage,run] of researchStages){
+   try{
+    const result=await run(e);
+    researchStageResults.push({stage,status:'COMPLETED',resultStatus:result?.status||null});
+   }catch(err){
+    const reason=safeError(err,e).slice(0,240);
+    researchStageResults.push({stage,status:'FAILED',reason});
+    log('scheduled research stage '+stage,err,e);
+   }
+  }
+  // Always emit the stage report to observability. KV may be at the
+  // per-invocation write limit; a missing diagnostic snapshot is not a pass.
+  const stageReport={
+   at:new Date().toISOString(),version:VERSION,stages:researchStageResults,
+   status:researchStageResults.some(x=>x.status==='FAILED')?'PARTIAL_FAILURE':'COMPLETED',
+   signalsVerified:false,ordersEnabled:false
+  };
+  const stageReportSaved=await put(e,'research:scheduled-stages:last',stageReport,86400*7);
+  console.log('research stage audit',JSON.stringify({
+   ...stageReport,persistence:stageReportSaved?'SAVED':
+    ((e.__kvWritesThisInvocation||0)>=8?'DEFERRED_WRITE_BUDGET':'FAILED'),
+   kvWritesUsed:e.__kvWritesThisInvocation||0
+  }));
   // Production-signal evidence is evaluated after research approvals and the
   // current scan. This is read-only and cannot send alerts or place orders.
   try {
