@@ -545,7 +545,7 @@ function evaluateOptionEvidence({underlying,options,market,now=Date.now(),market
 const {historicalRequest,normalizeAngelCandles} = __modules["angel-data-transport.mjs"];
 const { assessLiveReadiness } = __modules["live-readiness.mjs"];
 const TZ='Asia/Kolkata';
-const VERSION='janggo-unified-2026-11-11-historical-compat-batch';
+const VERSION='janggo-unified-2026-11-11-v112-paper-integrity-fix';
 // Scanner failure recovery: clear broker failure stages and avoid repeated master fetches.
 // Shared rounding helper used by scanner, research brain, options and paper lifecycle.
 const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
@@ -1457,7 +1457,7 @@ async function scan(e,{send=true}={}){
     if(!hist.length||now-hist[hist.length-1].t>=120000)hist.push({t:now,p:quality.price,v:quality.volume,oi:quality.oi});next[key]=hist;
     const verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
     if(verdict.status==='RESEARCH_WATCH'){
-     result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange};
+     result.paperContractEvidence[c.symbol]={token:String(c.token),exchange:c.exchange,symbol:c.symbol,side:c.side,expiry:c.expiry,lotSize:Number(c.lotsize),underlying:c.underlying};
      result.researchCandidates++;
      if(result.strategyWatches.length<8)result.strategyWatches.push(verdict);
     }else result.strategyWaitReasons[verdict.reason]=(result.strategyWaitReasons[verdict.reason]||0)+1;
@@ -2905,18 +2905,18 @@ async function runPaperResearchReview(e){
   try{raw=await get(e,'research:promotion-evidence:'+index)}
   catch(err){outcomes.push({index,status:'READ_ERROR',error:String(err.message||err).slice(0,120)});continue}
   if(!Array.isArray(raw)){outcomes.push({index,status:'NO_EVIDENCE'});continue}
-  for(const candidate of raw.slice(0,30)){
+  for(const candidate of raw.slice(0,3)){ // Keep this background review bounded so it cannot exhaust the scheduled invocation's KV write budget.
    const review=assessResearchPromotion(candidate);
    const id=String(candidate?.id||'');
    // Only validated identifiers can be used as KV suffixes.
    if(!/^[A-Za-z0-9_.:-]{3,80}$/.test(id)){outcomes.push({index,status:'REJECTED',reasons:['INVALID_ID']});continue}
    const record={id,index,at,status:review.approved?'PAPER_RESEARCH_ELIGIBLE':'REJECTED',reasons:review.reasons,productionSignalsEnabled:false,ordersEnabled:false,scope:'PAPER_RESEARCH_ONLY'};
-   try{await put(e,'research:review:'+index+':'+id,record,86400*30);outcomes.push(record)}
+   try{const saved=await put(e,'research:review:'+index+':'+id,record,86400*30);outcomes.push(saved?record:{index,id,status:'WRITE_SKIPPED',reason:'KV_WRITE_BUDGET_OR_UNAVAILABLE'})}
    catch(err){outcomes.push({index,id,status:'WRITE_ERROR',error:String(err.message||err).slice(0,120)})}
   }
  }
- const result={at,status:outcomes.some(x=>x.status==='WRITE_ERROR'||x.status==='READ_ERROR')?'DEGRADED':'REVIEWED',outcomes,productionSignalsEnabled:false,ordersEnabled:false};
- try{await put(e,'research:review:last',result,86400*7)}catch(err){result.status='DEGRADED';result.persistenceError=String(err.message||err).slice(0,120)}
+ const result={at,status:outcomes.some(x=>['WRITE_ERROR','WRITE_SKIPPED','READ_ERROR'].includes(x.status))?'DEGRADED':'REVIEWED',outcomes,productionSignalsEnabled:false,ordersEnabled:false};
+ const summarySaved=await put(e,'research:review:last',result,86400*7);if(!summarySaved){result.status='DEGRADED';result.persistence='NOT_SAVED_KV_WRITE_BUDGET_OR_UNAVAILABLE'}
  return result;
 }
 // Automatic post-registration strategy lifecycle. Index proxy results are NOT
@@ -3686,7 +3686,7 @@ async function automaticResearchPaperAlerts(e) {
   if(!contract?.token||!contract?.exchange||contract.exchange!==(index==='NIFTY'?'NFO':'BFO')||!/^\d+$/.test(String(contract.token))||!Number.isSafeInteger(Number(contract.lotSize))||Number(contract.lotSize)<=0){report.blocked.push(index+':CONTRACT_EVIDENCE_MISSING');continue;}
   const history=rolling[contract.exchange+':'+contract.token],last=Array.isArray(history)?history.at(-1):null;
   if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<Date.parse(scanState.at)-60000){report.blocked.push(index+':QUOTE_MISSING');continue;}
-  if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(Date.parse(contract.expiry))||Date.parse(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
+  if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(parseExpiry(contract.expiry))||parseExpiry(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
   if(Math.abs(last.p-watch.referencePremium)/watch.referencePremium>0.03){report.blocked.push(index+':WATCH_PRICE_MISMATCH');continue;}
   if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
   const position={status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:last.t,entryPremium:last.p,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
@@ -3699,7 +3699,7 @@ async function automaticResearchPaperAlerts(e) {
 }
 function paperWatchSelftest(){
  const w={status:'RESEARCH_WATCH',underlying:'NIFTY',side:'CE',referencePremium:100,hypotheticalSL:97,hypotheticalTarget:105,spotMovePct:0.4,premiumMovePct:2,oiDelta:100};
- const tests=[['valid',paperWatchDecision(w).ok],['invalid_side',!paperWatchDecision({...w,side:'XX'}).ok],['bad_stop',!paperWatchDecision({...w,hypotheticalSL:110}).ok],['missing_oi',!paperWatchDecision({...w,oiDelta:0}).ok],['low_rr',!paperWatchDecision({...w,hypotheticalTarget:101}).ok],['stop',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},96).reason==='STOP_LOSS'],['target',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},106).reason==='TARGET'],['hold',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},100).exit],['invalid_quote',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},NaN).exit],['invalid_position_levels',!paperWatchExit({status:'OPEN',entryPremium:100,stop:105,target:97},100).exit],['invalid_target',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:NaN},100).exit],['invalid_entry',!paperWatchExit({status:'OPEN',entryPremium:NaN,stop:97,target:105},100).exit],['target_below_entry',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:99},100).exit]];
+ const tests=[['valid',paperWatchDecision(w).ok],['invalid_side',!paperWatchDecision({...w,side:'XX'}).ok],['bad_stop',!paperWatchDecision({...w,hypotheticalSL:110}).ok],['missing_oi',!paperWatchDecision({...w,oiDelta:0}).ok],['low_rr',!paperWatchDecision({...w,hypotheticalTarget:101}).ok],['stop',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},96).reason==='STOP_LOSS'],['target',paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},106).reason==='TARGET'],['hold',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},100).exit],['invalid_quote',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:105},NaN).exit],['invalid_position_levels',!paperWatchExit({status:'OPEN',entryPremium:100,stop:105,target:97},100).exit],['invalid_target',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:NaN},100).exit],['invalid_entry',!paperWatchExit({status:'OPEN',entryPremium:NaN,stop:97,target:105},100).exit],['target_below_entry',!paperWatchExit({status:'OPEN',entryPremium:100,stop:97,target:99},100).exit],['angel_expiry_format',Number.isFinite(parseExpiry('06NOV2026'))],['iso_expiry_format',Number.isFinite(parseExpiry('2026-11-06T15:30:00+05:30'))]];
  return {passed:tests.filter(x=>x[1]).length,total:tests.length,tests:tests.map(([name,pass])=>({name,pass})),syntheticOnly:true,ordersEnabled:false};
 }
 
@@ -3774,13 +3774,13 @@ function verifiedSignalSelftest(){
 }
 
 export default {
- async fetch(req,e){e.__kvWritesThisInvocation=0;await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:NIFTY'),SENSEX:await get(e,'research:paper:position:SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
+ async fetch(req,e){e.__kvWritesThisInvocation=0;await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:'+day()+':NIFTY'),SENSEX:await get(e,'research:paper:position:'+day()+':SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
   const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
   const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
   return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),ordersEnabled:false,
    scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
    verifiedLiveSignalDelivery:false});
- }if(u.pathname==='/independent-intake-selftest')return json({version:VERSION,...independentIntakeSelftest()});if(u.pathname==='/production-delivery-selftest')return json({version:VERSION,...productionDeliverySelftest()});if(u.pathname==='/verified-signal-selftest')return json({version:VERSION,...verifiedSignalSelftest()});if(u.pathname==='/signal-evidence-intake-status')return json({version:VERSION,...(await get(e,'signal:evidence-intake:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/production-signal-pipeline')return json({version:VERSION,...await productionSignalPipeline(e,{dryRun:true})});if(u.pathname==='/production-approval-selftest')return json({version:VERSION,...productionApprovalSelftest()});if(u.pathname==='/production-approval-status')return json({version:VERSION,...(await get(e,'research:production-approval:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/candidate-review-selftest')return json({version:VERSION,...candidateReviewSelftest()});if(u.pathname==='/candidate-review-status')return json({version:VERSION,...(await get(e,'research:candidate-review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/attestation-selftest')return json({version:VERSION,...attestationRegression()});if(u.pathname==='/attestation-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN'})});if(u.pathname==='/certification-workflow-selftest')return json({version:VERSION,...certificationWorkflowRegression()});if(u.pathname==='/certification-workflow-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/certification-selftest')return json({version:VERSION,...certificationRegression()});if(u.pathname==='/certification-audit')return json({version:VERSION,...await certificationAudit(e)});if(u.pathname==='/paper-promotion-selftest')return json({version:VERSION,...paperPromotionSelftest()});if(u.pathname==='/paper-promotion-status')return json({version:VERSION,...(await get(e,'research:paper-promotion:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/forward-qualification-selftest')return json({version:VERSION,...forwardQualificationSelftest()});if(u.pathname==='/forward-qualification-status')return json({version:VERSION,...(await get(e,'research:forward-qualification:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/autonomous-research-status')return json({version:VERSION,...(await get(e,'research:auto:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/release-gate-selftest')return json({version:VERSION,...releaseGateSelftest()});if(u.pathname==='/release-gate')return json({version:VERSION,...await releaseEvidenceAudit(e)});if(u.pathname==='/paper-integrity-selftest')return json({version:VERSION,...paperIntegritySelftest()});if(u.pathname==='/paper-integrity')return json({version:VERSION,...await persistedPaperIntegrity(e)});if(u.pathname==='/research-review-status')return json({version:VERSION,...(await get(e,'research:review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/research-promotion-selftest')return json({version:VERSION,...researchPromotionSelftest()});if(u.pathname==='/research-promotion-audit')return json({version:VERSION,...await researchPromotionAudit(e)});if(u.pathname==='/integrated-safety-selftest')return json({version:VERSION,...integratedSafetyRegression()});if(u.pathname==='/production-blockers')return json({version:VERSION,...await productionBlockerAudit(e)});if(u.pathname==='/option-gate-selftest')return json({version:VERSION,...optionGateRegression()});if(u.pathname==='/paper-lifecycle-selftest')return json({version:VERSION,...await __modules['paper-lifecycle-regression.mjs'].runPaperLifecycleRegression()});if(u.pathname==='/operational-selftest')return json({version:VERSION,...operationalHealthRegression()});if(u.pathname==='/operational-health'){const [cron,scan,paper,forward,failure]=await Promise.all([get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last'),get(e,'cron:last-failure')]);return json({version:VERSION,at:new Date().toISOString(),...classifyOperationalHealth({marketOpen:marketOpen(e),cron,scan,paper,forward,failure})});}if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:true,evidenceGate:'INDEPENDENT_EVIDENCE_REQUIRED_BEFORE_ANY_ALERT'});if(u.pathname==='/operations-status'){
+ }if(u.pathname==='/independent-intake-selftest')return json({version:VERSION,...independentIntakeSelftest()});if(u.pathname==='/production-delivery-selftest')return json({version:VERSION,...productionDeliverySelftest()});if(u.pathname==='/verified-signal-selftest')return json({version:VERSION,...verifiedSignalSelftest()});if(u.pathname==='/signal-evidence-intake-status')return json({version:VERSION,...(await get(e,'signal:evidence-intake:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/production-signal-pipeline')return json({version:VERSION,...await productionSignalPipeline(e,{dryRun:true})});if(u.pathname==='/production-approval-selftest')return json({version:VERSION,...productionApprovalSelftest()});if(u.pathname==='/production-approval-status')return json({version:VERSION,...(await get(e,'research:production-approval:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/candidate-review-selftest')return json({version:VERSION,...candidateReviewSelftest()});if(u.pathname==='/candidate-review-status')return json({version:VERSION,...(await get(e,'research:candidate-review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/attestation-selftest')return json({version:VERSION,...attestationRegression()});if(u.pathname==='/attestation-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN'})});if(u.pathname==='/certification-workflow-selftest')return json({version:VERSION,...certificationWorkflowRegression()});if(u.pathname==='/certification-workflow-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/certification-selftest')return json({version:VERSION,...certificationRegression()});if(u.pathname==='/certification-audit')return json({version:VERSION,...await certificationAudit(e)});if(u.pathname==='/paper-promotion-selftest')return json({version:VERSION,...paperPromotionSelftest()});if(u.pathname==='/paper-promotion-status')return json({version:VERSION,...(await get(e,'research:paper-promotion:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/forward-qualification-selftest')return json({version:VERSION,...forwardQualificationSelftest()});if(u.pathname==='/forward-qualification-status')return json({version:VERSION,...(await get(e,'research:forward-qualification:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/autonomous-research-status')return json({version:VERSION,...(await get(e,'research:auto:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/release-gate-selftest')return json({version:VERSION,...releaseGateSelftest()});if(u.pathname==='/release-gate')return json({version:VERSION,...await releaseEvidenceAudit(e)});if(u.pathname==='/paper-integrity-selftest')return json({version:VERSION,...paperIntegritySelftest()});if(u.pathname==='/paper-integrity')return json({version:VERSION,...await persistedPaperIntegrity(e)});if(u.pathname==='/research-review-status')return json({version:VERSION,...(await get(e,'research:review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/research-promotion-selftest')return json({version:VERSION,...researchPromotionSelftest()});if(u.pathname==='/research-promotion-audit')return json({version:VERSION,...await researchPromotionAudit(e)});if(u.pathname==='/integrated-safety-selftest')return json({version:VERSION,...integratedSafetyRegression()});if(u.pathname==='/production-blockers')return json({version:VERSION,...await productionBlockerAudit(e)});if(u.pathname==='/option-gate-selftest')return json({version:VERSION,...optionGateRegression()});if(u.pathname==='/paper-lifecycle-selftest')return json({version:VERSION,...await __modules['paper-lifecycle-regression.mjs'].runPaperLifecycleRegression()});if(u.pathname==='/operational-selftest')return json({version:VERSION,...operationalHealthRegression()});if(u.pathname==='/operational-health'){const [cron,scan,paper,forward,failure]=await Promise.all([get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last'),get(e,'cron:last-failure')]);return json({version:VERSION,at:new Date().toISOString(),...classifyOperationalHealth({marketOpen:marketOpen(e),cron,scan,paper,forward,failure})});}if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:false,evidenceGate:'INDEPENDENT_EVIDENCE_REQUIRED_BEFORE_ANY_ALERT'});if(u.pathname==='/operations-status'){
  const [scan,paper,cron]=await Promise.all([get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'cron:last-trigger')]);
  const age=Date.now()-Date.parse(scan?.at||'');
  return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),marketOpen:marketOpen(e),lastCron:cron?.at||null,lastScan:scan?.at||null,scanHealthy:scan?.scanHealthy===true,scanFresh:Number.isFinite(age)&&age>=0&&age<5*60000,lastPaperCycle:paper||null,realOrdersEnabled:false,liveSignalsCertified:false});
@@ -3805,11 +3805,7 @@ export default {
  async scheduled(ev,e,ctx){e.__kvWritesThisInvocation=0;ctx.waitUntil((async()=>{try{
   await hydrateExchangeCalendar(e);
   await put(e,'cron:last-trigger',{at:new Date().toISOString(),scheduledTime:ev?.scheduledTime||null,marketOpen:marketOpen(e)},86400*3);
-  // Daily autonomous AI hypothesis generation and independent index-proxy research.
-  // Failure never enables signals or prevents the existing scanner.
-  const autonomousResearchTask=autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)}));
-  const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
-  if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
+  // Scanner gets first use of the bounded KV write budget; research work is deferred until its checkpoint is saved.
   const cal=await refreshExchangeCalendar(e);
   if(!cal.ok)console.warn('calendar refresh',JSON.stringify(cal));
   // Run notices and scanning independently. A slow Telegram notice must not delay
@@ -3864,7 +3860,7 @@ export default {
    log('scheduled paper cycle',err);
    try{await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersPlaced:false},86400)}catch(writeErr){log('paper cycle failure persistence',writeErr,e)}
   }};
-  const forwardTask=(async()=>{
+  const forwardTask=async()=>{
    try{
     const result=await forwardAutoCollect(e);
     await put(e,'forward:cycle:last',{at:new Date().toISOString(),status:'COMPLETED',resultStatus:result?.status||'RETURNED',ordersPlaced:false},86400);
@@ -3872,7 +3868,7 @@ export default {
     log('forward auto collection',err);
     try{await put(e,'forward:cycle:last',{at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersPlaced:false},86400)}catch(writeErr){log('forward failure persistence',writeErr,e)}
    }
-  })();
+  };
   // Only a scan completed in THIS invocation can authorize a paper cycle.
   // A cached scan from a previous cron invocation must never be reused.
   let currentScan=null;
@@ -3888,7 +3884,24 @@ export default {
   })();
   // The paper selector must consume the CURRENT scan, not yesterday's cached
   // market/options evidence. Run the scan first; failed scans fail closed.
-  await Promise.allSettled([noticeTask,scanTask,forwardTask,autonomousResearchTask]);
+  await Promise.allSettled([noticeTask,scanTask]);
+  // Run paper-only lifecycle work immediately after the current scan, before
+  // optional research/certification jobs can consume the remaining KV budget.
+  const scanState=await get(e,'scan:last');
+  const scanAge=Date.now()-Date.parse(scanState?.at||'');
+  const sameScan=!!currentScan && !!scanState && currentScan.at===scanState.at;
+  if(sameScan && currentScan.scanHealthy===true && scanState.scanHealthy===true && scanState.scanSummarySaved===true && Number.isFinite(scanAge) && scanAge>=0 && scanAge<5*60000 && marketOpen(e)){
+   try{await coordinatedPaperAlerts(e)}catch(err){log('research paper alerts',err,e)}
+   await paperTask();
+  }else{
+   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'SKIPPED_NO_CURRENT_PERSISTED_HEALTHY_SCAN',scanAt:scanState?.at||null,sameScan},86400);
+  }
+  // The scan and paper lifecycle have priority over background research writes.
+  const autonomousResearchTask=autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)}));
+  const forwardTaskResult=forwardTask().catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)}));
+  const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
+  if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
+  await Promise.allSettled([forwardTaskResult,autonomousResearchTask]);
   // Isolate every scheduled research stage: one failure must not suppress later diagnostics.
   // Persist a concise stage-specific report so recurring errors can be investigated.
   const researchStages=[
@@ -3936,21 +3949,6 @@ export default {
    try {await put(e,'signal:scheduled-audit:last',{
     at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersEnabled:false
    },86400)}catch(writeErr){log('scheduled signal audit persistence',writeErr,e)}
-  }
-  // Research paper alerts require this invocation's persisted healthy scan.
-  const scanForResearch=await get(e,'scan:last');
-  if(currentScan?.scanHealthy===true && currentScan?.at===scanForResearch?.at && scanForResearch?.scanSummarySaved===true){
-   try{await coordinatedPaperAlerts(e)}catch(err){log('research paper alerts',err,e)}
-  }
-  const scanState=await get(e,'scan:last');
-  const scanAge=Date.now()-Date.parse(scanState?.at||'');
-  // Require persisted state to match the newly completed scan; if KV write
-  // failed or an overlapping invocation replaced it, fail closed.
-  const sameScan=!!currentScan && !!scanState && currentScan.at===scanState.at;
-  if(sameScan && currentScan.scanHealthy===true && scanState.scanHealthy===true && Number.isFinite(scanAge) && scanAge>=0 && scanAge<5*60000 && marketOpen(e)){
-   await paperTask();
-  }else{
-   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'SKIPPED_NO_CURRENT_PERSISTED_HEALTHY_SCAN',scanAt:scanState?.at||null,sameScan},86400);
   }
  }catch(err){
    // Record a durable, bounded failure report rather than silently losing cron errors.
