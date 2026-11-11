@@ -437,9 +437,15 @@ async function historicalRequest(url,options,{label='historical',timeoutMs=15000
    if(throttled&&attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
    throw new AngelDataError(throttled?'RATE_LIMITED':'ACCESS_DENIED',response.status);
   }
-  // Never include raw response or broker credentials in errors/logs.
-  let payload;try{const raw=await response.text();if(!raw.trim())throw new Error('empty');payload=JSON.parse(raw);}catch{throw new AngelDataError('NON_JSON_RESPONSE',response.status);}
-  if(!response.ok||payload?.status!==true||!Array.isArray(payload?.data))throw new AngelDataError('INVALID_CANDLE_RESPONSE',response.status);
+  // Never log broker response bodies or authorization headers. Classify safely.
+  let payload;
+  try{const raw=await response.text();if(!raw.trim())throw Error('EMPTY');payload=JSON.parse(raw);}
+  catch{throw new AngelDataError(response.status===400?'BAD_REQUEST_NON_JSON':'NON_JSON_RESPONSE',response.status);}
+  if(!response.ok||payload?.status!==true||!Array.isArray(payload?.data)){
+   const code=response.status===400?'BAD_REQUEST':response.status===403?'ACCESS_DENIED':
+    response.ok&&payload?.status===false?'BROKER_REJECTED':'INVALID_CANDLE_RESPONSE';
+   throw new AngelDataError(code,response.status);
+  }
   return payload;
  }
  throw new AngelDataError('UNAVAILABLE');
@@ -448,7 +454,12 @@ function normalizeAngelCandles(data,{intervalMs=60000,now=Date.now(),closedOnly=
  if(!Array.isArray(data))throw new AngelDataError('INVALID_CANDLE_ARRAY');
  const parsed=data.map(row=>{
   if(!Array.isArray(row)||row.length<6)return null;
-  const t=Date.parse(row[0]);const [o,h,l,c,v]=row.slice(1,6).map(Number);
+  // SmartAPI timestamps without an offset represent exchange-local IST.
+  // Date.parse() otherwise interprets them as UTC in Workers, shifting candles 5h30m.
+  const rawTime=String(row[0]??'').trim();
+  const match=rawTime.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?$/);
+  const t=Date.parse(match?`${match[1]}T${match[2]}+05:30`:rawTime);
+  const [o,h,l,c,v]=row.slice(1,6).map(Number);
   if(!Number.isFinite(t)||![o,h,l,c,v].every(Number.isFinite)||o<=0||h<Math.max(o,c,l)||l>Math.min(o,c,h)||v<0)return null;
   return {t,o,h,l,c,v};
  }).filter(Boolean).sort((a,b)=>a.t-b.t);
@@ -534,7 +545,7 @@ function evaluateOptionEvidence({underlying,options,market,now=Date.now(),market
 const {historicalRequest,normalizeAngelCandles} = __modules["angel-data-transport.mjs"];
 const { assessLiveReadiness } = __modules["live-readiness.mjs"];
 const TZ='Asia/Kolkata';
-const VERSION='janggo-unified-2026-11-10-pipeline-repair';
+const VERSION='janggo-unified-2026-11-11-historical-compat-batch';
 // Scanner failure recovery: clear broker failure stages and avoid repeated master fetches.
 // Shared rounding helper used by scanner, research brain, options and paper lifecycle.
 const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
@@ -1758,26 +1769,64 @@ async function parseHistoricalResponse(response, label){
  }
  return data;
 }
+// Single bounded compatibility fallback for Angel One historical date formatting.
+// Never retry auth/permission errors with a changed payload, and never invent bars.
+async function fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval,fromdate,todate,label}){
+ const url='https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
+ const headers={...angelHeaders(e),Authorization:'Bearer '+jwt};
+ const request=(from,to)=>historicalRequest(url,{method:'POST',headers,
+  body:JSON.stringify({exchange,symboltoken,interval,fromdate:from,todate:to})},
+  {label,retries:0});
+ try{return await request(fromdate,todate)}catch(err){
+  const message=String(err?.message||err);
+  // Some SmartAPI gateways accept minute precision but reject seconds.
+  // Only retry genuine HTTP 400; other errors are passed through unchanged.
+  if(!/HTTP 400|BAD_REQUEST/.test(message))throw err;
+  const from=fromdate.replace(/:\d{2}$/,'');
+  const to=todate.replace(/:\d{2}$/,'');
+  if(from===fromdate||to===todate)throw err;
+  return await request(from,to);
+ }
+}
 async function historicalCandles(e,jwt,name,days=7){
  const exchange=name==='NIFTY'?'NSE':'BSE';
  const symboltoken=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
- const end=new Date(), start=new Date(end.getTime()-days*86400000);
- const result=await historicalRequest('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData',{
-  method:'POST',headers:{...angelHeaders(e),Authorization:'Bearer '+jwt},
-  body:JSON.stringify({exchange,symboltoken,interval:'FIVE_MINUTE',fromdate:istDateTime(start),todate:istDateTime(end)})
- },{label:'FIVE_MINUTE '+name});
- return normalizeAngelCandles(result.data,{intervalMs:300000});
+ // Avoid large multi-day broker requests; only request valid IST market windows.
+ const end=new Date(), all=[];
+ for(let offset=Math.min(7,Math.max(1,days))-1;offset>=0;offset--){
+  const date=istDateTime(new Date(end.getTime()-offset*86400000)).slice(0,10);
+  const fromdate=date+' 09:15:00';
+  const todate=offset===0?(istDateTime(end)<date+' 15:30:00'?istDateTime(end):date+' 15:30:00'):date+' 15:30:00';
+  if([0,6].includes(new Date(date+'T12:00:00+05:30').getUTCDay()))continue;
+  if(todate<=fromdate)continue;
+  const result=await fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval:'FIVE_MINUTE',fromdate,todate,label:'FIVE_MINUTE '+name+' '+date});
+  all.push(...result.data);
+  if(offset>0)await new Promise(resolve=>setTimeout(resolve,650));
+ }
+ if(!all.length)throw Error('NO_HISTORICAL_CANDLES_RETURNED');
+ return normalizeAngelCandles(all,{intervalMs:300000});
 }
 // v19: read-only index candle intelligence. No orders and no trading signal promotion.
 async function minuteCandles(e,jwt,name,days=5){
  const exchange=name==='NIFTY'?'NSE':'BSE';
  const symboltoken=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
- const end=new Date(),start=new Date(end.getTime()-Math.max(1,Math.min(7,days))*86400000);
- const x=await historicalRequest('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData',{
-  method:'POST',headers:{...angelHeaders(e),Authorization:'Bearer '+jwt},
-  body:JSON.stringify({exchange,symboltoken,interval:'ONE_MINUTE',fromdate:istDateTime(start),todate:istDateTime(end)})
- },{label:'ONE_MINUTE '+name});
- return normalizeAngelCandles(x.data,{intervalMs:60000});
+ // Query each IST calendar day separately. Large 1-minute ranges can be rejected
+ // by the broker; never silently synthesize missing historical bars.
+ const end=new Date(), maxDays=Math.max(1,Math.min(7,days));
+ const all=[];
+ for(let offset=maxDays-1;offset>=0;offset--){
+  const day=new Date(end.getTime()-offset*86400000);
+  const date=istDateTime(day).slice(0,10);
+  const fromdate=date+' 09:15:00';
+  const todate=offset===0?(istDateTime(end)<date+' 15:30:00'?istDateTime(end):date+' 15:30:00'):date+' 15:30:00';
+  if([0,6].includes(new Date(date+'T12:00:00+05:30').getUTCDay()))continue;
+  if(todate<=fromdate)continue;
+  const x=await fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval:'ONE_MINUTE',fromdate,todate,label:'ONE_MINUTE '+name+' '+date});
+  all.push(...x.data);
+  if(offset>0)await new Promise(resolve=>setTimeout(resolve,650));
+ }
+ if(!all.length)throw new Error('NO_HISTORICAL_CANDLES_RETURNED');
+ return normalizeAngelCandles(all,{intervalMs:60000});
 }
 function aggregateCandles(rows,minutes){
  const ms=minutes*60000,groups=[];let last=-1;
@@ -1797,8 +1846,9 @@ async function marketIntelligence(e,name){
  try{const jwt=await session(e);rows=await minuteCandles(e,jwt,name)}catch(err){
   const message=String(err?.message||err).slice(0,220);
   const isDenied=/ACCESS_DENIED|HTTP 403|HTTP 401|BROKER_REJECTED/.test(message);
+  const isBadRequest=/BAD_REQUEST|HTTP 400/.test(message);
   const isLimited=/RATE_LIMITED|HTTP 429/.test(message);
-  const delay=isDenied?300000:isLimited?120000:30000;
+  const delay=isDenied?300000:isBadRequest?180000:isLimited?120000:30000;
   await put(e,failureKey,{message,retryAfter:Date.now()+delay},Math.ceil(delay/1000));
   throw Error('HISTORICAL_FETCH_FAILED '+name+': '+message);
  }
