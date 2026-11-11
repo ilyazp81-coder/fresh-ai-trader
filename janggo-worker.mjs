@@ -1,3 +1,4 @@
+import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
 import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity } from './router.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
@@ -463,7 +464,7 @@ function normalizeAngelCandles(data,{intervalMs=60000,now=Date.now(),closedOnly=
   const match=rawTime.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?$/);
   const t=Date.parse(match?`${match[1]}T${match[2]}+05:30`:rawTime);
   const [o,h,l,c,v]=row.slice(1,6).map(Number);
-  if(!Number.isFinite(t)||![o,h,l,c,v].every(Number.isFinite)||o<=0||h<Math.max(o,c,l)||l>Math.min(o,c,h)||v<0)return null;
+  if(!Number.isFinite(t)||![o,h,l,c,v].every(Number.isFinite)||[o,h,l,c].some(x=>x<=0)||h<Math.max(o,c,l)||l>Math.min(o,c,h)||v<0)return null;
   return {t,o,h,l,c,v};
  }).filter(Boolean).sort((a,b)=>a.t-b.t);
  const unique=new Map();for(const candle of parsed){if(closedOnly&&candle.t+intervalMs>now)continue;unique.set(candle.t,candle);}
@@ -1820,8 +1821,8 @@ async function fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval,fromda
   // Some SmartAPI gateways accept minute precision but reject seconds.
   // Only retry genuine HTTP 400; other errors are passed through unchanged.
   if(!/HTTP 400|BAD_REQUEST/.test(message))throw err;
-  const from=fromdate.replace(/:\d{2}$/,'');
-  const to=todate.replace(/:\d{2}$/,'');
+  const from=fromdate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
+  const to=todate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
   if(from===fromdate||to===todate)throw err;
   return await request(from,to);
  }
@@ -1861,7 +1862,7 @@ async function historicalCandles(e,jwt,name,days=7){
  return normalizeAngelCandles(all,{intervalMs:300000});
 }
 // v19: read-only index candle intelligence. No orders and no trading signal promotion.
-async function minuteCandles(e,jwt,name,days=5){
+async function minuteCandles(e,jwt,name,days=7){
  const exchange=name==='NIFTY'?'NSE':'BSE';
  const symboltoken=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
  // Query each IST calendar day separately. Large 1-minute ranges can be rejected
@@ -3900,6 +3901,13 @@ function verifiedSignalSelftest(){
 
 export default {
  async fetch(req,e,executionCtx){e.__kvWritesThisInvocation=0;
+if(new URL(req.url).pathname==='/internal/research-audit'&&req.method==='POST'){
+ const signed=await readSigned(req,e);if(!signed||signed.command!=='research-audit'||!['NIFTY','SENSEX'].includes(signed.index))return new Response('Forbidden',{status:403});
+ const index=signed.index,key='deployment:research-data-v1:'+index;
+ const result=await researchAudit({index,read:()=>get(e,key),write:r=>put(e,key,r,86400*30),analyse:()=>marketIntelligence(e,index),benchmark:async()=>tenHistoricalChecks(await historicalCandles(e,await session(e),index,7),index),send:message=>telegram(e,message)});
+ return Response.json(result);
+}
+if(new URL(req.url).pathname==='/research-data-audit')return Response.json({NIFTY:await get(e,'deployment:research-data-v1:NIFTY'),SENSEX:await get(e,'deployment:research-data-v1:SENSEX'),ordersEnabled:false});
 if(new URL(req.url).pathname==='/internal/router'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='ensure-router')return new Response('Forbidden',{status:403});
  try{const routed=await ensureBotRouter(e);if(signed.audit==='history-chain-runtime-v1'&&executionCtx){executionCtx.waitUntil(deploymentAudit({read:()=>get(e,'deployment:history-chain-runtime-v1'),write:r=>put(e,'deployment:history-chain-runtime-v1',r,86400*30),probe:index=>historicalProbe(e,index),status:()=>chainCommand(e,'status'),send:message=>telegram(e,message)}).catch(()=>console.warn('deployment-audit-failed')));routed.auditAccepted=true;}return Response.json(routed);}catch{return Response.json({configured:false,reason:'TELEGRAM_ROUTER_SETUP_FAILED'},{status:502});}
@@ -4101,4 +4109,4 @@ export { signalEvidenceConsistency, verifiedSignalDecision };
 export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
-export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe};
+export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks};
