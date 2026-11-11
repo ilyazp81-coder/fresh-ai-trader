@@ -1,3 +1,4 @@
+import {deploymentAudit} from './deployment-audit.mjs';
 import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity } from './router.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
 // Paper-only alerts; live broker validation pending.
@@ -3898,11 +3899,12 @@ function verifiedSignalSelftest(){
 }
 
 export default {
- async fetch(req,e){e.__kvWritesThisInvocation=0;
+ async fetch(req,e,executionCtx){e.__kvWritesThisInvocation=0;
 if(new URL(req.url).pathname==='/internal/router'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='ensure-router')return new Response('Forbidden',{status:403});
- try{return Response.json(await ensureBotRouter(e));}catch{return Response.json({configured:false,reason:'TELEGRAM_ROUTER_SETUP_FAILED'},{status:502});}
+ try{const routed=await ensureBotRouter(e);if(signed.audit==='history-chain-runtime-v1'&&executionCtx){executionCtx.waitUntil(deploymentAudit({read:()=>get(e,'deployment:history-chain-runtime-v1'),write:r=>put(e,'deployment:history-chain-runtime-v1',r,86400*30),probe:index=>historicalProbe(e,index),status:()=>chainCommand(e,'status'),send:message=>telegram(e,message)}).catch(()=>console.warn('deployment-audit-failed')));routed.auditAccepted=true;}return Response.json(routed);}catch{return Response.json({configured:false,reason:'TELEGRAM_ROUTER_SETUP_FAILED'},{status:502});}
 }
+if(new URL(req.url).pathname==='/deployment-audit')return Response.json(await get(e,'deployment:history-chain-runtime-v1')||{status:'NOT_RUN',ordersEnabled:false});
 await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:NIFTY'),SENSEX:await get(e,'research:paper:position:SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
   const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
   const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
