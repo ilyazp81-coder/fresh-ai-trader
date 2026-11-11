@@ -432,10 +432,19 @@ async function historicalRequest(url,options,{label='historical',timeoutMs=15000
   // A broker may use HTTP 403 for throttling as well as permission failures.
   // Read only a bounded response for classification; never log raw broker data.
   if(response.status===401||response.status===403){
-   let hint='';try{hint=(await response.text()).slice(0,512).toLowerCase();}catch{}
+   // Preserve only a safe classification of the broker's denial response.
+   // Do not log/return raw response bodies, JWTs, API keys, or request headers.
+   let hint='';try{hint=(await response.text()).slice(0,1024).toLowerCase();}catch{}
    const throttled=response.status===403&&/rate.?limit|too many requests|throttl|exceeded.*limit/.test(hint);
+   const denialClass=throttled?'RATE_LIMITED':
+    /cloudflare|cf-ray|web application firewall|waf|bot.?fight|request blocked|access denied.*policy/.test(hint)?'EDGE_OR_WAF_BLOCK':
+    /ip.*(allow|block|restrict|denied)|not.?whitelist|whitelist.*ip/.test(hint)?'IP_RESTRICTION':
+    /subscription|permission|not authorized|unauthorized|access denied/.test(hint)?'BROKER_PERMISSION_OR_AUTH':
+    response.status===401?'AUTH_REJECTED':'ACCESS_DENIED_UNCLASSIFIED';
    if(throttled&&attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
-   throw new AngelDataError(throttled?'RATE_LIMITED':'ACCESS_DENIED',response.status);
+   const requestId=response.headers?.get?.('x-request-id')||response.headers?.get?.('cf-ray')||'';
+   const suffix=requestId?` request=${String(requestId).replace(/[^a-zA-Z0-9._-]/g,'').slice(0,48)}`:'';
+   throw new AngelDataError(denialClass+suffix,response.status);
   }
   // Never log broker response bodies or authorization headers. Classify safely.
   let payload;
