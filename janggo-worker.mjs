@@ -1820,15 +1820,11 @@ async function fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval,fromda
  const request=(from,to)=>historicalRequest(url,{method:'POST',headers,
   body:JSON.stringify({exchange,symboltoken,interval,fromdate:from,todate:to})},
   {label,retries:0,beforeRequest:()=>brokerSlot(e,'history')});
- try{return await request(fromdate,todate)}catch(err){
-  const message=String(err?.message||err);
-  // Some SmartAPI gateways accept minute precision but reject seconds.
-  // Only retry genuine HTTP 400; other errors are passed through unchanged.
-  if(!/HTTP 400|BAD_REQUEST/.test(message))throw err;
-  const from=fromdate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
-  const to=todate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
-  if(from===fromdate||to===todate)throw err;
-  return await request(from,to);
+ const from=fromdate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1'),to=todate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
+ try{return await request(from,to)}catch(err){
+  if(err?.code==='RATE_LIMITED'&&e.OPTION_CHAIN)await chainCommand(e,'broker-cooldown',{kind:'history'}).catch(()=>{});
+  if(!/HTTP 400|BAD_REQUEST/.test(String(err?.message||err))||(from===fromdate&&to===todate))throw err;
+  return request(fromdate,todate);
  }
 }
 
@@ -3976,7 +3972,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
   // Daily autonomous AI hypothesis generation and independent index-proxy research.
   // Failure never enables signals or prevents the existing scanner.
   const backgroundDue=new Date().getUTCMinutes()%15<3;
-  const autonomousResearchTask=backgroundDue?autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)})):Promise.resolve({status:'DEFERRED'});
+  const autonomousResearchTask=Promise.resolve({status:'DEFERRED_UNTIL_CRITICAL_WORK'});
   const cal=await refreshExchangeCalendar(e);
   if(!cal.ok)console.warn('calendar refresh',JSON.stringify(cal));
   // Run notices and scanning independently. A slow Telegram notice must not delay
@@ -4074,6 +4070,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
   }
   // Lower-priority evidence promotion cannot consume the critical scanner/candle write budget first.
   if(!backgroundDue)return;
+  await autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:safeError(err,e)}));
   const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
   if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
   // Isolate every scheduled research stage: one failure must not suppress later diagnostics.

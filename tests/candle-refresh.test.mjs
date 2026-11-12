@@ -35,3 +35,9 @@ test('stale research cannot trigger review or selection and unchanged waits do n
  const result=await runScheduledPaperCycle(deps);assert.ok(result.results.every(x=>x.status==='EVIDENCE_STALE'));assert.equal(reviews,0);assert.equal(writes,2);
  now+=180000;await runScheduledPaperCycle(deps);assert.equal(writes,2);
 });
+
+test('an expired broker backoff is renewed after a new rate-limit rejection',async()=>{
+ const now=Date.now(),cache={rows:{},errors:{NIFTY:{reason:'RATE_LIMITED',retryAfter:now-1}}};let saved;
+ await refreshCandleEvidence({now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{saved=x;},seed:async()=>{throw Error('RATE_LIMITED');},today:async()=>[],analyse:()=>({}),saveEvidence:async()=>true,safeError:e=>e.message});
+ assert.ok(saved.errors.NIFTY.retryAfter>=now+300000);
+});

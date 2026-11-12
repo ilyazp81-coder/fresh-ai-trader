@@ -36,7 +36,7 @@ export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,t
   }catch(error){
    const reason=safeError(error);const limited=/RATE_LIMITED|HTTP 429/.test(reason);
    const denied=!limited&&/ACCESS_DENIED|HTTP 401|HTTP 403/.test(reason);
-   cache.errors[index]||={reason,retryAfter:now+(denied?1800000:limited?300000:60000)};
+   if(!cache.errors[index]||cache.errors[index].retryAfter<=now)cache.errors[index]={reason,retryAfter:now+(denied?1800000:limited?300000:60000)};
    outcomes[index]={status:'UNAVAILABLE',reason,retryAfter:cache.errors[index].retryAfter};
    await saveEvidence(index,{at:now,underlying:index,status:'HISTORICAL_REFRESH_UNAVAILABLE',historicalError:reason,candleFresh:false,signalEligible:false,ordersPlaced:false});
   }

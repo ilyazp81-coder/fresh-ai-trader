@@ -5,13 +5,14 @@ test('multi-day loader uses bounded IST days, preserves broker bars and produces
  const calls=[];const timer=setTimeout;t.mock.method(globalThis,'setTimeout',(fn,ms,...args)=>timer(fn,0,...args));
  t.mock.method(globalThis,'fetch',async(url,init)=>{
   assert.match(url,/getCandleData$/);const q=JSON.parse(init.body);calls.push(q);
-  assert.equal(q.fromdate.slice(0,10),q.todate.slice(0,10));assert.match(q.fromdate,/09:15:00$/);
+  assert.equal(q.fromdate.slice(0,10),q.todate.slice(0,10));assert.match(q.fromdate,/09:15(?::00)?$/);
   const start=Date.parse(q.fromdate.replace(' ','T')+'+05:30'),end=Date.parse(q.todate.replace(' ','T')+'+05:30');
   const span=q.interval==='ONE_MINUTE'?60000:300000,data=[];
   for(let at=start;at<end;at+=span)data.push([new Date(at).toISOString(),100,102,99,101,0]);
   return Response.json({status:true,data});
  });
- const minute=await minuteCandles({},'fake','NIFTY',7),five=await historicalCandles({},'fake','NIFTY',7);
+ const env={TELEGRAM_BOT_TOKEN:'fake',TELEGRAM_CHAT_ID:'7',OPTION_CHAIN:{fetch:async()=>Response.json({at:Date.now()})}};
+ const minute=await minuteCandles(env,'fake','NIFTY',7),five=await historicalCandles(env,'fake','NIFTY',7);
  assert.ok(minute.length>=750);assert.ok(five.length>=150);
  assert.ok(calls.every(q=>q.exchange==='NSE'&&q.symboltoken==='99926000'));
  assert.equal(tenHistoricalChecks(five,'NIFTY').passed,10);
