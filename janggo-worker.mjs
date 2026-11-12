@@ -1,3 +1,4 @@
+import {researchDailySummary,researchDailyMessage} from './daily-results.mjs';
 import {parseAiJson} from './ai-json.mjs';
 import {refreshCandleEvidence,packCandleCache,readPackedCandleCache,authorizedCandleCacheRequest,requestCandleCache} from './candle-refresh.mjs';
 import {researchAudit} from './research-audit.mjs';
@@ -1500,7 +1501,7 @@ async function scan(e,{send=true}={}){
     if(!hist.length||now-hist[hist.length-1].t>=120000)hist.push({t:now,p:quality.price,v:quality.volume,oi:quality.oi});next[key]=hist;
     const verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
     if(verdict.status==='RESEARCH_WATCH'){
-     result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange};
+     result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange,symbol:c.symbol,side:c.side,expiry:new Date(parseExpiry(c.expiry)).toISOString(),lotSize:Number(c.lotSize??c.lotsize)};
      result.researchCandidates++;
      if(result.strategyWatches.length<8)result.strategyWatches.push(verdict);
     }else result.strategyWaitReasons[verdict.reason]=(result.strategyWaitReasons[verdict.reason]||0)+1;
@@ -3768,6 +3769,21 @@ function paperWatchExit(position, observed) {
 export class PaperAlertCoordinator {
  constructor(state,env){this.state=state;this.env=env;this.queue=Promise.resolve();}
  async fetch(request){
+  if(new URL(request.url).pathname==='/internal/daily-results'){
+   const signed=await readSigned(request,this.env);
+   if(!signed||!['daily-results','daily-results-status'].includes(signed.command))return new Response('Forbidden',{status:403});
+   if(signed.command==='daily-results-status')return Response.json(await this.state.storage.get('daily-results:last')||{status:'NOT_RUN'});
+   if(!/^\d{4}-\d{2}-\d{2}$/.test(signed.day)||!Number.isFinite(signed.closeAt)||Date.now()<signed.closeAt||Date.now()-signed.closeAt>12*3600000)return new Response('Outside report window',{status:400});
+   const job=this.queue.then(async()=>{
+    const key='daily-results:'+signed.day,old=await this.state.storage.get(key);if(old)return Response.json(old);
+    const positions=await Promise.all(['NIFTY','SENSEX'].map(async index=>{const k='research:paper:position:'+signed.day+':'+index;return await this.state.storage.get(k)||await get(this.env,k)}));
+    const summary=researchDailySummary(signed.day,positions,await get(this.env,'directional-alerts:'+signed.day)||{});
+    const result={...summary,at:new Date().toISOString(),delivery:'ATTEMPTED'};
+    await this.state.storage.put({[key]:result,'daily-results:last':result});
+    try{await telegram(this.env,researchDailyMessage(summary));result.delivery='API_CONFIRMED'}catch{result.delivery='UNCONFIRMED'}
+    await this.state.storage.put({[key]:result,'daily-results:last':result});return Response.json(result);
+   });this.queue=job.catch(()=>{});return job;
+  }
   if(new URL(request.url).pathname==='/internal/candle-cache'){
    const signed=await authorizedCandleCacheRequest(request,this.env);
    if(!signed)return new Response('Forbidden',{status:403});
@@ -3788,6 +3804,7 @@ export class PaperAlertCoordinator {
      if(key.startsWith('research:paper:position:'))await storage.put(key,value);
     }
    }};
+   await hydrateExchangeCalendar(wrapped);
    const result=await automaticResearchPaperAlerts(wrapped);
    return new Response(JSON.stringify(result),{headers:{'content-type':'application/json'}});
   });
@@ -3795,6 +3812,17 @@ export class PaperAlertCoordinator {
   try{return await job}catch(err){return new Response(JSON.stringify({status:'BLOCKED',reason:'COORDINATOR_FAILURE'}),{status:503,headers:{'content-type':'application/json'}})}
  }
 }
+
+async function freshDailyResults(e,statusOnly=false){
+ if(!e.PAPER_COORDINATOR)return {status:'COORDINATOR_MISSING'};
+ const schedule=sessionConfig(e),date=day(),closeAt=Date.parse(date+'T'+schedule.close+':00+05:30');
+ if(!statusOnly&&(!schedule.valid||Date.now()<closeAt))return {status:'NOT_DUE'};
+ const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName('janggo-paper-alerts-v1'));
+ const body=JSON.stringify({command:statusOnly?'daily-results-status':'daily-results',day:date,closeAt,chatId:String(e.TELEGRAM_CHAT_ID),at:Date.now()});
+ const response=await stub.fetch('https://coordinator.internal/internal/daily-results',{method:'POST',headers:{'content-type':'application/json','x-janggo-signature':await signCommand(e.TELEGRAM_BOT_TOKEN,body)},body});
+ if(!response.ok)throw Error('DAILY_RESULTS_UNAVAILABLE');return response.json();
+}
+
 async function coordinatedPaperAlerts(e){
  if(!e.PAPER_COORDINATOR)return {status:'BLOCKED',reason:'PAPER_COORDINATOR_BINDING_MISSING'};
  const id=e.PAPER_COORDINATOR.idFromName('janggo-paper-alerts-v1');
@@ -3818,7 +3846,7 @@ async function automaticResearchPaperAlerts(e) {
    if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<pos.entryAt||last.t<Number(scanState?.at?Date.parse(scanState.at):0)-60000){report.blocked.push(index+':STALE_EXIT_QUOTE');continue;}
    const decision=paperWatchExit(pos,last.p);
    if(decision.exit){
-    const closed={...pos,status:'CLOSED',exitAt:last.t,exitPremium:decision.price,exitReason:decision.reason,points:Number((decision.price-pos.entryPremium).toFixed(2)),grossPaperPnl:Number.isFinite(pos.quantity)?Number(((decision.price-pos.entryPremium)*pos.quantity).toFixed(2)):null,delivery:'PENDING'};
+    const closed={...pos,entryDelivery:pos.entryDelivery||pos.delivery,status:'CLOSED',exitAt:last.t,exitPremium:decision.price,exitReason:decision.reason,points:Number((decision.price-pos.entryPremium).toFixed(2)),grossPaperPnl:Number.isFinite(pos.quantity)?Number(((decision.price-pos.entryPremium)*pos.quantity).toFixed(2)):null,delivery:'PENDING'};
     if(!await put(e,key,closed,86400*7)){report.blocked.push(index+':EXIT_SAVE_FAILED');continue;}
     const msg=`🧪 JANGGO PAPER RESEARCH EXIT — NOT A VERIFIED TRADE SIGNAL\n${index} ${pos.symbol}\n${decision.reason} | Observed ₹${decision.price.toFixed(2)} | Entry ₹${pos.entryPremium.toFixed(2)} | Premium change ${closed.points}\nNo actual fill or broker order. Quotes are sampled, not independently verified.`;
     try{const sent=await telegram(e,msg);closed.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';await put(e,key,closed,86400*7);}catch(err){closed.delivery='UNCONFIRMED';await put(e,key,closed,86400*7);}
@@ -3832,7 +3860,7 @@ async function automaticResearchPaperAlerts(e) {
   if(!watch)continue;
   const ai=(scanState.directionalReview?.decisions||[]).find(d=>d.symbol===watch.symbol);
   if(!ai){report.blocked.push(index+':AI_REVIEW_MISSING');continue;}
-  if(ai.action!=='WATCH'||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
+  if(!['WATCH',watch.side==='CE'?'BUY_CE':'BUY_PE'].includes(ai.action)||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
   const contract=(scanState.paperContractEvidence||{})[watch.symbol];
   if(!contract?.token||!contract?.exchange||contract.exchange!==(index==='NIFTY'?'NFO':'BFO')||!/^\d+$/.test(String(contract.token))||!Number.isSafeInteger(Number(contract.lotSize))||Number(contract.lotSize)<=0){report.blocked.push(index+':CONTRACT_EVIDENCE_MISSING');continue;}
   const history=rolling[contract.exchange+':'+contract.token],last=Array.isArray(history)?history.at(-1):null;
@@ -3842,8 +3870,10 @@ async function automaticResearchPaperAlerts(e) {
   if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
   const position={status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:last.t,entryPremium:last.p,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
   if(!await put(e,key,position,86400*7)){report.blocked.push(index+':ENTRY_SAVE_FAILED');continue;}
+  const sentDirectional=(await get(e,'directional-alerts:'+day()))?.[watch.symbol];
+  if(sentDirectional?.state==='SENT'){position.delivery='DELIVERED';position.entryDelivery='DELIVERED';position.entryNotice='EXISTING_DIRECTIONAL_ALERT';await put(e,key,position,86400*7);report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});continue;}
   const msg=`🧪 JANGGO PAPER RESEARCH ${watch.side} — NOT A VERIFIED BUY SIGNAL\n${index} ${watch.symbol}\nObserved premium ₹${last.p.toFixed(2)} | Hypothetical SL ₹${position.stop.toFixed(2)} | Target ₹${position.target.toFixed(2)}\nSpot momentum ${watch.spotMovePct}% | OI change ${watch.oiDelta}\nNo broker order. Not independently certified; do not trade from this message.`;
-  try{const sent=await telegram(e,msg);position.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';await put(e,key,position,86400*7);}catch(err){position.delivery='UNCONFIRMED';await put(e,key,position,86400*7);}
+  try{const sent=await telegram(e,msg);position.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';position.entryDelivery=position.delivery;await put(e,key,position,86400*7);}catch(err){position.delivery='UNCONFIRMED';await put(e,key,position,86400*7);}
   report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});
  }
  report.status='COMPLETED';await put(e,'research:paper:alerts:last',report,86400);return report;
@@ -3938,7 +3968,7 @@ if(new URL(req.url).pathname==='/internal/router'&&req.method==='POST'){
  try{const routed=await ensureBotRouter(e);if(signed.audit==='history-chain-runtime-v1'&&executionCtx){executionCtx.waitUntil(deploymentAudit({read:()=>get(e,'deployment:history-chain-runtime-v1'),write:r=>put(e,'deployment:history-chain-runtime-v1',r,86400*30),probe:index=>historicalProbe(e,index),status:()=>chainCommand(e,'status'),send:message=>telegram(e,message)}).catch(()=>console.warn('deployment-audit-failed')));routed.auditAccepted=true;}return Response.json(routed);}catch{return Response.json({configured:false,reason:'TELEGRAM_ROUTER_SETUP_FAILED'},{status:502});}
 }
 if(new URL(req.url).pathname==='/deployment-audit')return Response.json(await get(e,'deployment:history-chain-runtime-v1')||{status:'NOT_RUN',ordersEnabled:false});
-await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:NIFTY'),SENSEX:await get(e,'research:paper:position:SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
+await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/daily-results-status')return Response.json(await freshDailyResults(e,true));if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:'+day()+':NIFTY'),SENSEX:await get(e,'research:paper:position:'+day()+':SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
   const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
   const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
   return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),ordersEnabled:false,
@@ -3977,7 +4007,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
   if(!cal.ok)console.warn('calendar refresh',JSON.stringify(cal));
   // Run notices and scanning independently. A slow Telegram notice must not delay
   // Angel One setup or consume the scanner's timeout budget.
-  const noticeTask=(async()=>{try{await sessionNotice(e)}catch(err){log('session notice',err)}})();
+  const noticeTask=(async()=>{try{await sessionNotice(e);await freshDailyResults(e)}catch(err){log('session notice or daily results',err,e)}})();
   // One sequential writer: paper exits -> strategy review -> new research-paper selection.
   const paperTask=async()=>{try{
    if(!hasKV(e)||!marketOpen(e))return;
@@ -4140,4 +4170,4 @@ export { signalEvidenceConsistency, verifiedSignalDecision };
 export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
-export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly};
+export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly};
