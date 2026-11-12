@@ -25,7 +25,7 @@ test('scheduled candles seed once, merge broker updates and fail closed on stale
  const row=()=>({t:now-120000,o:100,h:102,l:99,c:101,v:0});
  const deps={now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{cache=structuredClone(x);},seed:async()=>{seeds++;return [row()];},today:async()=>{loads++;return [row()];},analyse:(index,rows)=>({underlying:index,observations:rows.length}),saveEvidence:async(index,value)=>{saved[index]=value;return true;},safeError:e=>e.message};
  await refreshCandleEvidence(deps);assert.equal(seeds,2);assert.equal(saved.NIFTY.candleFresh,true);
- now+=180000;await refreshCandleEvidence({...deps,now});assert.equal(seeds,2);assert.equal(loads,2);assert.equal(saved.NIFTY.observations,2);
+ now+=180000;await refreshCandleEvidence({...deps,now});assert.equal(seeds,2);assert.equal(loads,4);assert.equal(saved.NIFTY.observations,2);
  now+=300000;await refreshCandleEvidence({...deps,now,today:async()=>[]});assert.equal(saved.NIFTY.candleFresh,false);assert.equal(saved.SENSEX.candleFresh,false);assert.equal(saved.NIFTY.status,'HISTORICAL_REFRESH_UNAVAILABLE');
 });
 test('stale research cannot trigger review or selection and unchanged waits do not flood KV diagnostics',async()=>{
@@ -38,6 +38,14 @@ test('stale research cannot trigger review or selection and unchanged waits do n
 
 test('an expired broker backoff is renewed after a new rate-limit rejection',async()=>{
  const now=Date.now(),cache={rows:{},errors:{NIFTY:{reason:'RATE_LIMITED',retryAfter:now-1}}};let saved;
- await refreshCandleEvidence({now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{saved=x;},seed:async()=>{throw Error('RATE_LIMITED');},today:async()=>[],analyse:()=>({}),saveEvidence:async()=>true,safeError:e=>e.message});
+ await refreshCandleEvidence({now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{saved=x;},seed:async()=>[],today:async()=>{throw Error('RATE_LIMITED');},analyse:()=>({}),saveEvidence:async()=>true,safeError:e=>e.message});
  assert.ok(saved.errors.NIFTY.retryAfter>=now+300000);
+});
+
+test('failed older history backfill cannot discard fresh current-session broker candles',async()=>{
+ const now=Date.parse('2026-11-12T14:00:00+05:30'),saved={};let cache=null,seeds=0;
+ const row={t:now-60000,o:100,h:102,l:99,c:101,v:0};
+ const deps={now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{cache=structuredClone(x)},today:async()=>[row],seed:async()=>{seeds++;throw Error('RATE_LIMITED HTTP 403')},analyse:(index,rows)=>({observations:rows.length}),saveEvidence:async(index,x)=>{saved[index]=x;return true},safeError:e=>e.message};
+ await refreshCandleEvidence(deps);assert.equal(saved.NIFTY.candleFresh,true);assert.equal(saved.SENSEX.candleFresh,true);assert.equal(saved.NIFTY.observations,1);assert.match(saved.NIFTY.historyBackfill.reason,/RATE_LIMITED/);assert.equal(seeds,2);
+ await refreshCandleEvidence({...deps,now:now+60000});assert.equal(seeds,2);
 });

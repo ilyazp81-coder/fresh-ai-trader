@@ -23,16 +23,28 @@ export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,t
   try{
    const blocked=cache.errors[index];if(blocked?.retryAfter>now)throw Error(blocked.reason);
    const existing=Array.isArray(cache.rows[index])?cache.rows[index]:[];
-   const loaded=existing.length?await today(index):await seed(index);
+   // Current-session recovery must not depend on an older backfill request succeeding.
+   const loaded=await today(index);
    const byTime=new Map(existing.map(x=>[x.t,x]));for(const row of loaded)byTime.set(row.t,row);
    const rows=[...byTime.values()].filter(x=>x.t>=now-8*86400000&&x.t+60000<=now).sort((a,b)=>a.t-b.t).slice(-5000);
    const last=rows.at(-1);
    if(!last||new Date(last.t+19800000).toISOString().slice(0,10)!==day)throw Error('NO_CLOSED_CANDLES_TODAY');
    if(now-last.t>240000)throw Error('HISTORICAL_CANDLES_STALE');
    cache.rows[index]=rows;delete cache.errors[index];
-   const evidence={at:now,...analyse(index,rows),candleFresh:true};
+   // A failed backfill preserves actual fresh broker bars, with missing history explicit.
+   const historyDays=new Set(rows.map(x=>new Date(x.t+19800000).toISOString().slice(0,10)));
+   const backfill=cache.backfillErrors?.[index];
+   if(historyDays.size<2&&cache.seedDays?.[index]!==day&&(!backfill||backfill.retryAfter<=now)){
+    try{const past=await seed(index),merged=new Map(rows.map(x=>[x.t,x]));
+     for(const x of past)if(x.t+60000<=now&&x.t>=now-8*86400000)merged.set(x.t,x);
+     cache.rows[index]=[...merged.values()].sort((a,b)=>a.t-b.t).slice(-5000);
+     cache.seedDays||={};cache.seedDays[index]=day;
+     if(cache.backfillErrors)delete cache.backfillErrors[index];
+    }catch(error){cache.backfillErrors||={};cache.backfillErrors[index]={reason:safeError(error),retryAfter:now+300000};}
+   }
+   const evidence={at:now,...analyse(index,cache.rows[index]),candleFresh:true,historyBackfill:cache.backfillErrors?.[index]||null};
    if(await saveEvidence(index,evidence)===false)throw Error('CANDLE_EVIDENCE_SAVE_FAILED');
-   outcomes[index]={status:'REFRESHED',rows:rows.length,lastCompleteCandle:new Date(last.t).toISOString()};
+   outcomes[index]={status:'REFRESHED',rows:cache.rows[index].length,historyBackfill:cache.backfillErrors?.[index]||null,lastCompleteCandle:new Date(last.t).toISOString()};
   }catch(error){
    const reason=safeError(error);const limited=/RATE_LIMITED|HTTP 429/.test(reason);
    const denied=!limited&&/ACCESS_DENIED|HTTP 401|HTTP 403/.test(reason);
@@ -46,7 +58,7 @@ export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,t
 
 // Durable Object KV values have a per-value size limit. Keep history in small chunks.
 export function packCandleCache(cache){
- const writes={},manifest={at:cache.at,errors:cache.errors||{},indices:{}};
+ const writes={},manifest={at:cache.at,errors:cache.errors||{},backfillErrors:cache.backfillErrors||{},seedDays:cache.seedDays||{},indices:{}};
  for(const index of ['NIFTY','SENSEX']){
   const rows=cache.rows?.[index]||[];if(rows.length>5000)throw Error('HISTORY_CACHE_TOO_LARGE');
   manifest.indices[index]=Math.ceil(rows.length/100);
@@ -57,5 +69,5 @@ export function packCandleCache(cache){
 export async function readPackedCandleCache(storage){
  const manifest=await storage.get('candles:manifest');if(!manifest)return null;
  const rows={};for(const index of ['NIFTY','SENSEX']){const count=manifest.indices[index]||0;if(count>50)throw Error('INVALID_HISTORY_MANIFEST');rows[index]=(await Promise.all(Array.from({length:count},(_,i)=>storage.get('candles:'+index+':'+i)))).flatMap(x=>Array.isArray(x)?x:[]);}
- return {at:manifest.at,rows,errors:manifest.errors||{}};
+ return {at:manifest.at,rows,errors:manifest.errors||{},backfillErrors:manifest.backfillErrors||{},seedDays:manifest.seedDays||{}};
 }
