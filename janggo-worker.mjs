@@ -1,3 +1,4 @@
+import {refreshCandleEvidence,packCandleCache,readPackedCandleCache,authorizedCandleCacheRequest,requestCandleCache} from './candle-refresh.mjs';
 import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
 import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity } from './router.mjs';
@@ -326,17 +327,20 @@ async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY','SENSEX'],
    }else if(trackingStatus==='OPEN'||trackingStatus==='PAPER_CLOSED'){
     result.status=trackingStatus==='OPEN'?'POSITION_STILL_OPEN':'EXIT_SETTLED_WAIT_NEXT_CYCLE';
    }else {
-   result.review=await review(index);
    const evidence=await loadEvidence(index);
    if(!evidence?.market||!evidence?.options){result.status='NO_EVIDENCE';}
+   else if([evidence.market,evidence.options].some(x=>!Number.isFinite(x.at)||x.at>now()||now()-x.at>90000)){result.status='EVIDENCE_STALE';}
    else {
+    result.review=await review(index);
     result.selection=await select(index,evidence);
     result.status=result.selection?.status||'WAIT';
    }
    }
   }catch(err){result.status='ERROR';result.reason=String(err?.message||err).slice(0,120)}
   // Store diagnostics even if a single index fails. No claims of actual fills.
-  await kv.put('paper:scheduled:last:'+index,JSON.stringify({...result,paperOnly:true,ordersEnabled:false,productionSignalsEnabled:false}),{expirationTtl:86400});
+  const reportKey='paper:scheduled:last:'+index,previous=await kv.get(reportKey,'json');
+  const unchangedWait=['NO_EVIDENCE','EVIDENCE_STALE','WAIT'].includes(result.status)&&previous?.status===result.status&&now()-Number(previous.at||0)<15*60000;
+  if(!unchangedWait)await kv.put(reportKey,JSON.stringify({...result,paperOnly:true,ordersEnabled:false,productionSignalsEnabled:false}),{expirationTtl:86400});
   results.push(result);
  }
  return {status:'COMPLETED',results,paperOnly:true,ordersEnabled:false,productionSignalsEnabled:false};
@@ -1948,7 +1952,24 @@ async function marketIntelligence(e,name){
   await put(e,failureKey,{message,transportVersion:'history-router-v7',at:new Date().toISOString(),retryAfter:Date.now()+delay},86400*2);
   return {version:VERSION,underlying:name,status:'HISTORICAL_UNAVAILABLE',historicalError:message,historicalApiState:isDenied?'PERMISSION_OR_AUTH_BLOCKED':isLimited?'RATE_LIMITED':'TEMPORARILY_UNAVAILABLE',historicalRecovery:isDenied?'Check Angel One historical API entitlement and IP restrictions; do not retry every cron.':'Retry only after backoff; do not synthesize candles.',retryAfter:new Date(Date.now()+delay).toISOString(),fallback:await liveObservationEvidence(e,name),signalEligible:false,ordersPlaced:false};
  }
-const result={version:VERSION,underlying:name,source:'Angel One ONE_MINUTE historical index candles',observations:rows.length,frames:[1,3,5,15].map(tf=>frameIntelligence(rows,tf)),signalEligible:false,ordersPlaced:false,limitations:['Historical index data only, not option CE/PE candles','Latest incomplete timeframe candles excluded','Broker historical feed may be delayed, rate-limited or unavailable','No option-chain OI, Greeks, PCR or verified news confluence','Indicators are descriptive, not validated buy/sell signals']};await put(e,'marketintel:'+name,{at:Date.now(),...result},86400);return result}
+const result=buildMarketIntelligence(name,rows);await put(e,'marketintel:'+name,{at:Date.now(),...result},86400);return result}
+
+
+function buildMarketIntelligence(name,rows){return {version:VERSION,underlying:name,source:'Angel One ONE_MINUTE historical index candles',observations:rows.length,frames:[1,3,5,15].map(tf=>frameIntelligence(rows,tf)),signalEligible:false,ordersPlaced:false,limitations:['Historical index data only, not option CE/PE candles','Latest incomplete timeframe candles excluded','Broker historical feed may be delayed, rate-limited or unavailable','No option-chain OI, Greeks, PCR or verified news confluence','Indicators are descriptive, not validated buy/sell signals']};}
+async function refreshScheduledCandleEvidence(e){
+ if(!marketOpen(e)||!e.PAPER_COORDINATOR)return {status:'SKIPPED'};
+ const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName('janggo-history-cache-v1'));
+ 
+ const jwt=await session(e),now=Date.now(),date=day(),schedule=sessionConfig(e);
+ return refreshCandleEvidence({now,day:date,
+  readCache:async()=>{const r=await requestCandleCache(e,stub,'cache-read');if(!r.ok)throw Error('CANDLE_CACHE_READ_FAILED');return r.json();},
+  writeCache:async cache=>{const r=await requestCandleCache(e,stub,'cache-write',cache);if(!r.ok)throw Error('CANDLE_CACHE_SAVE_FAILED');},
+  seed:index=>minuteCandles(e,jwt,index,7),
+  today:async index=>{
+   const result=await fetchHistoricalWindow(e,jwt,{exchange:index==='NIFTY'?'NSE':'BSE',symboltoken:String(index==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000')),interval:'ONE_MINUTE',fromdate:date+' '+schedule.open+':00',todate:istDateTime(new Date(now))<date+' '+schedule.close+':00'?istDateTime(new Date(now)):date+' '+schedule.close+':00',label:'CURRENT_SESSION_CANDLES'});
+   return normalizeAngelCandles(result.data,{intervalMs:60000,now});
+  },analyse:buildMarketIntelligence,saveEvidence:(index,result)=>put(e,'marketintel:'+index,result,86400),safeError:error=>safeError(error,e)});
+}
 
 function emaSeries(values,period){const out=[];let prev=NaN;const alpha=2/(period+1);for(let i=0;i<values.length;i++){if(i===period-1)prev=values.slice(0,period).reduce((a,b)=>a+b,0)/period;else if(i>=period)prev=alpha*values[i]+(1-alpha)*prev;out.push(prev)}return out}
 function benchmarkTrades(candles){
@@ -3751,6 +3772,14 @@ function paperWatchExit(position, observed) {
 export class PaperAlertCoordinator {
  constructor(state,env){this.state=state;this.env=env;this.queue=Promise.resolve();}
  async fetch(request){
+  if(new URL(request.url).pathname==='/internal/candle-cache'){
+   const signed=await authorizedCandleCacheRequest(request,this.env);
+   if(!signed)return new Response('Forbidden',{status:403});
+   if(signed.command==='cache-read')return Response.json(await readPackedCandleCache(this.state.storage));
+   const cache=signed.cache;if(!cache||!Number.isFinite(cache.at))return new Response('Invalid cache',{status:400});
+   const job=this.queue.then(async()=>{const previous=await this.state.storage.get('candles:manifest');if(!previous||previous.at<=cache.at)await this.state.storage.put(packCandleCache(cache));return Response.json({saved:true});});
+   this.queue=job.catch(()=>{});return job;
+  }
   if(new URL(request.url).pathname!=='/internal/paper-run')return new Response('Not found',{status:404});
   const job=this.queue.then(async()=>{
    // Durable storage is the source of truth for positions; KV is a mirror.
@@ -3946,9 +3975,8 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
   await put(e,'cron:last-trigger',{at:new Date().toISOString(),version:VERSION,scheduledTime:ev?.scheduledTime||null,marketOpen:marketOpen(e)},86400*3);
   // Daily autonomous AI hypothesis generation and independent index-proxy research.
   // Failure never enables signals or prevents the existing scanner.
-  const autonomousResearchTask=autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)}));
-  const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
-  if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
+  const backgroundDue=new Date().getUTCMinutes()%15<3;
+  const autonomousResearchTask=backgroundDue?autonomousResearchCycle(e).catch(err=>({status:'FAILED',reason:String(err.message||err).slice(0,120)})):Promise.resolve({status:'DEFERRED'});
   const cal=await refreshExchangeCalendar(e);
   if(!cal.ok)console.warn('calendar refresh',JSON.stringify(cal));
   // Run notices and scanning independently. A slow Telegram notice must not delay
@@ -3964,7 +3992,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
       const q=rows.find(x=>String(x.symbolToken??x.symboltoken??x.token)===String(c.token));
       if(!q)throw Error('NO_CONTRACT_QUOTE');return q;
      },{marketOpen:true});
-     await put(e,'premium:last:'+index,{...result,at:Date.now()},86400);
+     if(result.status!=='IDLE')await put(e,'premium:last:'+index,{...result,at:Date.now()},86400);
      // Paper BUY/SELL notifications only after a recorded simulated state transition.
      // A failed notification never changes the simulated trade state or places orders.
      if(result.status==='PAPER_OPEN'||result.status==='PAPER_CLOSED'){
@@ -4028,6 +4056,26 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
   // The paper selector must consume the CURRENT scan, not yesterday's cached
   // market/options evidence. Run the scan first; failed scans fail closed.
   await Promise.allSettled([noticeTask,scanTask,forwardTask,autonomousResearchTask]);
+  if(marketOpen(e)){try{const candleRefresh=await refreshScheduledCandleEvidence(e);console.log('candle refresh',JSON.stringify(candleRefresh));}catch(err){log('scheduled candle refresh',err,e)}}
+  // Research paper alerts require this invocation's persisted healthy scan.
+  const scanForResearch=await get(e,'scan:last');
+  if(currentScan?.scanHealthy===true && currentScan?.at===scanForResearch?.at && scanForResearch?.scanSummarySaved===true){
+   try{await coordinatedPaperAlerts(e)}catch(err){log('research paper alerts',err,e)}
+  }
+  const scanState=await get(e,'scan:last');
+  const scanAge=Date.now()-Date.parse(scanState?.at||'');
+  // Require persisted state to match the newly completed scan; if KV write
+  // failed or an overlapping invocation replaced it, fail closed.
+  const sameScan=!!currentScan && !!scanState && currentScan.at===scanState.at;
+  if(sameScan && currentScan.scanHealthy===true && scanState.scanHealthy===true && Number.isFinite(scanAge) && scanAge>=0 && scanAge<5*60000 && marketOpen(e)){
+   await paperTask();
+  }else{
+   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'SKIPPED_NO_CURRENT_PERSISTED_HEALTHY_SCAN',scanAt:scanState?.at||null,sameScan},86400);
+  }
+  // Lower-priority evidence promotion cannot consume the critical scanner/candle write budget first.
+  if(!backgroundDue)return;
+  const researchReview=await runPaperResearchReview(e).catch(err=>({status:'ERROR',error:String(err.message||err).slice(0,150)}));
+  if(researchReview.status==='ERROR')console.warn('paper research review',researchReview.error);
   // Isolate every scheduled research stage: one failure must not suppress later diagnostics.
   // Persist a concise stage-specific report so recurring errors can be investigated.
   const researchStages=[
@@ -4076,21 +4124,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/pape
     at:new Date().toISOString(),status:'FAILED',reason:safeError(err,e).slice(0,160),ordersEnabled:false
    },86400)}catch(writeErr){log('scheduled signal audit persistence',writeErr,e)}
   }
-  // Research paper alerts require this invocation's persisted healthy scan.
-  const scanForResearch=await get(e,'scan:last');
-  if(currentScan?.scanHealthy===true && currentScan?.at===scanForResearch?.at && scanForResearch?.scanSummarySaved===true){
-   try{await coordinatedPaperAlerts(e)}catch(err){log('research paper alerts',err,e)}
-  }
-  const scanState=await get(e,'scan:last');
-  const scanAge=Date.now()-Date.parse(scanState?.at||'');
-  // Require persisted state to match the newly completed scan; if KV write
-  // failed or an overlapping invocation replaced it, fail closed.
-  const sameScan=!!currentScan && !!scanState && currentScan.at===scanState.at;
-  if(sameScan && currentScan.scanHealthy===true && scanState.scanHealthy===true && Number.isFinite(scanAge) && scanAge>=0 && scanAge<5*60000 && marketOpen(e)){
-   await paperTask();
-  }else{
-   await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'SKIPPED_NO_CURRENT_PERSISTED_HEALTHY_SCAN',scanAt:scanState?.at||null,sameScan},86400);
-  }
+
  }catch(err){
    // Record a durable, bounded failure report rather than silently losing cron errors.
    const failure={at:new Date().toISOString(),stage:'SCHEDULED_OUTER',status:'FAILED',error:safeError(err,e).slice(0,180),ordersPlaced:false};
@@ -4109,4 +4143,4 @@ export { signalEvidenceConsistency, verifiedSignalDecision };
 export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
-export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks};
+export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle};
