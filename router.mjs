@@ -36,7 +36,7 @@ export async function brokerSlot(env,kind){
   if(!Number.isSafeInteger(slot.at)||slot.at>Date.now()+10000)throw Error('INVALID_BROKER_SLOT');
   const wait=slot.at-Date.now();if(wait>0)await new Promise(r=>setTimeout(r,wait));return;
  }
- const now=Date.now(),gap=kind==='history'?1200:1100,at=Math.max(now,localSlots[kind]||0);
+ const now=Date.now(),gap=kind==='history'?5000:1100,at=Math.max(now,localSlots[kind]||0);
  if(at-now>8000)throw Error('LOCAL_BROKER_QUEUE_FULL');localSlots[kind]=at+gap;
  if(at>now)await new Promise(r=>setTimeout(r,at-now));
 }
