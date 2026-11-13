@@ -1,3 +1,4 @@
+import worker from '../janggo-worker.mjs';
 import test from 'node:test';import assert from 'node:assert/strict';
 import {automaticResearchPaperAlerts,PaperAlertCoordinator} from '../janggo-worker.mjs';
 import {researchDailySummary} from '../daily-results.mjs';import {signCommand} from '../router.mjs';
@@ -5,7 +6,7 @@ test('a confirmed BUY_PE alert starts one tracked paper position without a dupli
  const RealDate=Date,now=Date.parse('2026-11-12T14:40:00+05:30');
  t.mock.method(globalThis,'Date',class extends RealDate{constructor(...args){super(...(args.length?args:[now]))}static now(){return now}});t.mock.method(Date,'now',()=>now);
  const state=new Map(),env={__verifiedCalendar:{source:'NSE_OFFICIAL_FO',years:['2026'],holidays:[]},STATE:{get:async k=>state.get(k)||null,put:async(k,v)=>state.set(k,v)}};
- const watch={status:'RESEARCH_WATCH',underlying:'SENSEX',symbol:'SENSEX_TEST_PE',side:'PE',referencePremium:100,hypotheticalSL:95,hypotheticalTarget:110,spotMovePct:-.2,premiumMovePct:2,oiDelta:100};
+ const watch={entryPolicy:'strong-research-v1',candleConfirmation:{ok:true},status:'RESEARCH_WATCH',underlying:'SENSEX',symbol:'SENSEX_TEST_PE',side:'PE',referencePremium:100,hypotheticalSL:95,hypotheticalTarget:110,spotMovePct:-.2,premiumMovePct:2,oiDelta:100};
  const scan={at:new Date(now).toISOString(),scanHealthy:true,scanSummarySaved:true,kvStateSaved:true,strategyWatches:[watch],directionalReview:{decisions:[{symbol:watch.symbol,action:'BUY_PE'}]},paperContractEvidence:{[watch.symbol]:{symbol:watch.symbol,token:'123',exchange:'BFO',side:'PE',expiry:'2026-11-19T10:00:00Z',lotSize:20}}};
  state.set('scan:last',JSON.stringify(scan));state.set('rolling:2026-11-12',JSON.stringify({'BFO:123':[{t:now,p:100}]}));state.set('directional-alerts:2026-11-12',JSON.stringify({[watch.symbol]:{state:'SENT',at:now}}));
  t.mock.method(globalThis,'fetch',async()=>assert.fail('Confirmed entry must not notify twice'));
@@ -25,4 +26,11 @@ test('closing summary excludes unresolved and untracked alerts; authenticated re
  t.mock.method(globalThis,'fetch',async()=>{sent++;return Response.json({ok:true,result:{message_id:22}})});
  const body=JSON.stringify({command:'daily-results',at:now,day:'2026-11-12',closeAt:now-1000,chatId:'7'});const init={method:'POST',headers:{'x-janggo-signature':await signCommand('fake',body)},body};
  const a=await (await co.fetch(new Request('https://private/internal/daily-results',init))).json();assert.equal(a.delivery,'API_CONFIRMED');await co.fetch(new Request('https://private/internal/daily-results',init));assert.equal(sent,1);
+});
+
+test('public daily-results status uses the authenticated coordinator and never throws for missing imports',async()=>{
+ const env={TELEGRAM_BOT_TOKEN:'fake',TELEGRAM_CHAT_ID:'7',STATE:{get:async()=>null,put:async()=>{}}};
+ const coordinator=new PaperAlertCoordinator({storage:{get:async()=>({status:'RECORDED'}),put:async()=>{}}},env);
+ env.PAPER_COORDINATOR={idFromName:x=>x,get:()=>({fetch:(url,init)=>coordinator.fetch(new Request(url,init))})};
+ const response=await worker.fetch(new Request('https://fresh.example/daily-results-status'),env);assert.equal(response.status,200);assert.equal((await response.json()).status,'RECORDED');
 });

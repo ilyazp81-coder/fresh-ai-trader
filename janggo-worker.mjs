@@ -1,9 +1,10 @@
+import {RESEARCH_ENTRY_POLICY,strongSnapshotEvidence,researchCandleConfirmation,researchAlertCapacity,confirmResearchQuote} from './strong-entry.mjs';
 import {researchDailySummary,researchDailyMessage} from './daily-results.mjs';
 import {parseAiJson} from './ai-json.mjs';
 import {refreshCandleEvidence,packCandleCache,readPackedCandleCache,authorizedCandleCacheRequest,requestCandleCache} from './candle-refresh.mjs';
 import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
-import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity } from './router.mjs';
+import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity,signCommand } from './router.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
 // Paper-only alerts; live broker validation pending.
 
@@ -1060,7 +1061,7 @@ function quoteQuality(q){
  const oi=num(q.opnInterest??q.openInterest??q.openinterest??q.oi);
  const bid=num(q.depth?.buy?.[0]?.price),ask=num(q.depth?.sell?.[0]?.price);
  const spread=Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0&&ask>=bid&&price>0?round2((ask-bid)/price*100):null;
- return {...quoteTimestamp(q),price,volume,oi:Number.isFinite(oi)&&oi>=0?oi:null,bid:Number.isFinite(bid)&&bid>0?bid:null,ask:Number.isFinite(ask)&&ask>0?ask:null,spreadPct:spread,hasOi:Number.isFinite(oi)&&oi>=0,hasSpread:spread!==null};
+ return {...quoteTimestamp(q),price,volume,bidQuantity:num(q.depth?.buy?.[0]?.quantity),askQuantity:num(q.depth?.sell?.[0]?.quantity),oi:Number.isFinite(oi)&&oi>=0?oi:null,bid:Number.isFinite(bid)&&bid>0?bid:null,ask:Number.isFinite(ask)&&ask>0?ask:null,spreadPct:spread,hasOi:Number.isFinite(oi)&&oi>=0,hasSpread:spread!==null};
 }
 async function optionContext(e,c,q){
  const v=quoteQuality(q),key=`oi:${day()}:${c.exchange}:${c.token}`,prev=await get(e,key);
@@ -1354,11 +1355,13 @@ async function sendDirectionalAlerts(e,result,now){
  if(seen===null){result.directionalAlertsSkipped='Deduplication state missing or unreadable; alerts blocked';return}
  if(typeof seen!=='object'||Array.isArray(seen)){result.directionalAlertsSkipped='Invalid deduplication state';return}
  const selected=[];
- for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||seen[d.symbol]||selected.length>=2)continue;
+ for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||seen[d.symbol]||selected.length>=1||!researchAlertCapacity(seen,w.underlying,Date.now())||w.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok)continue;
   if(!(w.referencePremium>0&&w.hypotheticalSL>0&&w.hypotheticalSL<w.referencePremium&&w.hypotheticalTarget>w.referencePremium))continue;
   // A watch must be from the current verified scan, not a stale cached candidate.
   if(w.status!=='RESEARCH_WATCH'||!['CE','PE'].includes(w.side)||
      (w.side==='CE'&&d.action!=='BUY_CE')||(w.side==='PE'&&d.action!=='BUY_PE'))continue;
+  const contract=result.paperContractEvidence?.[w.symbol];if(!contract?.token||!contract.exchange)continue;
+  try{const latest=await quotes(e,await session(e),contract.exchange,[String(contract.token)]);const raw=latest.find(q=>String(q.symbolToken??q.symboltoken??q.token)===String(contract.token));const confirmed=confirmResearchQuote(w,contract,quoteQuality(raw||{}),Date.now());if(!confirmed)continue;Object.assign(w,confirmed);}catch{continue;}
   selected.push({w,d});
  }
  if(!selected.length)return;
@@ -1366,7 +1369,7 @@ async function sendDirectionalAlerts(e,result,now){
  // concurrent scan, but a failed send must be recoverable on the next scan.
  // A short-lived pending claim is deliberately distinct from a confirmed delivery.
  const claims={...seen};
- for(const {w} of selected)claims[w.symbol]={state:'PENDING',at:now};
+ for(const {w} of selected)claims[w.symbol]={state:'PENDING',at:now,underlying:w.underlying};
  if(!await put(e,key,claims,86400)){result.directionalAlertsSkipped='KV quota/write failed: alert blocked';return}
  for(const {w,d} of selected){
   // A queued alert may become stale while another Telegram request is in flight.
@@ -1376,16 +1379,16 @@ async function sendDirectionalAlerts(e,result,now){
    result.issues.push('Directional alert queue expired; unsent claims remain blocked for safety');
    break;
   }
-  const msg=`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. No validated candle/Greeks/news/backtest; not an order. Check live price before any decision.`;
+  const msg=`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. Closed 1m/5m trends aligned; strategy/Greeks/backtest unvalidated. Not an order. Check live price before any decision.`;
   try{
    await telegram(e,msg);
    result.directionalAlertsSent++;
-   claims[w.symbol]={state:'SENT',at:Date.now()};
+   claims[w.symbol]={state:'SENT',at:Date.now(),underlying:w.underlying};
   }catch(err){
    result.issues.push('Directional Telegram delivery: '+String(err?.message||err).slice(0,120));
    // Fail closed on ambiguous transport outcomes: do not auto-retry an
    // unconfirmed send, because Telegram may have delivered it already.
-   claims[w.symbol]={state:'UNKNOWN',at:Date.now()};
+   claims[w.symbol]={state:'UNKNOWN',at:Date.now(),underlying:w.underlying};
   }
   if(!await put(e,key,claims,86400)){
    result.issues.push('Telegram delivery reconciliation KV write failed; automatic resend blocked');
@@ -1489,6 +1492,7 @@ async function scan(e,{send=true}={}){
     const rows=await quotes(e,jwt,ex,tokens.slice(i,i+50));
     for(const q of rows)byToken.set(String(q.symbolToken??q.symboltoken??q.symbol_token??q.token),q);
    }
+   const marketCandles=await get(e,'marketintel:'+name);
    for(const c of cs){
     const q=byToken.get(c.token);if(!q)continue;
     const quality=quoteQuality(q);if(!Number.isFinite(quality.price)||quality.price<=0)continue;
@@ -1499,7 +1503,8 @@ async function scan(e,{send=true}={}){
     const key=c.exchange+':'+c.token;
     const hist=(Array.isArray(previous[key])?previous[key]:[]).filter(x=>Number.isFinite(x.t)&&now-x.t<40*60000).slice(-9);
     if(!hist.length||now-hist[hist.length-1].t>=120000)hist.push({t:now,p:quality.price,v:quality.volume,oi:quality.oi});next[key]=hist;
-    const verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
+    let verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
+    if(verdict.status==='RESEARCH_WATCH'){const confirm=researchCandleConfirmation(verdict,marketCandles,now);if(!confirm.ok)verdict={status:'WAIT',reason:confirm.reason};else verdict.candleConfirmation=confirm;}
     if(verdict.status==='RESEARCH_WATCH'){
      result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange,symbol:c.symbol,side:c.side,expiry:new Date(parseExpiry(c.expiry)).toISOString(),lotSize:Number(c.lotSize??c.lotsize)};
      result.researchCandidates++;
@@ -1516,6 +1521,9 @@ async function scan(e,{send=true}={}){
    result.indices[name]=info;
   }catch(err){result.issues.push(name+': '+String(err.message).slice(0,160));result.indices[name]={status:'FAILED',reason:String(err.message).slice(0,160),contracts:0,quoted:0,fresh:0}}
  }
+ const alertClaims=await get(e,'directional-alerts:'+day());
+ result.strategyWatches=result.strategyWatches.filter(w=>researchAlertCapacity(alertClaims,w.underlying,now));
+ result.entryPolicy=RESEARCH_ENTRY_POLICY;
  // One grounded pretrained-AI inference per scan. A second independent inference
  // caused unnecessary latency and inconsistent WATCH vs directional decisions.
  result.directionalReview=result.strategyWatches.length?await reviewDirectionalSignals(e,result.strategyWatches,result.indices):{status:'NO_CANDIDATES',decisions:[]};
@@ -1608,25 +1616,7 @@ async function scan(e,{send=true}={}){
 }
 // V44 deterministic, auditable strategy: observation-based research ONLY.
 // Snapshots are NOT OHLC candles; do not infer BOS/FVG/engulfing from them.
-function evaluateSnapshotStrategy({contract, history, spotHistory, quality, now=Date.now()}) {
- const wait=reason=>({status:'WAIT',reason});
- if(!contract||!quality||quality.state!=='FRESH'||!quality.hasOi||!quality.hasSpread||quality.spreadPct>1.5)return wait('quote quality/OI/spread gate');
- if(!Array.isArray(history)||history.length<4||!Array.isArray(spotHistory)||spotHistory.length<4)return wait('need 4 independent observations');
- const h=history.slice(-4),sh=spotHistory.slice(-4);
- if(h.some((v,i)=>!Number.isFinite(v.p)||v.p<=0||!Number.isFinite(v.oi)||!Number.isFinite(v.v)||!Number.isFinite(v.t)||(i>0&&v.t<=h[i-1].t)))return wait('invalid option observations');
- if(sh.some((v,i)=>!Number.isFinite(v.p)||v.p<=0||!Number.isFinite(v.t)||(i>0&&v.t<=sh[i-1].t)))return wait('invalid spot observations');
- if(now-h[3].t>240000||now-sh[3].t>240000||h[3].t-h[0].t<8*60000||sh[3].t-sh[0].t<8*60000)return wait('stale or insufficient observation interval');
- if(h.some((v,i)=>i>0&&v.v<h[i-1].v))return wait('nonmonotonic cumulative volume');
- const premiumMove=(h[3].p/h[0].p-1)*100, spotMove=(sh[3].p/sh[0].p-1)*100;
- const side=contract.side==='CE'?1:contract.side==='PE'?-1:0;
- if(!side)return wait('invalid option side');
- if(spotMove*side<0.12)return wait('spot direction insufficient or contradictory');
- if(premiumMove<1.0)return wait('option premium momentum below minimum');
- if(premiumMove>8.0)return wait('premium move exceeds late-entry cap');
- if(h[3].oi<=h[0].oi||h[3].v<=h[0].v)return wait('OI/volume expansion missing');
- if(h[3].p<=h[2].p||sh[3].p*side<=sh[2].p*side)return wait('momentum not sustained');
- return {status:'RESEARCH_WATCH',strategy:'spot_option_momentum_oi_v1',symbol:contract.symbol,underlying:contract.underlying,side:contract.side,spotMovePct:round2(spotMove),premiumMovePct:round2(premiumMove),oiDelta:round2(h[3].oi-h[0].oi),referencePremium:round2(h[3].p),hypotheticalSL:round2(h[3].p*.97),hypotheticalTarget:round2(h[3].p*1.05),reason:'4 sequential observations, spot direction, premium momentum, OI and volume expansion; NOT candle/Greeks/backtest validated',executable:false};
-}
+function evaluateSnapshotStrategy(input){return strongSnapshotEvidence(input);}
 // Read-only diagnostic of the actual scheduled scanner (not the manual quote probe).
 async function scanStatus(e){
  const last=await get(e,'scan:last');
@@ -3857,7 +3847,7 @@ async function automaticResearchPaperAlerts(e) {
   // A closed position cannot reopen within the same day; prevents churn and duplicate notifications.
   if(pos)continue;
   const watch=(scanState.strategyWatches||[]).find(w=>w.underlying===index&&paperWatchDecision(w).ok);
-  if(!watch)continue;
+  if(!watch||watch.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!watch.candleConfirmation?.ok)continue;
   const ai=(scanState.directionalReview?.decisions||[]).find(d=>d.symbol===watch.symbol);
   if(!ai){report.blocked.push(index+':AI_REVIEW_MISSING');continue;}
   if(!['WATCH',watch.side==='CE'?'BUY_CE':'BUY_PE'].includes(ai.action)||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
@@ -4170,4 +4160,4 @@ export { signalEvidenceConsistency, verifiedSignalDecision };
 export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
-export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly};
+export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly,sendDirectionalAlerts};
