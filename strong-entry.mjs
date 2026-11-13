@@ -1,5 +1,5 @@
 // Engineering filters for fewer experimental alerts; no claim of validated accuracy.
-export const RESEARCH_ENTRY_POLICY={version:'strong-research-v1',maximumAlertsPerDay:2,minimumSpotMovePct:0.2,minimumPremiumMovePct:3,maximumPremiumMovePct:6,maximumSpreadPct:0.75,minimumOiChangePct:1,minimumVolumeLots:10,cooldownMinutes:30};
+export const RESEARCH_ENTRY_POLICY={version:'movement-research-v2',tradeCountLimit:null,countMode:'QUALIFYING_MOVEMENTS',minimumSpotMovePct:0.2,minimumPremiumMovePct:3,maximumPremiumMovePct:6,maximumSpreadPct:0.75,minimumOiChangePct:1,minimumVolumeLots:10};
 const wait=reason=>({status:'WAIT',reason});
 export function strongSnapshotEvidence({contract,history,spotHistory,quality,now=Date.now()}){
  const lot=Number(contract?.lotSize??contract?.lotsize),p=RESEARCH_ENTRY_POLICY;
@@ -21,11 +21,10 @@ export function researchCandleConfirmation(w,market,now=Date.now()){
  for(const [tf,maxAge]of [['1m',240000],['5m',600000]]){const f=market.frames?.find(x=>x.timeframe===tf),at=Date.parse(f?.lastCompleteCandle||'');if(f?.status!=='RESEARCH_ONLY'||f.trend!==direction||!Number.isFinite(at)||now-at>maxAge||at>now)return {ok:false,reason:tf+' closed-candle trend not aligned'};}
  return {ok:true,timeframes:['1m','5m'],direction,asOf:market.at};
 }
-export function researchAlertCapacity(claims,index,now){
- if(!claims||typeof claims!=='object'||Array.isArray(claims))return false;
- const entries=Object.entries(claims);if(entries.length>=2)return false;
- if(entries.some(([symbol,x])=>x?.underlying===index||symbol.startsWith(index)))return false;
- return !entries.some(([,x])=>!Number.isFinite(x?.at)||now-x.at<1800000);
+export function researchAlertCapacity(claims,index,now,signalId,position){
+ if(!claims||typeof claims!=='object'||Array.isArray(claims)||position?.status==='OPEN')return false;
+ if(signalId&&claims[signalId])return false;
+ return !Object.entries(claims).some(([key,x])=>['PENDING','UNKNOWN'].includes(x?.state)&&(x.underlying===index||key.startsWith(index)));
 }
 
 export function confirmResearchQuote(w,contract,q,now=Date.now()){

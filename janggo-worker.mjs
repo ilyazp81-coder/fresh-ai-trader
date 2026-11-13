@@ -1355,7 +1355,7 @@ async function sendDirectionalAlerts(e,result,now){
  if(seen===null){result.directionalAlertsSkipped='Deduplication state missing or unreadable; alerts blocked';return}
  if(typeof seen!=='object'||Array.isArray(seen)){result.directionalAlertsSkipped='Invalid deduplication state';return}
  const selected=[];
- for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||seen[d.symbol]||selected.length>=1||!researchAlertCapacity(seen,w.underlying,Date.now())||w.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok)continue;
+ for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||!w.signalId||seen[w.signalId]||selected.some(x=>x.w.underlying===w.underlying)||!researchAlertCapacity(seen,w.underlying,Date.now(),w.signalId,await get(e,'research:paper:position:'+day()+':'+w.underlying))||w.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok)continue;
   if(!(w.referencePremium>0&&w.hypotheticalSL>0&&w.hypotheticalSL<w.referencePremium&&w.hypotheticalTarget>w.referencePremium))continue;
   // A watch must be from the current verified scan, not a stale cached candidate.
   if(w.status!=='RESEARCH_WATCH'||!['CE','PE'].includes(w.side)||
@@ -1369,7 +1369,7 @@ async function sendDirectionalAlerts(e,result,now){
  // concurrent scan, but a failed send must be recoverable on the next scan.
  // A short-lived pending claim is deliberately distinct from a confirmed delivery.
  const claims={...seen};
- for(const {w} of selected)claims[w.symbol]={state:'PENDING',at:now,underlying:w.underlying};
+ for(const {w} of selected)claims[w.signalId]={state:'PENDING',at:now,underlying:w.underlying,symbol:w.symbol};
  if(!await put(e,key,claims,86400)){result.directionalAlertsSkipped='KV quota/write failed: alert blocked';return}
  for(const {w,d} of selected){
   // A queued alert may become stale while another Telegram request is in flight.
@@ -1379,16 +1379,17 @@ async function sendDirectionalAlerts(e,result,now){
    result.issues.push('Directional alert queue expired; unsent claims remain blocked for safety');
    break;
   }
-  const msg=`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. Closed 1m/5m trends aligned; strategy/Greeks/backtest unvalidated. Not an order. Check live price before any decision.`;
+  const timing='Signal time '+istDateTime(new Date())+' IST | Quote age '+Math.max(0,Math.round((Date.now()-w.quotedAt)/1000))+'s\nEntry evidence expires '+istDateTime(new Date(w.quotedAt+30000))+' IST; recheck live price.\nMovement ETA unknown; momentum already observed. Monitoring about every 3 minutes.\n';
+  const msg=timing+`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. Closed 1m/5m trends aligned; strategy/Greeks/backtest unvalidated. Not an order. Check live price before any decision.`;
   try{
    await telegram(e,msg);
    result.directionalAlertsSent++;
-   claims[w.symbol]={state:'SENT',at:Date.now(),underlying:w.underlying};
+   claims[w.signalId]={state:'SENT',at:Date.now(),underlying:w.underlying};
   }catch(err){
    result.issues.push('Directional Telegram delivery: '+String(err?.message||err).slice(0,120));
    // Fail closed on ambiguous transport outcomes: do not auto-retry an
    // unconfirmed send, because Telegram may have delivered it already.
-   claims[w.symbol]={state:'UNKNOWN',at:Date.now(),underlying:w.underlying};
+   claims[w.signalId]={state:'UNKNOWN',at:Date.now(),underlying:w.underlying};
   }
   if(!await put(e,key,claims,86400)){
    result.issues.push('Telegram delivery reconciliation KV write failed; automatic resend blocked');
@@ -1505,6 +1506,9 @@ async function scan(e,{send=true}={}){
     if(!hist.length||now-hist[hist.length-1].t>=120000)hist.push({t:now,p:quality.price,v:quality.volume,oi:quality.oi});next[key]=hist;
     let verdict=evaluateSnapshotStrategy({contract:c,history:hist,spotHistory:spotHist,quality,now});
     if(verdict.status==='RESEARCH_WATCH'){const confirm=researchCandleConfirmation(verdict,marketCandles,now);if(!confirm.ok)verdict={status:'WAIT',reason:confirm.reason};else verdict.candleConfirmation=confirm;}
+    const episodeKey='episode:'+key,priorEpisode=previous[episodeKey],active=verdict.status==='RESEARCH_WATCH';
+    const startedAt=active&&priorEpisode?.active&&now-priorEpisode.at<=240000?priorEpisode.startedAt:now;next[episodeKey]={active,at:now,startedAt};
+    if(active)verdict.signalId=c.symbol+'@'+startedAt;
     if(verdict.status==='RESEARCH_WATCH'){
      result.paperContractEvidence[c.symbol]={token:c.token,exchange:c.exchange,symbol:c.symbol,side:c.side,expiry:new Date(parseExpiry(c.expiry)).toISOString(),lotSize:Number(c.lotSize??c.lotsize)};
      result.researchCandidates++;
@@ -1522,7 +1526,8 @@ async function scan(e,{send=true}={}){
   }catch(err){result.issues.push(name+': '+String(err.message).slice(0,160));result.indices[name]={status:'FAILED',reason:String(err.message).slice(0,160),contracts:0,quoted:0,fresh:0}}
  }
  const alertClaims=await get(e,'directional-alerts:'+day());
- result.strategyWatches=result.strategyWatches.filter(w=>researchAlertCapacity(alertClaims,w.underlying,now));
+ const activePaper=Object.fromEntries(await Promise.all(['NIFTY','SENSEX'].map(async index=>[index,await get(e,'research:paper:position:'+day()+':'+index)])));
+ result.strategyWatches=result.strategyWatches.filter(w=>researchAlertCapacity(alertClaims,w.underlying,now,w.signalId,activePaper[w.underlying]));
  result.entryPolicy=RESEARCH_ENTRY_POLICY;
  // One grounded pretrained-AI inference per scan. A second independent inference
  // caused unnecessary latency and inconsistent WATCH vs directional decisions.
@@ -3766,7 +3771,10 @@ export class PaperAlertCoordinator {
    if(!/^\d{4}-\d{2}-\d{2}$/.test(signed.day)||!Number.isFinite(signed.closeAt)||Date.now()<signed.closeAt||Date.now()-signed.closeAt>12*3600000)return new Response('Outside report window',{status:400});
    const job=this.queue.then(async()=>{
     const key='daily-results:'+signed.day,old=await this.state.storage.get(key);if(old)return Response.json(old);
-    const positions=await Promise.all(['NIFTY','SENSEX'].map(async index=>{const k='research:paper:position:'+signed.day+':'+index;return await this.state.storage.get(k)||await get(this.env,k)}));
+    const decode=x=>typeof x==='string'?JSON.parse(x):x;
+    const current=await Promise.all(['NIFTY','SENSEX'].map(async index=>{const k='research:paper:position:'+signed.day+':'+index;return decode(await this.state.storage.get(k)||await get(this.env,k))}));
+    const archived=this.state.storage.list?await this.state.storage.list({prefix:'research:paper:closed:'+signed.day+':'}):new Map();
+    const positions=[...new Map([...archived.values(),...current].map(decode).filter(Boolean).map(x=>[x.index+':'+x.entryAt,x])).values()];
     const summary=researchDailySummary(signed.day,positions,await get(this.env,'directional-alerts:'+signed.day)||{});
     const result={...summary,at:new Date().toISOString(),delivery:'ATTEMPTED'};
     await this.state.storage.put({[key]:result,'daily-results:last':result});
@@ -3791,7 +3799,11 @@ export class PaperAlertCoordinator {
     put:async(key,value,options)=>{
      // KV persistence must succeed first; then record durable state before Telegram delivery.
      await kv.put(key,value,options);
-     if(key.startsWith('research:paper:position:'))await storage.put(key,value);
+     if(key.startsWith('research:paper:position:')){
+      const decode=x=>typeof x==='string'?JSON.parse(x):x,old=decode(await storage.get(key)),next=decode(value);
+      for(const item of [old,next])if(item?.status==='CLOSED'&&Number.isFinite(item.entryAt))await storage.put('research:paper:closed:'+key.split(':')[3]+':'+item.index+':'+item.entryAt,JSON.stringify(item));
+      await storage.put(key,value);
+     }
     }
    }};
    await hydrateExchangeCalendar(wrapped);
@@ -3844,10 +3856,12 @@ async function automaticResearchPaperAlerts(e) {
    }
    continue;
   }
-  // A closed position cannot reopen within the same day; prevents churn and duplicate notifications.
-  if(pos)continue;
+  // A new movement may open after the previous position closes; the same episode cannot.
+
   const watch=(scanState.strategyWatches||[]).find(w=>w.underlying===index&&paperWatchDecision(w).ok);
-  if(!watch||watch.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!watch.candleConfirmation?.ok)continue;
+  if(!watch||!watch.signalId||watch.signalId===pos?.signalId||watch.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!watch.candleConfirmation?.ok)continue;
+  const sentDirectional=(await get(e,'directional-alerts:'+day()))?.[watch.signalId];
+  if(sentDirectional?.state!=='SENT')continue;
   const ai=(scanState.directionalReview?.decisions||[]).find(d=>d.symbol===watch.symbol);
   if(!ai){report.blocked.push(index+':AI_REVIEW_MISSING');continue;}
   if(!['WATCH',watch.side==='CE'?'BUY_CE':'BUY_PE'].includes(ai.action)||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
@@ -3858,9 +3872,8 @@ async function automaticResearchPaperAlerts(e) {
   if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(Date.parse(contract.expiry))||Date.parse(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
   if(Math.abs(last.p-watch.referencePremium)/watch.referencePremium>0.03){report.blocked.push(index+':WATCH_PRICE_MISMATCH');continue;}
   if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
-  const position={status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:last.t,entryPremium:last.p,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
+  const position={signalId:watch.signalId,status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:watch.quotedAt||last.t,entryPremium:watch.referencePremium,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
   if(!await put(e,key,position,86400*7)){report.blocked.push(index+':ENTRY_SAVE_FAILED');continue;}
-  const sentDirectional=(await get(e,'directional-alerts:'+day()))?.[watch.symbol];
   if(sentDirectional?.state==='SENT'){position.delivery='DELIVERED';position.entryDelivery='DELIVERED';position.entryNotice='EXISTING_DIRECTIONAL_ALERT';await put(e,key,position,86400*7);report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});continue;}
   const msg=`🧪 JANGGO PAPER RESEARCH ${watch.side} — NOT A VERIFIED BUY SIGNAL\n${index} ${watch.symbol}\nObserved premium ₹${last.p.toFixed(2)} | Hypothetical SL ₹${position.stop.toFixed(2)} | Target ₹${position.target.toFixed(2)}\nSpot momentum ${watch.spotMovePct}% | OI change ${watch.oiDelta}\nNo broker order. Not independently certified; do not trade from this message.`;
   try{const sent=await telegram(e,msg);position.delivery=sent?.delivered?'DELIVERED':'UNCONFIRMED';position.entryDelivery=position.delivery;await put(e,key,position,86400*7);}catch(err){position.delivery='UNCONFIRMED';await put(e,key,position,86400*7);}
