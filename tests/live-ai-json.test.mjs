@@ -10,6 +10,7 @@ test('structured and fenced AI responses pass the same symbol and side gates; in
  assert.equal((await reviewDirectionalSignals({AI:{run:async()=>({response:'not JSON'})}},[watch],{})).status,'AI_REVIEW_FAILED');
 });
 test('read-only broker probe records actual selected quotes, timestamps and lot sizes without undefined variables',async t=>{
+ const ActualDate=Date,fixed=ActualDate.parse('2026-11-16T11:00:00+05:30');t.mock.method(globalThis,'Date',class extends ActualDate{constructor(...args){super(...(args.length?args:[fixed]));}static now(){return fixed;}});t.mock.method(Date,'now',()=>fixed);
  const now=Date.now(),memory=new Map();const rows=['NIFTY','SENSEX'].flatMap((underlying,k)=>['CE','PE'].map((side,i)=>({underlying,exchange:k?'BFO':'NFO',token:String(100+k*10+i),symbol:underlying+side,side,expiry:'19NOV2026',strike:k?82000:25000,lotsize:65})));
  memory.set('master:cache',JSON.stringify({at:now,rows}));
  const env={SMART_API_KEY:'fake',SMART_CLIENT_CODE:'read-only-probe-test',SMART_PIN:'0000',SMART_TOTP_SEED:'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',__verifiedCalendar:{source:'NSE_OFFICIAL_FO',years:['2026'],holidays:[]},STATE:{get:async key=>memory.get(key)||null,put:async(key,value)=>memory.set(key,value)}};
@@ -20,6 +21,6 @@ test('read-only broker probe records actual selected quotes, timestamps and lot 
   assert.ok(url.endsWith('/quote/'));const [exchange,tokens]=Object.entries(JSON.parse(init.body).exchangeTokens)[0];
   return Response.json({status:true,data:{fetched:tokens.map(token=>({exchange,symbolToken:token,ltp:exchange==='NSE'?25000:exchange==='BSE'?82000:100,opnInterest:10000,tradeVolume:1000,exchFeedTime:new Date().toISOString(),depth:{buy:[{price:99,quantity:65}],sell:[{price:100,quantity:65}]}}))}});
  });
- const r=await scanQuotesOnly(env);assert.equal(r.issues.length,0);assert.equal(r.allQuotesFresh,true);
+ const r=await scanQuotesOnly(env);assert.equal(r.issues.length,0,JSON.stringify(r.issues));assert.equal(r.allQuotesFresh,true);
  for(const index of ['NIFTY','SENSEX']){const snapshot=JSON.parse(memory.get('broker:snapshot:'+index));assert.equal(snapshot.quotes.length,2);assert.equal(snapshot.quotes[0].contract.lotSize,65);assert.ok(Number.isFinite(Date.parse(snapshot.at)));}
 });

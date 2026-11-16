@@ -50,7 +50,7 @@
     }
   },
   "keep_vars": true,
-  "vars": {"TRADE_UNDERLYINGS":"NIFTY"},
+  "vars": {"TRADE_UNDERLYINGS":"NIFTY", "MARKET_DATA_PROVIDER":"KOTAK_NEO"},
   "services": [
     {
       "binding": "OPTION_CHAIN",
