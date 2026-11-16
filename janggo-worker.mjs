@@ -1,3 +1,6 @@
+import {paperSize} from './paper-sizing.mjs';
+import {platformFetch} from './platform.mjs';
+import {deskSessionRequest,deskRpc,privateJson} from './platform-auth.mjs';
 import {useNeo,neoQuotes,neoInstruments,neoHistoryWindow} from './neo-service.mjs';
 import {entryAllowed,entryUniverse,tradePreferences} from './entry-policy.mjs';
 export async function scanContracts(e,all,name,spot){const rows=select(all,name,spot);const p=await get(e,'research:paper:position:'+day()+':'+name);if(p?.status==='OPEN'){const held=all.find(x=>x.exchange===p.exchange&&String(x.token)===String(p.token)&&x.underlying===name);if(held&&!rows.some(x=>x.exchange===held.exchange&&String(x.token)===String(held.token)))rows.push(held);}return rows;}
@@ -678,6 +681,7 @@ const put=async(e,k,v,ttl)=>{
  try {await e.STATE.put(brokerDataKey(e,k),JSON.stringify(v),ttl?{expirationTtl:Math.max(60,ttl)}:undefined);return true}
  catch(err){kvWriteSkipped++;kvWriteErrors.push(String(err?.message||err).slice(0,100));return false}
 };
+export const researchEntriesPaused=async e=>(await get(e,'platform:research-paused'))===true;
 const cfg=e=>[...(useNeo(e)?['OPTION_CHAIN']:['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED']),'TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET'].filter(k=>!e[k]);
 // Never echo configured credentials into Worker logs or Telegram diagnostics.
 const safeError=(error,env={})=>{
@@ -1299,6 +1303,7 @@ async function scanQuotesOnly(e){
 // Pretrained AI reviews only broker-grounded research observations; it cannot
 // create new symbols, prices, trades, or bypass deterministic data gates.
 async function reviewResearchWithAI(e, watches, indices){
+ if(await researchEntriesPaused(e))return {status:'ENTRIES_PAUSED',reviews:[]};
  if(e.TRADE_UNDERLYINGS!==undefined){watches=watches.filter(w=>entryAllowed(e,w.underlying));indices=Object.fromEntries(Object.entries(indices||{}).filter(([index])=>entryAllowed(e,index)));}
  if(!watches.length)return {status:'NO_CANDIDATES',reviews:[]};
  if(!e.AI)return {status:'AI_UNAVAILABLE',reviews:[]};
@@ -1330,6 +1335,7 @@ async function boundedAIReview(e, payload, timeoutMs=18000){
  } finally {clearTimeout(timer)}
 }
 async function reviewDirectionalSignals(e,watches,indices){
+ if(await researchEntriesPaused(e))return {status:'ENTRIES_PAUSED',decisions:[]};
  if(e.TRADE_UNDERLYINGS!==undefined){watches=watches.filter(w=>entryAllowed(e,w.underlying));indices=Object.fromEntries(Object.entries(indices||{}).filter(([index])=>entryAllowed(e,index)));}
  if(!watches.length)return {status:'NO_CANDIDATES',decisions:[]};
  if(!e.AI)return {status:'AI_UNAVAILABLE',decisions:[]};
@@ -1354,6 +1360,7 @@ async function reviewDirectionalSignals(e,watches,indices){
 }
 async function sendDirectionalAlerts(e,result,now){
  result.directionalAlertsSent=0;result.directionalAlertsSkipped='';
+ if(await researchEntriesPaused(e)){result.directionalAlertsSkipped='New paper entries paused from desk';return;}
  // Never send a delayed directional alert after a slow AI/broker response.
  // All displayed premiums are observation prices, not guaranteed executable fills.
  if(!marketOpen(e)||Date.now()-now>120000){result.directionalAlertsSkipped='Session closed or signal evidence older than 120 seconds';return}
@@ -1374,6 +1381,7 @@ async function sendDirectionalAlerts(e,result,now){
      (w.side==='CE'&&d.action!=='BUY_CE')||(w.side==='PE'&&d.action!=='BUY_PE'))continue;
   const contract=result.paperContractEvidence?.[w.symbol];if(!contract?.token||!contract.exchange)continue;
   try{const latest=await quotes(e,await session(e),contract.exchange,[String(contract.token)]);const raw=latest.find(q=>String(q.symbolToken??q.symboltoken??q.token)===String(contract.token));const confirmed=confirmResearchQuote(w,contract,quoteQuality(raw||{}),Date.now());if(!confirmed)continue;Object.assign(w,confirmed);}catch{continue;}
+  Object.assign(w,{paperSizing:paperSize(Number(contract.lotSize),await get(e,'platform:paper-lots')??1)});
   selected.push({w,d});
  }
  if(!selected.length)return;
@@ -1381,7 +1389,7 @@ async function sendDirectionalAlerts(e,result,now){
  // concurrent scan, but a failed send must be recoverable on the next scan.
  // A short-lived pending claim is deliberately distinct from a confirmed delivery.
  const claims={...seen};
- for(const {w} of selected)claims[w.signalId]={state:'PENDING',at:now,underlying:w.underlying,symbol:w.symbol};
+ for(const {w} of selected)claims[w.signalId]={state:'PENDING',at:now,underlying:w.underlying,symbol:w.symbol,...w.paperSizing};
  if(!await put(e,key,claims,86400)){result.directionalAlertsSkipped='KV quota/write failed: alert blocked';return}
  for(const {w,d} of selected){
   // A queued alert may become stale while another Telegram request is in flight.
@@ -1392,11 +1400,11 @@ async function sendDirectionalAlerts(e,result,now){
    break;
   }
   const timing='Signal time '+istDateTime(new Date())+' IST | Quote age '+Math.max(0,Math.round((Date.now()-w.quotedAt)/1000))+'s\nEntry evidence expires '+istDateTime(new Date(w.quotedAt+30000))+' IST; recheck live price.\nMovement ETA unknown; momentum already observed. Monitoring about every 3 minutes.\n';
-  const msg=timing+`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. Closed 1m/5m trends aligned; strategy/Greeks/backtest unvalidated. Not an order. Check live price before any decision.`;
+  const msg=timing+`🧪 JANGGO EXPERIMENTAL ${d.action} — NOT VALIDATED\n${w.underlying} | ${w.symbol}\nObserved premium ₹${w.referencePremium}\nIndicative entry ₹${w.referencePremium} | SL ₹${w.hypotheticalSL} | Target ₹${w.hypotheticalTarget}\nPaper size ${w.paperSizing.lots} lot × ${w.paperSizing.lotSize} = ${w.paperSizing.quantity} units\nSpot move ${w.spotMovePct}% | Premium move ${w.premiumMovePct}% | OI change ${w.oiDelta}\nAI: ${d.reason}\n⚠️ Snapshot-based research only. Closed 1m/5m trends aligned; strategy/Greeks/backtest unvalidated. Not an order. Check live price before any decision.`;
   try{
    await telegram(e,msg);
    result.directionalAlertsSent++;
-   claims[w.signalId]={state:'SENT',at:Date.now(),underlying:w.underlying};
+   claims[w.signalId]={state:'SENT',at:Date.now(),underlying:w.underlying,...w.paperSizing};
   }catch(err){
    result.issues.push('Directional Telegram delivery: '+String(err?.message||err).slice(0,120));
    // Fail closed on ambiguous transport outcomes: do not auto-retry an
@@ -2815,6 +2823,8 @@ async function optionBacktest(e,raw){
 }
 
 async function handle(e,u){const m=u.message||u.edited_message;if(String(m?.chat?.id)!==String(e.TELEGRAM_CHAT_ID))return;const raw=String(m.text||'').trim();if(!raw)return;const cmd=raw.split(/\s+/)[0].split('@')[0].toLowerCase();
+ if(cmd==='/start'&&/^desk_[a-f0-9]{32}$/.test(raw.split(/\s+/)[1]||'')){if(String(m.from?.id)!==String(e.PLATFORM_OWNER_USER_ID||e.TELEGRAM_CHAT_ID))return;const approved=await deskRpc(e,'approve',{challenge:raw.split(/\s+/)[1].slice(5)});await telegram(e,approved.approved?'JANGGO DESK | Browser approved. Return to the platform. This grants access to paper trades only; no real orders. Only approve login links you opened yourself.':'JANGGO DESK | This login link expired or was already used. Start a new login from your desk.');return;}
+
 if(['/oc','/ocstatus','/ocscan','/ocpause','/ocresume','/ocreport'].includes(cmd)){
  const command=({'/oc':'status','/ocstatus':'status','/ocscan':'scan','/ocpause':'pause','/ocresume':'resume','/ocreport':'report'})[cmd];
  try{await telegram(e,'[OPTION CHAIN]\n'+JSON.stringify(await chainCommand(e,command),null,2));}
@@ -3778,6 +3788,14 @@ function paperWatchExit(position, observed) {
 export class PaperAlertCoordinator {
  constructor(state,env){this.state=state;this.env=env;this.queue=Promise.resolve();}
  async fetch(request){
+  if(new URL(request.url).pathname==='/internal/platform-session'){const job=this.queue.then(()=>deskSessionRequest(request,this.env,this.state.storage));this.queue=job.catch(()=>{});return job;}
+  if(new URL(request.url).pathname==='/internal/platform-journal'){
+   const signed=await readSigned(request,this.env);if(!signed||signed.command!=='platform-journal'||!/^\d{4}-\d{2}-\d{2}$/.test(signed.day||''))return privateJson({error:'FORBIDDEN'},403);
+   const decode=x=>{try{return typeof x==='string'?JSON.parse(x):x}catch{return null}};
+   const current=await Promise.all(['NIFTY','SENSEX'].map(async index=>decode(await this.state.storage.get('research:paper:position:'+signed.day+':'+index)||await get(this.env,'research:paper:position:'+signed.day+':'+index))));
+   const closed=await this.state.storage.list({prefix:'research:paper:closed:'+signed.day+':',limit:200});
+   const trades=[...new Map([...closed.values(),...current].map(decode).filter(Boolean).map(p=>[p.index+':'+p.entryAt,p])).values()];return privateJson({trades});
+  }
   if(new URL(request.url).pathname==='/internal/daily-results'){
    const signed=await readSigned(request,this.env);
    if(!signed||!['daily-results','daily-results-status'].includes(signed.command))return new Response('Forbidden',{status:403});
@@ -3880,7 +3898,7 @@ async function automaticResearchPaperAlerts(e) {
    continue;
   }
   // A new movement may open after the previous position closes; the same episode cannot.
-  if(!entryAllowed(e,index)){report.blocked.push(index+':NEW_ENTRIES_PAUSED');continue;}
+  if(!entryAllowed(e,index)||await researchEntriesPaused(e)){report.blocked.push(index+':NEW_ENTRIES_PAUSED');continue;}
 
   const watch=(scanState.strategyWatches||[]).find(w=>w.underlying===index&&paperWatchDecision(w).ok);
   if(!watch||!watch.signalId||watch.signalId===pos?.signalId||watch.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!watch.candleConfirmation?.ok)continue;
@@ -3896,7 +3914,7 @@ async function automaticResearchPaperAlerts(e) {
   if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(parseExpiry(contract.expiry))||parseExpiry(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
   if(Math.abs(last.p-watch.referencePremium)/watch.referencePremium>0.03){report.blocked.push(index+':WATCH_PRICE_MISMATCH');continue;}
   if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
-  const position={provider:useNeo(e)?'KOTAK_NEO':'ANGEL',signalId:watch.signalId,status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:watch.quotedAt||last.t,entryPremium:watch.referencePremium,quantity:contract.lotSize,stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
+  const position={provider:useNeo(e)?'KOTAK_NEO':'ANGEL',signalId:watch.signalId,status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:watch.quotedAt||last.t,entryPremium:watch.referencePremium,...paperSize(Number(contract.lotSize),sentDirectional.lots??1),stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
   if(!await put(e,key,position,86400*7)){report.blocked.push(index+':ENTRY_SAVE_FAILED');continue;}
   if(sentDirectional?.state==='SENT'){position.delivery='DELIVERED';position.entryDelivery='DELIVERED';position.entryNotice='EXISTING_DIRECTIONAL_ALERT';await put(e,key,position,86400*7);report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});continue;}
   const msg=`🧪 JANGGO PAPER RESEARCH ${watch.side} — NOT A VERIFIED BUY SIGNAL\n${index} ${watch.symbol}\nObserved premium ₹${last.p.toFixed(2)} | Hypothetical SL ₹${position.stop.toFixed(2)} | Target ₹${position.target.toFixed(2)}\nSpot momentum ${watch.spotMovePct}% | OI change ${watch.oiDelta}\nNo broker order. Not independently certified; do not trade from this message.`;
@@ -3997,6 +4015,8 @@ export async function neoResearchAudit(e){
 }
 export default {
  async fetch(req,e,executionCtx){e.__kvWritesThisInvocation=0;
+if(new URL(req.url).pathname==='/platform'||new URL(req.url).pathname.startsWith('/platform/')){await hydrateExchangeCalendar(e);return platformFetch(req,e,{read:key=>get(e,key),date:day(),session:sessionConfig(e),marketOpen:marketOpen(e)});}
+
 if(new URL(req.url).pathname==='/internal/research-audit'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='research-audit'||!['NIFTY','SENSEX'].includes(signed.index))return new Response('Forbidden',{status:403});
  const index=signed.index,key='deployment:research-data-v1:'+index;
@@ -4090,9 +4110,9 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/dail
      }
      return result;
     },
-    review:async index=>entryAllowed(e,index)?reviewStrategyIndex(e.STATE,index):{status:'PAUSED_UNDERLYING'},
+    review:async index=>entryAllowed(e,index)&&!(await researchEntriesPaused(e))?reviewStrategyIndex(e.STATE,index):{status:'PAUSED_UNDERLYING'},
     loadEvidence:async index=>({market:await get(e,'marketintel:'+index),options:await get(e,'options:'+index)}),
-    select:async(index,{market,options})=>entryAllowed(e,index)?autoSelectPaper(e.STATE,{index,market,options,marketOpen:true}):{status:'PAUSED_UNDERLYING'}
+    select:async(index,{market,options})=>entryAllowed(e,index)&&!(await researchEntriesPaused(e))?autoSelectPaper(e.STATE,{index,market,options,marketOpen:true}):{status:'PAUSED_UNDERLYING'}
    });
    await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'COMPLETED',scanAt:currentScan?.at||null,ordersPlaced:false},86400);
   }catch(err){
@@ -4213,3 +4233,6 @@ export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
 export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly,sendDirectionalAlerts,paperWatchExit};
+
+// Owner login handler export for authorization regression tests.
+export {handle as handleBotUpdate};
