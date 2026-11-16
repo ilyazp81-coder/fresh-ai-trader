@@ -56,6 +56,6 @@ export async function platformFetch(request,env,deps){
   return privateJson({message:'Page not found.'},404);
  }catch(error){
   console.warn('platform-request-unavailable:'+(/^DESK_[A-Z_]+$/.test(error?.message||'')?error.message:'DATA_UNAVAILABLE'));
-  return privateJson({message:path==='/platform/chart'?'Broker candles are unavailable for this chart. No sample data was substituted.':'The desk could not complete this request. Please retry.'},503);
+  return privateJson({code:/^DESK_[A-Z_]+$/.test(error?.message||'')?error.message:'DESK_DATA_UNAVAILABLE',message:path==='/platform/chart'?'Broker candles are unavailable for this chart. No sample data was substituted.':'The desk could not complete this request. Please retry.'},503);
  }
 }

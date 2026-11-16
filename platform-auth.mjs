@@ -10,7 +10,7 @@ export async function deskRpc(env,action,args={}){
  const body=JSON.stringify({command:'platform-session',action,...args,chatId:String(env.TELEGRAM_CHAT_ID),at:Date.now()});
  const stub=env.PAPER_COORDINATOR.get(env.PAPER_COORDINATOR.idFromName('janggo-platform-sessions-v1'));
  const r=await stub.fetch('https://desk.internal/internal/platform-session',{method:'POST',headers:{'content-type':'application/json','x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});
- if(!r.ok)throw Error(r.status===429?'DESK_LOGIN_BUSY':'DESK_SESSION_UNAVAILABLE');return r.json();
+ if(!r.ok)throw Error(r.status===429?'DESK_LOGIN_BUSY':r.status===403?'DESK_SESSION_AUTH_REJECTED':'DESK_SESSION_UNAVAILABLE');return r.json();
 }
 export async function deskSessionRequest(request,env,storage){
  const d=await readSigned(request,env);if(!d||d.command!=='platform-session')return privateJson({error:'FORBIDDEN'},403);
