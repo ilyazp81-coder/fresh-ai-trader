@@ -23,11 +23,11 @@ export async function deskSnapshot(env,{read,date,session,marketOpen}){
  const [chain,journal,research,scan,audit,paused,daily,lots]=await Promise.allSettled([
   chainCommand(env,'status'),chainCommand(env,'journal',{day:date}),
   researchDeskJournal(env,date),read('scan:last'),read('broker:neo:commissioning'),read('platform:research-paused'),read('research:paper:alerts:last'),read('platform:paper-lots')]);
- const value=(x,f=null)=>x.status==='fulfilled'?x.value:f,c=value(chain),j=value(journal,{trades:[]}),r=value(research,{trades:[]});
+ const value=(x,f=null)=>x.status==='fulfilled'?x.value:f,c=value(chain),j=value(journal,{trades:[]}),r=value(research,{trades:[]}),shared=c?.sharedAiBudget?.enabled?c.sharedAiBudget:null;
  const trades=[...(j.trades||[]).map(t=>deskTrade(t.body,'chain',t.state,t)),...(r.trades||[]).map(p=>deskTrade(p,'research',p.status))];
  return {at:new Date().toISOString(),day:date,marketOpen,session,mode:'EXPERIMENTAL_PAPER',ordersEnabled:false,underlying:'NIFTY',trades,totals:{...deskTotals(trades),complete:journal.status==='fulfilled'&&research.status==='fulfilled'},
   chain:c?{connected:true,enabled:c.enabled,paperAlertsEnabled:c.paperAlertsEnabled,lots:c.paperLots??1,provider:c.broker?.activeProvider,scan:c.lastScan,review:c.lastAIReview,block:c.lastEntryBlock,error:c.lastError,aiCalls:c.aiCallsToday,callCap:c.aiBudgetLimit,nextReview:c.nextAIReviewAt,spot:c.broker?.probe?.spot}: {connected:false,error:'Chain status unavailable'},
   research:{connected:audit.status==='fulfilled',enabled:value(paused)!==true,lots:value(lots)??1,provider:'KOTAK_NEO',scan:value(scan),audit:value(audit),paper:value(daily)},
-  budget:{chainCalls:c?.aiCallsToday??null,chainCap:c?.aiBudgetLimit??80,providerUsageKnown:false,freeNeuronAllowance:10000,paidEnabled:false,note:'Call count is not the shared Cloudflare neuron balance. AI reviews stop when unavailable; paper exits do not require AI.'},
+  budget:{sharedEnabled:!!shared,calls:shared?.calls??c?.aiCallsToday??null,callCap:shared?.callCap??80,estimatedUsed:shared?.estimatedUsed??null,estimatedLimit:shared?.estimatedLimit??null,priorUsageUnknown:shared?.priorUsageUnknown??true,byCaller:shared?.byCaller??null,lastBlock:shared?.lastBlock??null,chainCalls:c?.aiCallsToday??null,chainCap:c?.aiBudgetLimit??80,providerUsageKnown:false,freeNeuronAllowance:10000,paidEnabled:false,note:'Call count is not the shared Cloudflare neuron balance. AI reviews stop when unavailable; paper exits do not require AI.'},
   issues:[chain,journal,research].flatMap((x,i)=>x.status==='rejected'?[['Chain status','Chain journal','Research journal'][i]+' unavailable']:[])};
 }

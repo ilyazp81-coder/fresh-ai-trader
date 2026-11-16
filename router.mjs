@@ -13,7 +13,7 @@ export async function chainCommand(env,command,extra={}){
  const body=JSON.stringify({command,chatId:String(env.TELEGRAM_CHAT_ID),at:Date.now(),...extra});
  const response=await env.OPTION_CHAIN.fetch('https://chain.internal/internal/command',{method:'POST',
   headers:{'content-type':'application/json','x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});
- if(!response.ok){let detail;try{detail=await response.json()}catch{}if(command==='neo-read'&&/^NEO_[A-Z_0-9]+$/.test(detail?.reason||''))throw Error(detail.reason);throw Error('OPTION_CHAIN HTTP '+response.status);}
+ if(!response.ok){let detail;try{detail=await response.json()}catch{}if((command==='neo-read'&&/^NEO_[A-Z_0-9]+$/.test(detail?.reason||''))||(command==='ai-run'&&/^AI_SHARED_[A-Z_]+$/.test(detail?.reason||'')))throw Error(detail.reason);throw Error('OPTION_CHAIN HTTP '+response.status);}
  return response.json();
 }
 export async function ensureBotRouter(env){
