@@ -46,6 +46,20 @@ test('failed older history backfill cannot discard fresh current-session broker 
  const now=Date.parse('2026-11-12T14:00:00+05:30'),saved={};let cache=null,seeds=0;
  const row={t:now-60000,o:100,h:102,l:99,c:101,v:0};
  const deps={now,day:'2026-11-12',readCache:async()=>cache,writeCache:async x=>{cache=structuredClone(x)},today:async()=>[row],seed:async()=>{seeds++;throw Error('RATE_LIMITED HTTP 403')},analyse:(index,rows)=>({observations:rows.length}),saveEvidence:async(index,x)=>{saved[index]=x;return true},safeError:e=>e.message};
- await refreshCandleEvidence(deps);assert.equal(saved.NIFTY.candleFresh,true);assert.equal(saved.SENSEX.candleFresh,true);assert.equal(saved.NIFTY.observations,1);assert.match(saved.NIFTY.historyBackfill.reason,/RATE_LIMITED/);assert.equal(seeds,2);
- await refreshCandleEvidence({...deps,now:now+60000});assert.equal(seeds,2);
+ await refreshCandleEvidence(deps);assert.equal(saved.NIFTY.candleFresh,true);assert.equal(saved.SENSEX.candleFresh,true);assert.equal(saved.NIFTY.observations,1);assert.match(saved.NIFTY.historyBackfill.reason,/RATE_LIMITED/);assert.equal(seeds,1);
+ await refreshCandleEvidence({...deps,now:now+60000});assert.equal(seeds,1);
+});
+
+test('current-session candles for both indices precede optional backfill',async()=>{
+ const now=Date.parse('2026-11-16T10:00:00+05:30'),calls=[];
+ const row={t:now-60000,o:100,h:102,l:99,c:101,v:20};
+ await refreshCandleEvidence({now,day:'2026-11-16',readCache:async()=>null,writeCache:async()=>{},today:async index=>{calls.push('today:'+index);return [row]},seed:async index=>{calls.push('seed:'+index);return [row]},analyse:()=>({}),saveEvidence:async()=>true,safeError:e=>e.message});
+ assert.deepEqual(calls,['today:NIFTY','today:SENSEX','seed:NIFTY','seed:SENSEX']);
+});
+
+test('a shared history throttle stops further requests without extending the cooldown each cron',async()=>{
+ const now=Date.parse('2026-11-16T10:00:00+05:30');let cache=null,calls=0;const saved={};
+ const deps={now,day:'2026-11-16',readCache:async()=>cache,writeCache:async x=>{cache=structuredClone(x)},today:async()=>{calls++;throw Error('ANGEL_RATE_LIMITED HTTP 403')},seed:async()=>assert.fail('No backfill during throttle'),analyse:()=>({}),saveEvidence:async(i,x)=>{saved[i]=x;return true},safeError:e=>e.message};
+ await refreshCandleEvidence(deps);assert.equal(calls,1);assert.equal(saved.SENSEX.candleFresh,false);assert.equal(cache.errors.SENSEX.retryAfter,now+300000);
+ await refreshCandleEvidence({...deps,now:now+180000});assert.equal(calls,1);assert.equal(cache.errors.NIFTY.retryAfter,now+300000);assert.equal(cache.errors.SENSEX.retryAfter,now+300000);
 });

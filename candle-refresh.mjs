@@ -18,9 +18,13 @@ export async function requestCandleCache(env,stub,command,cache){
 // Refresh both independent index research views; quotes never substitute for OHLC.
 export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,today,analyse,saveEvidence,safeError}){
  const cache=await readCache()||{rows:{},errors:{}};cache.rows||={};cache.errors||={};
- const outcomes={};
+ const outcomes={},fresh=[];
+ // Both indices share one broker history quota. Do not make another request
+ // during a known throttle, including one saved for the other index.
+ let sharedBlock=Object.values(cache.errors).find(x=>x?.retryAfter>now&&/RATE_LIMITED|HTTP 429/.test(x.reason||''));
  for(const index of ['NIFTY','SENSEX']){
   try{
+   if(sharedBlock)throw Error(sharedBlock.reason);
    const blocked=cache.errors[index];if(blocked?.retryAfter>now)throw Error(blocked.reason);
    const existing=Array.isArray(cache.rows[index])?cache.rows[index]:[];
    // Current-session recovery must not depend on an older backfill request succeeding.
@@ -31,16 +35,36 @@ export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,t
    if(!last||new Date(last.t+19800000).toISOString().slice(0,10)!==day)throw Error('NO_CLOSED_CANDLES_TODAY');
    if(now-last.t>240000)throw Error('HISTORICAL_CANDLES_STALE');
    cache.rows[index]=rows;delete cache.errors[index];
-   // A failed backfill preserves actual fresh broker bars, with missing history explicit.
+   // Finish current-session reads for BOTH indices before optional older history.
+   fresh.push({index,last});
+   const evidence={at:now,...analyse(index,cache.rows[index]),candleFresh:true,historyBackfill:cache.backfillErrors?.[index]||null};
+   if(await saveEvidence(index,evidence)===false)throw Error('CANDLE_EVIDENCE_SAVE_FAILED');
+   outcomes[index]={status:'REFRESHED',rows:cache.rows[index].length,historyBackfill:cache.backfillErrors?.[index]||null,lastCompleteCandle:new Date(last.t).toISOString()};
+  }catch(error){
+   const reason=safeError(error);const limited=/RATE_LIMITED|HTTP 429/.test(reason);
+   const denied=!limited&&/ACCESS_DENIED|HTTP 401|HTTP 403/.test(reason);
+   const retryAfter=sharedBlock?.retryAfter||now+(denied?1800000:limited?300000:60000);
+   if(!cache.errors[index]||cache.errors[index].retryAfter<=now)cache.errors[index]={reason,retryAfter};
+   if(limited)sharedBlock=cache.errors[index];
+   outcomes[index]={status:'UNAVAILABLE',reason,retryAfter:cache.errors[index].retryAfter};
+   await saveEvidence(index,{at:now,underlying:index,status:'HISTORICAL_REFRESH_UNAVAILABLE',historicalError:reason,candleFresh:false,signalEligible:false,ordersPlaced:false});
+  }
+ }
+ for(const {index,last} of fresh){
+  if(outcomes[index].status!=='REFRESHED')continue;
+  try{
+   const rows=cache.rows[index];
+   // A failed backfill preserves fresh broker bars. A throttle stops further
+   // optional requests rather than probing the same account again immediately.
    const historyDays=new Set(rows.map(x=>new Date(x.t+19800000).toISOString().slice(0,10)));
    const backfill=cache.backfillErrors?.[index];
    if(historyDays.size<2&&cache.seedDays?.[index]!==day&&(!backfill||backfill.retryAfter<=now)){
-    try{const past=await seed(index),merged=new Map(rows.map(x=>[x.t,x]));
+    try{if(sharedBlock)throw Error(sharedBlock.reason);const past=await seed(index),merged=new Map(rows.map(x=>[x.t,x]));
      for(const x of past)if(x.t+60000<=now&&x.t>=now-8*86400000)merged.set(x.t,x);
      cache.rows[index]=[...merged.values()].sort((a,b)=>a.t-b.t).slice(-5000);
      cache.seedDays||={};cache.seedDays[index]=day;
      if(cache.backfillErrors)delete cache.backfillErrors[index];
-    }catch(error){cache.backfillErrors||={};cache.backfillErrors[index]={reason:safeError(error),retryAfter:now+300000};}
+    }catch(error){cache.backfillErrors||={};const reason=safeError(error);cache.backfillErrors[index]={reason,retryAfter:sharedBlock?.retryAfter||now+300000};if(/RATE_LIMITED|HTTP 429/.test(reason))sharedBlock=cache.backfillErrors[index];}
    }
    const evidence={at:now,...analyse(index,cache.rows[index]),candleFresh:true,historyBackfill:cache.backfillErrors?.[index]||null};
    if(await saveEvidence(index,evidence)===false)throw Error('CANDLE_EVIDENCE_SAVE_FAILED');
