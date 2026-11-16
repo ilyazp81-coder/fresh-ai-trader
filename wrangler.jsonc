@@ -50,6 +50,7 @@
     }
   },
   "keep_vars": true,
+  "vars": {"TRADE_UNDERLYINGS":"NIFTY"},
   "services": [
     {
       "binding": "OPTION_CHAIN",

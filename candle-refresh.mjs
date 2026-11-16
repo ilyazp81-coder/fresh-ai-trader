@@ -16,13 +16,13 @@ export async function requestCandleCache(env,stub,command,cache){
  return stub.fetch('https://coordinator.internal/internal/candle-cache',{method:'POST',headers:{'content-type':'application/json','x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});
 }
 // Refresh both independent index research views; quotes never substitute for OHLC.
-export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,today,analyse,saveEvidence,safeError}){
+export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,today,analyse,saveEvidence,safeError,enabledIndices=['NIFTY','SENSEX']}){
  const cache=await readCache()||{rows:{},errors:{}};cache.rows||={};cache.errors||={};
  const outcomes={},fresh=[];
  // Both indices share one broker history quota. Do not make another request
  // during a known throttle, including one saved for the other index.
  let sharedBlock=Object.values(cache.errors).find(x=>x?.retryAfter>now&&/RATE_LIMITED|HTTP 429/.test(x.reason||''));
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of [...new Set(enabledIndices)].filter(x=>['NIFTY','SENSEX'].includes(x))){
   try{
    if(sharedBlock)throw Error(sharedBlock.reason);
    const blocked=cache.errors[index];if(blocked?.retryAfter>now)throw Error(blocked.reason);

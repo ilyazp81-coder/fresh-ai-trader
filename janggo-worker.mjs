@@ -1,3 +1,6 @@
+import {entryAllowed,entryUniverse,tradePreferences} from './entry-policy.mjs';
+export async function scanContracts(e,all,name,spot){const rows=select(all,name,spot);const p=await get(e,'research:paper:position:'+day()+':'+name);if(p?.status==='OPEN'){const held=all.find(x=>x.exchange===p.exchange&&String(x.token)===String(p.token)&&x.underlying===name);if(held&&!rows.some(x=>x.exchange===held.exchange&&String(x.token)===String(held.token)))rows.push(held);}return rows;}
+export async function scanIndices(e){const names=entryUniverse(e);for(const name of ['NIFTY','SENSEX'])if(!names.includes(name)){const pos=await get(e,'research:paper:position:'+day()+':'+name);if(pos?.status==='OPEN')names.push(name);}return names;}
 import {paperTrail} from './paper-trailing.mjs';
 import {RESEARCH_ENTRY_POLICY,strongSnapshotEvidence,researchCandleConfirmation,researchAlertCapacity,confirmResearchQuote} from './strong-entry.mjs';
 import {researchDailySummary,researchDailyMessage} from './daily-results.mjs';
@@ -1071,6 +1074,7 @@ async function optionContext(e,c,q){
  return {...v,oiDelta:delta,oiDirection:delta===null?'UNKNOWN':delta>0?'INCREASING':delta<0?'DECREASING':'UNCHANGED',note:'OI change alone does not identify writers or predict direction'};
 }
 async function brainEvaluate(e,c,q,send){
+ if(e.TRADE_UNDERLYINGS!==undefined&&!entryAllowed(e,c.underlying))return {status:'PAUSED_UNDERLYING'};
  const key=`samples:${day()}:${c.exchange}:${c.token}`;
  const a=(await get(e,key))||[];
  const verdict=researchBrain(c,q,a);
@@ -1257,9 +1261,9 @@ async function scanQuotesOnly(e){
  if(!marketOpen(e))return {version:VERSION,mode:'MARKET_CLOSED',reason:sessionConfig(e).reason||'Outside trading hours',contracts:0,quoted:0};
  const now=Date.now(),all=await instruments(e),jwt=await session(e);
  const result={version:VERSION,at:new Date().toISOString(),mode:'READ_ONLY_LIVE_QUOTES',marketOpen:true,contracts:0,quoted:0,fresh:0,stale:0,unverified:0,withOI:0,withBidAsk:0,indices:{},issues:[],kvWrites:0,verifiedBuySellSignals:false};
- for(const name of ['NIFTY','SENSEX']){
+ for(const name of await scanIndices(e)){
   try{
-   const spot=await spotReference(e,jwt,name),cs=select(all,name,spot.value);
+   const spot=await spotReference(e,jwt,name),cs=await scanContracts(e,all,name,spot.value);
    const byToken=new Map();
    const info={spot:spot.value,contracts:cs.length,quoted:0,fresh:0,withOI:0,withBidAsk:0};result.contracts+=cs.length;
    const groups={};for(const c of cs)(groups[c.exchange]??=[]).push(c.token);
@@ -1290,6 +1294,7 @@ async function scanQuotesOnly(e){
 // Pretrained AI reviews only broker-grounded research observations; it cannot
 // create new symbols, prices, trades, or bypass deterministic data gates.
 async function reviewResearchWithAI(e, watches, indices){
+ if(e.TRADE_UNDERLYINGS!==undefined){watches=watches.filter(w=>entryAllowed(e,w.underlying));indices=Object.fromEntries(Object.entries(indices||{}).filter(([index])=>entryAllowed(e,index)));}
  if(!watches.length)return {status:'NO_CANDIDATES',reviews:[]};
  if(!e.AI)return {status:'AI_UNAVAILABLE',reviews:[]};
  const evidence=watches.slice(0,4).map(w=>({underlying:w.underlying,symbol:w.symbol,referencePremium:w.referencePremium,spotMovePct:w.spotMovePct,premiumMovePct:w.premiumMovePct,oiDelta:w.oiDelta,hypotheticalSL:w.hypotheticalSL,hypotheticalTarget:w.hypotheticalTarget}));
@@ -1320,13 +1325,14 @@ async function boundedAIReview(e, payload, timeoutMs=18000){
  } finally {clearTimeout(timer)}
 }
 async function reviewDirectionalSignals(e,watches,indices){
+ if(e.TRADE_UNDERLYINGS!==undefined){watches=watches.filter(w=>entryAllowed(e,w.underlying));indices=Object.fromEntries(Object.entries(indices||{}).filter(([index])=>entryAllowed(e,index)));}
  if(!watches.length)return {status:'NO_CANDIDATES',decisions:[]};
  if(!e.AI)return {status:'AI_UNAVAILABLE',decisions:[]};
  const evidence=watches.slice(0,6).map(w=>({symbol:w.symbol,underlying:w.underlying,side:w.side,spotMovePct:w.spotMovePct,premiumMovePct:w.premiumMovePct,oiDelta:w.oiDelta,referencePremium:w.referencePremium,hypotheticalSL:w.hypotheticalSL,hypotheticalTarget:w.hypotheticalTarget,reason:w.reason}));
  try{
   const response=await boundedAIReview(e,{messages:[
    {role:'system',content:'You are an advanced pretrained Indian index options research reviewer. Use ONLY the supplied broker observations, never invent candles, news, Greeks or prices. Return strict JSON: {"decisions":[{"symbol":"exact symbol","action":"BUY_CE|BUY_PE|WAIT","reason":"brief"}]}. Only BUY_CE for CE contract, BUY_PE for PE contract. WAIT when data is insufficient or conflicting. These are research signals, NOT guarantees; never place orders.'},
-   {role:'user',content:JSON.stringify({indices,evidence}).slice(0,7000)}
+   {role:'user',content:JSON.stringify({indices,evidence,tradePreferences,preferenceNote:'Desired opportunity sizes are not a prediction or mandatory target. Reject unjustified entry or exit levels.'}).slice(0,7000)}
   ],max_tokens:600});
   const parsed=parseAiJson(response);if(!parsed||!Array.isArray(parsed.decisions)||parsed.decisions.length>6)throw Error('Invalid decisions array');
   const allowed=new Map(evidence.map(x=>[x.symbol,x]));
@@ -1350,13 +1356,13 @@ async function sendDirectionalAlerts(e,result,now){
  const choices=(result.directionalReview?.decisions||[]).filter(d=>d.action!=='WAIT');
  if(!choices.length)return;
  // A stale or partially failed index must not produce directional alerts.
- if(Object.values(result.indices||{}).some(x=>x?.status==='FAILED')){result.directionalAlertsSkipped='Underlying index scan failed; alerts blocked';return}
+ if(Object.entries(result.indices||{}).some(([index,x])=>entryAllowed(e,index)&&x?.status==='FAILED')){result.directionalAlertsSkipped='Underlying index scan failed; alerts blocked';return}
  if(!result.kvStateSaved||!result.scanSummarySaved){result.directionalAlertsSkipped='KV persistence failed';return}
  const key='directional-alerts:'+day();const seen=await get(e,key);
  if(seen===null){result.directionalAlertsSkipped='Deduplication state missing or unreadable; alerts blocked';return}
  if(typeof seen!=='object'||Array.isArray(seen)){result.directionalAlertsSkipped='Invalid deduplication state';return}
  const selected=[];
- for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||!w.signalId||seen[w.signalId]||selected.some(x=>x.w.underlying===w.underlying)||!researchAlertCapacity(seen,w.underlying,Date.now(),w.signalId,await get(e,'research:paper:position:'+day()+':'+w.underlying))||w.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok)continue;
+ for(const d of choices){const w=result.strategyWatches.find(x=>x.symbol===d.symbol);if(!w||!entryAllowed(e,w.underlying)||!w.signalId||seen[w.signalId]||selected.some(x=>x.w.underlying===w.underlying)||!researchAlertCapacity(seen,w.underlying,Date.now(),w.signalId,await get(e,'research:paper:position:'+day()+':'+w.underlying))||w.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok)continue;
   if(!(w.referencePremium>0&&w.hypotheticalSL>0&&w.hypotheticalSL<w.referencePremium&&w.hypotheticalTarget>w.referencePremium))continue;
   // A watch must be from the current verified scan, not a stale cached candidate.
   if(w.status!=='RESEARCH_WATCH'||!['CE','PE'].includes(w.side)||
@@ -1481,9 +1487,9 @@ async function scan(e,{send=true}={}){
   result.scanHealthy=false;result.scanSummarySaved=await put(e,'scan:last',result,86400);return result;
  }
  const jwt=authResult.value,all=masterResult.value;
- for(const name of ['NIFTY','SENSEX']){
+ for(const name of await scanIndices(e)){
   try{
-   const spot=await spotReference(e,jwt,name),cs=select(all,name,spot.value);
+   const spot=await spotReference(e,jwt,name),cs=await scanContracts(e,all,name,spot.value);
    const info={spot:spot.value,contracts:cs.length,quoted:0,fresh:0};result.contracts+=cs.length;
    const spotKey='spot:'+name;
    const spotHist=(Array.isArray(previous[spotKey])?previous[spotKey]:[]).filter(x=>Number.isFinite(x.t)&&now-x.t<40*60000).slice(-9);
@@ -1633,6 +1639,7 @@ async function ai(e,text){if(!e.AI)return 'AI binding missing';try{const r=await
 
 // v9: grounded AI is advisory, never permitted to invent a quote or trigger an order.
 async function groundedAnalysis(e,underlying){
+ if(!entryAllowed(e,underlying))return {status:'PAUSED_UNDERLYING',underlying,ordersEnabled:false};
  const report=await get(e,'scan:last');
  const prefix=`brain:${day()}:`;
  const keys=(await get(e,`brain:index:${day()}`))||[];
@@ -1954,7 +1961,7 @@ async function refreshScheduledCandleEvidence(e){
  const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName('janggo-history-cache-v1'));
  
  const jwt=await session(e),now=Date.now(),date=day(),schedule=sessionConfig(e);
- return refreshCandleEvidence({now,day:date,
+ return refreshCandleEvidence({now,day:date,enabledIndices:entryUniverse(e),
   readCache:async()=>{const r=await requestCandleCache(e,stub,'cache-read');if(!r.ok)throw Error('CANDLE_CACHE_READ_FAILED');return r.json();},
   writeCache:async cache=>{const r=await requestCandleCache(e,stub,'cache-write',cache);if(!r.ok)throw Error('CANDLE_CACHE_SAVE_FAILED');},
   seed:index=>minuteCandles(e,jwt,index,7),
@@ -3866,6 +3873,7 @@ async function automaticResearchPaperAlerts(e) {
    continue;
   }
   // A new movement may open after the previous position closes; the same episode cannot.
+  if(!entryAllowed(e,index)){report.blocked.push(index+':NEW_ENTRIES_PAUSED');continue;}
 
   const watch=(scanState.strategyWatches||[]).find(w=>w.underlying===index&&paperWatchDecision(w).ok);
   if(!watch||!watch.signalId||watch.signalId===pos?.signalId||watch.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!watch.candleConfirmation?.ok)continue;
@@ -3984,7 +3992,7 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/dail
   const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
   const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
   return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),ordersEnabled:false,configuredEntryPolicy:RESEARCH_ENTRY_POLICY,paperMonitoring:{intervalSeconds:180,trailing:'ONE_INITIAL_RISK_THEN_ONE_RISK_BELOW_OBSERVED_PEAK',ordersPlaced:false},
-   scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
+   newEntryUnderlyings:entryUniverse(e),tradePreferences,scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
    verifiedLiveSignalDelivery:false});
  }if(u.pathname==='/independent-intake-selftest')return json({version:VERSION,...independentIntakeSelftest()});if(u.pathname==='/production-delivery-selftest')return json({version:VERSION,...productionDeliverySelftest()});if(u.pathname==='/verified-signal-selftest')return json({version:VERSION,...verifiedSignalSelftest()});if(u.pathname==='/signal-evidence-intake-status')return json({version:VERSION,...(await get(e,'signal:evidence-intake:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/production-signal-pipeline')return json({version:VERSION,...await productionSignalPipeline(e,{dryRun:true})});if(u.pathname==='/production-approval-selftest')return json({version:VERSION,...productionApprovalSelftest()});if(u.pathname==='/production-approval-status')return json({version:VERSION,...(await get(e,'research:production-approval:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/candidate-review-selftest')return json({version:VERSION,...candidateReviewSelftest()});if(u.pathname==='/candidate-review-status')return json({version:VERSION,...(await get(e,'research:candidate-review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/attestation-selftest')return json({version:VERSION,...attestationRegression()});if(u.pathname==='/attestation-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN'})});if(u.pathname==='/certification-workflow-selftest')return json({version:VERSION,...certificationWorkflowRegression()});if(u.pathname==='/certification-workflow-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/certification-selftest')return json({version:VERSION,...certificationRegression()});if(u.pathname==='/certification-audit')return json({version:VERSION,...await certificationAudit(e)});if(u.pathname==='/paper-promotion-selftest')return json({version:VERSION,...paperPromotionSelftest()});if(u.pathname==='/paper-promotion-status')return json({version:VERSION,...(await get(e,'research:paper-promotion:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/forward-qualification-selftest')return json({version:VERSION,...forwardQualificationSelftest()});if(u.pathname==='/forward-qualification-status')return json({version:VERSION,...(await get(e,'research:forward-qualification:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/autonomous-research-status')return json({version:VERSION,...(await get(e,'research:auto:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/release-gate-selftest')return json({version:VERSION,...releaseGateSelftest()});if(u.pathname==='/release-gate')return json({version:VERSION,...await releaseEvidenceAudit(e)});if(u.pathname==='/paper-integrity-selftest')return json({version:VERSION,...paperIntegritySelftest()});if(u.pathname==='/paper-integrity')return json({version:VERSION,...await persistedPaperIntegrity(e)});if(u.pathname==='/research-review-status')return json({version:VERSION,...(await get(e,'research:review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/research-promotion-selftest')return json({version:VERSION,...researchPromotionSelftest()});if(u.pathname==='/research-promotion-audit')return json({version:VERSION,...await researchPromotionAudit(e)});if(u.pathname==='/integrated-safety-selftest')return json({version:VERSION,...integratedSafetyRegression()});if(u.pathname==='/production-blockers')return json({version:VERSION,...await productionBlockerAudit(e)});if(u.pathname==='/option-gate-selftest')return json({version:VERSION,...optionGateRegression()});if(u.pathname==='/paper-lifecycle-selftest')return json({version:VERSION,...await __modules['paper-lifecycle-regression.mjs'].runPaperLifecycleRegression()});if(u.pathname==='/operational-selftest')return json({version:VERSION,...operationalHealthRegression()});if(u.pathname==='/operational-health'){const [cron,scan,paper,forward,failure]=await Promise.all([get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last'),get(e,'cron:last-failure')]);return json({version:VERSION,at:new Date().toISOString(),...classifyOperationalHealth({marketOpen:marketOpen(e),cron,scan,paper,forward,failure})});}if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:false,evidenceGate:'INDEPENDENT_EVIDENCE_REQUIRED_BEFORE_ANY_ALERT'});if(u.pathname==='/operations-status'){
  const [scan,paper,cron]=await Promise.all([get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'cron:last-trigger')]);
@@ -4060,9 +4068,9 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/dail
      }
      return result;
     },
-    review:async index=>reviewStrategyIndex(e.STATE,index),
+    review:async index=>entryAllowed(e,index)?reviewStrategyIndex(e.STATE,index):{status:'PAUSED_UNDERLYING'},
     loadEvidence:async index=>({market:await get(e,'marketintel:'+index),options:await get(e,'options:'+index)}),
-    select:async(index,{market,options})=>autoSelectPaper(e.STATE,{index,market,options,marketOpen:true})
+    select:async(index,{market,options})=>entryAllowed(e,index)?autoSelectPaper(e.STATE,{index,market,options,marketOpen:true}):{status:'PAUSED_UNDERLYING'}
    });
    await put(e,'paper:cycle:last',{at:new Date().toISOString(),status:'COMPLETED',scanAt:currentScan?.at||null,ordersPlaced:false},86400);
   }catch(err){
