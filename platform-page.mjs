@@ -25,11 +25,12 @@ export const deskJs=String.raw`
 const $=id=>document.getElementById(id),money=n=>Number.isFinite(n)?'₹'+n.toLocaleString('en-IN',{maximumFractionDigits:2,minimumFractionDigits:2}):'—';
 const time=x=>x?new Date(x).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',hour12:false}):'—';
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const protectedControls=['refresh','export','chart-series','chain-lots','research-lots','save-chain','save-research'];
 let state=null,rawChart=null,frame=1,connected=false,poll=null,refreshing=false;
 async function api(path,options={}){const r=await fetch('/platform/'+path,{credentials:'same-origin',cache:'no-store',...options});let b;try{b=await r.json()}catch{throw Error('Desk connection unavailable. Try again.')}if(!r.ok){if(r.status===401)lock();throw Error(b.message||'Desk request unavailable. Try again.')}return b;}
 function notice(text){$('notice').textContent=text||'';$('notice').hidden=!text;}
-function lock(){connected=false;state=null;clearInterval(poll);$('login-panel').hidden=false;$('logout').hidden=true;for(const id of ['refresh','export','chart-series','chain-lots','research-lots','save-chain','save-research'])$(id).disabled=true;$('market-state').textContent='Not connected';$('market-state').className='pill neutral';}
-function unlock(){connected=true;$('login-panel').hidden=true;$('logout').hidden=false;for(const id of ['refresh','export','chain-control','research-control','chart-series'])$(id).disabled=false;}
+function lock(){connected=false;state=null;clearInterval(poll);$('login-panel').hidden=false;$('logout').hidden=true;for(const id of protectedControls)$(id).disabled=true;$('market-state').textContent='Not connected';$('market-state').className='pill neutral';}
+function unlock(){connected=true;$('login-panel').hidden=true;$('logout').hidden=false;for(const id of protectedControls)$(id).disabled=false;}
 function pill(id,text,kind='neutral'){$(id).textContent=text;$(id).className='pill '+kind;}
 function label(s){return String(s||'Waiting for evidence').replaceAll('_',' ').toLowerCase();}
 function renderTrades(){if(!state)return;const open=state.trades.filter(t=>['OPEN','PAPER_OPEN'].includes(t.state));$('monitor-count').textContent=String(open.length)+' open';$('open-table').innerHTML=open.length?open.map(t=>'<tr><td><strong>'+escape(t.symbol)+'</strong><small>'+escape(t.project==='chain'?'Option chain':'Candle research')+'</small></td><td>'+money(t.entry)+'</td><td>'+escape(t.quantity??'—')+'</td><td>'+money(t.stop)+'</td><td>'+t.targets.map(money).join(' / ')+'</td><td>'+escape(t.trailing?'Active':'Waiting')+'</td><td>'+time(t.timeExit)+'</td></tr>').join(''):'<tr><td colspan="7" class="table-empty">No open paper positions. The bots wait for qualifying evidence.</td></tr>';

@@ -61,3 +61,12 @@ test('browser script parses and chart aggregation excludes incomplete or missing
 });
 
 test('paper sizing starts with one actual exchange lot and stores adjusted quantities without changing past trades',async()=>{const {paperSize}=await import('../paper-sizing.mjs');assert.deepEqual(paperSize(65),{lotSize:65,lots:1,quantity:65});assert.equal(paperSize(65,3).quantity,195);for(const x of [0,-1,1.5,11])assert.throws(()=>paperSize(65,x),/INVALID_PAPER_LOTS/);const trade=deskTrade({entry:100,lot:65,quantity:195,lots:3},'chain','PAPER_CLOSED',{exitPrice:110});assert.equal(trade.grossPnl,1950);assert.equal(trade.quantity,195);});
+test('an approved browser initializes against the actual page IDs and loads the dashboard without removed controls',async()=>{
+ const nodes=new Map([...deskHtml.matchAll(/id="([^"]+)"/g)].map(([,id])=>[id,{id,hidden:false,disabled:true,value:id==='chart-series'?'index':id==='journal-filter'?'all':'',textContent:'',innerHTML:'',style:{},dataset:{},options:[{value:'index'}],classList:{toggle(){}},addEventListener(){}}]));
+ const calls=[],at=new Date().toISOString(),data={at,day:'2026-11-16',marketOpen:false,trades:[],totals:{complete:true,grossPnl:null,open:0,wins:0,losses:0,flat:0,unpriced:0,uncertain:0},budget:{chainCalls:18,chainCap:80},chain:{connected:true,enabled:true,lots:1,provider:'KOTAK_NEO'},research:{connected:true,enabled:true,lots:1,provider:'KOTAK_NEO'},issues:[]};
+ const context={document:{getElementById:id=>nodes.get(id)||null,querySelectorAll:()=>[],addEventListener(){},hidden:false},fetch:async path=>{calls.push(path);return Response.json(path.endsWith('/session')?{approved:true}:path.endsWith('/data')?data:{candles:[]});},setInterval:()=>1,clearInterval(){},setTimeout,URL,Blob,Date,Map,console};
+ await vm.runInNewContext(deskJs,context);
+ assert.equal(nodes.get('login-panel').hidden,true);assert.equal(nodes.get('logout').hidden,false);assert.equal(nodes.get('market-state').textContent,'Market closed');assert.equal(nodes.get('notice').hidden,true,nodes.get('notice').textContent);
+ for(const id of ['refresh','export','chart-series','chain-lots','research-lots','save-chain','save-research'])assert.equal(nodes.get(id).disabled,false,id);
+ assert.ok(calls.some(p=>p.endsWith('/data')));assert.ok(calls.some(p=>p.includes('/chart?')));assert.match(nodes.get('chain-size').textContent,/1 lot/);
+});
