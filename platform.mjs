@@ -8,11 +8,12 @@ const snapshots=new WeakMap(),charts=new WeakMap();
 async function snapshot(env,deps){const old=snapshots.get(env);if(old&&Date.now()-old.at<15000)return old.promise;const promise=deskSnapshot(env,deps);snapshots.set(env,{at:Date.now(),promise});try{return await promise}catch(e){snapshots.delete(env);throw e;}}
 async function chart(env,deps,tradeId){
  let instrumentToken='Nifty 50',exchangeSegment='nse_cm',symbol='NIFTY 50',kind='INDEX';
- if(tradeId&&tradeId!=='index'){
+ if(tradeId==='commodity'){const c=(await snapshot(env,deps)).commodity?.marketSample;if(!c||!/^\d{1,12}$/.test(c.token||''))throw Error('CHART_DATA_UNAVAILABLE');instrumentToken=c.token;exchangeSegment='mcx_fo';symbol=c.symbol;kind='OPTION';}
+ else if(tradeId&&tradeId!=='index'){
   if(tradeId.length>240)throw Error('CHART_NOT_LISTED');
   const trade=(await snapshot(env,deps)).trades.find(t=>t.id===tradeId);
   if(!trade||trade.provider!=='KOTAK_NEO'||!/^\d{1,12}$/.test(trade.instrumentToken||''))throw Error('CHART_NOT_LISTED');
-  instrumentToken=trade.instrumentToken;exchangeSegment=trade.exchange==='NFO'?'nse_fo':trade.exchange==='BFO'?'bse_fo':null;if(!exchangeSegment)throw Error('CHART_NOT_LISTED');symbol=trade.symbol;kind='OPTION';
+  instrumentToken=trade.instrumentToken;exchangeSegment=trade.exchange==='NFO'?'nse_fo':trade.exchange==='BFO'?'bse_fo':trade.exchange==='MCX'?'mcx_fo':null;if(!exchangeSegment)throw Error('CHART_NOT_LISTED');symbol=trade.symbol;kind='OPTION';
  }
  const old=charts.get(env),key=exchangeSegment+'|'+instrumentToken+'|'+deps.date;
  if(old?.key===key&&Date.now()-old.at<60000)return old.promise;
@@ -20,8 +21,9 @@ async function chart(env,deps,tradeId){
   const fromDate=new Date(Date.now()-6*86400000+19800000).toISOString().slice(0,10);
   const data=await chainCommand(env,'neo-read',{operation:'candles',args:{exchangeSegment,instrumentToken,fromDate,toDate:deps.date,interval:'1min'}});
   if(data.provider!=='KOTAK_NEO'||!Array.isArray(data.candles))throw Error('CHART_DATA_UNAVAILABLE');
-  const candles=data.candles.filter(c=>{const d=new Date(c.at),local=new Date(d.getTime()+19800000),minute=local.getUTCHours()*60+local.getUTCMinutes();return minute>=555&&minute<930&&d.getTime()+60000<=Date.now();}).slice(-2500);
-  return {provider:'KOTAK_NEO',kind,symbol,asOf:data.receivedAt,candles,sessionValidated:false,ordersEnabled:false};
+  const sessionHours=exchangeSegment==='mcx_fo'?{openMinute:540,closeMinute:1435}:{openMinute:555,closeMinute:930};
+  const candles=data.candles.filter(c=>{const d=new Date(c.at),local=new Date(d.getTime()+19800000),minute=local.getUTCHours()*60+local.getUTCMinutes();return minute>=sessionHours.openMinute&&minute<sessionHours.closeMinute&&d.getTime()+60000<=Date.now();}).slice(-2500);
+  return {provider:'KOTAK_NEO',kind,symbol,asOf:data.receivedAt,sessionHours,candles,sessionValidated:false,ordersEnabled:false};
  })();charts.set(env,{key,at:Date.now(),promise});try{return await promise}catch(e){charts.delete(env);throw e;}
 }
 export async function platformFetch(request,env,deps){
@@ -39,8 +41,8 @@ export async function platformFetch(request,env,deps){
   if(path==='/platform/settings'&&request.method==='POST'){
    if(!sameOrigin(request))return privateJson({message:'Use settings from your own desk page.'},403);
    const raw=await request.text();if(raw.length>256)return privateJson({message:'Invalid size setting.'},400);let d;try{d=JSON.parse(raw);paperSize(1,d.lots)}catch{return privateJson({message:'Choose a whole number from 1 to 10 lots.'},400);}
-   if(!['chain','research'].includes(d.project))return privateJson({message:'Choose one of your two desks.'},400);
-   if(d.project==='chain')await chainCommand(env,'paper-settings',{lots:d.lots});else await env.STATE.put('platform:paper-lots',JSON.stringify(d.lots));
+   if(!['chain','research','commodity'].includes(d.project))return privateJson({message:'Choose one of your two desks.'},400);
+   if(d.project==='chain')await chainCommand(env,'paper-settings',{lots:d.lots});else if(d.project==='commodity')await chainCommand(env,'commodity-settings',{lots:d.lots});else await env.STATE.put('platform:paper-lots',JSON.stringify(d.lots));
    snapshots.delete(env);return privateJson({project:d.project,lots:d.lots,newEntriesOnly:true,ordersEnabled:false});
   }
   if(path==='/platform/control'&&request.method==='POST'){

@@ -4027,6 +4027,7 @@ if(new URL(req.url).pathname==='/internal/research-audit'&&req.method==='POST'){
  const result=await researchAudit({index,read:()=>get(e,key),write:r=>put(e,key,r,86400*30),analyse:()=>marketIntelligence(e,index),benchmark:async()=>tenHistoricalChecks(await historicalCandles(e,await session(e),index,7),index),send:message=>telegram(e,message)});
  return Response.json(result);
 }
+if(new URL(req.url).pathname==='/commodity-status'){try{return Response.json(await chainCommand(e,'commodity-status'));}catch{return Response.json({status:'UNAVAILABLE',ordersEnabled:false},{status:503});}}
 if(new URL(req.url).pathname==='/research-data-audit'){let optionChain=null;try{optionChain=await chainCommand(e,'status');}catch{}return Response.json({NIFTY:await get(e,'deployment:research-data-v1:NIFTY'),SENSEX:await get(e,'deployment:research-data-v1:SENSEX'),aiConnectionAudit:optionChain?.aiConnectionAudit||null,optionChain,researchBroker:{provider:useNeo(e)?'KOTAK_NEO':'ANGEL',sharedAiEnabled:sharedBudgetEnabled(e),audit:await get(e,'broker:neo:commissioning')},currentResearch:{NIFTY:await get(e,'marketintel:NIFTY'),SENSEX:await get(e,'marketintel:SENSEX')},ordersEnabled:false});}
 if(new URL(req.url).pathname==='/internal/router'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='ensure-router')return new Response('Forbidden',{status:403});
