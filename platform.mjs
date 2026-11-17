@@ -1,6 +1,6 @@
 import {paperSize} from './paper-sizing.mjs';
 import {deskHtml,deskCss,deskJs} from './platform-page.mjs';
-import {approvedDesk,beginDesk,logoutDesk,privateJson,sameOrigin} from './platform-auth.mjs';
+import {approvedDesk,beginDesk,logoutDesk,privateJson,sameOrigin,deskSessionStatus} from './platform-auth.mjs';
 import {deskSnapshot} from './platform-data.mjs';
 import {chainCommand} from './router.mjs';
 const headers={'cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer','x-frame-options':'DENY','permissions-policy':'camera=(), microphone=(), geolocation=()','content-security-policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"};
@@ -32,7 +32,7 @@ export async function platformFetch(request,env,deps){
   if(request.method==='GET'&&path==='/platform/app.js')return new Response(deskJs,{headers:{...headers,'content-type':'text/javascript; charset=utf-8'}});
   if(path==='/platform/auth'&&request.method==='POST')return await beginDesk(request,env);
   if(path==='/platform/logout'&&request.method==='POST')return await logoutDesk(request,env);
-  if(path==='/platform/session'&&request.method==='GET')return privateJson({approved:await approvedDesk(request,env)});
+  if(path==='/platform/session'&&request.method==='GET')return deskSessionStatus(request,env);
   if(!await approvedDesk(request,env))return privateJson({message:'Approve this browser through Janggo first.'},401);
   if(path==='/platform/data'&&request.method==='GET')return privateJson(await snapshot(env,deps));
   if(path==='/platform/chart'&&request.method==='GET')return privateJson(await chart(env,deps,new URL(request.url).searchParams.get('trade')));

@@ -2,12 +2,16 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import {strongSnapshotEvidence,researchCandleConfirmation,researchAlertCapacity,confirmResearchQuote} from '../strong-entry.mjs';
 import {sendDirectionalAlerts} from '../janggo-worker.mjs';
 const now=Date.parse('2026-11-13T13:00:00+05:30');
-const contract={symbol:'NIFTY_TEST_CE',underlying:'NIFTY',side:'CE',lotsize:20,token:'123',exchange:'NFO'};
+const contract={symbol:'NIFTY_TEST_CE',underlying:'NIFTY',side:'CE',lotsize:20,token:'123',exchange:'NFO',expiry:'2026-11-19'};
 const h=[100,101,102,104].map((p,i)=>({p,t:now-(3-i)*180000,oi:[10000,10010,10050,10200][i],v:[1000,1200,1400,1900][i]}));
 const spot=[25000,25010,25030,25065].map((p,i)=>({p,t:now-(3-i)*180000}));
 const quality={state:'FRESH',ageSeconds:1,hasOi:true,hasSpread:true,spreadPct:.5,bidQuantity:40,askQuantity:40};
 const input={contract,history:h,spotHistory:spot,quality,now};
 const market={candleFresh:true,at:now,frames:['1m','5m'].map((timeframe,i)=>({timeframe,status:'RESEARCH_ONLY',trend:'UP',lastCompleteCandle:new Date(now-(i?300000:60000)).toISOString()}))};
+test('same-day and missing expiry block research and the final price recheck',()=>{
+ for(const expiry of ['2026-11-13','13NOV2026',undefined,'2026-11-12']){assert.match(strongSnapshotEvidence({...input,contract:{...contract,expiry}}).reason,/expiry/);assert.equal(confirmResearchQuote({}, {...contract,expiry},{},now),null);}
+ assert.equal(strongSnapshotEvidence({...input,contract:{...contract,expiry:'19NOV2026'}}).status,'RESEARCH_WATCH');
+});
 test('only sustained, liquid, expanding and non-chased evidence reaches AI eligibility',()=>{
  assert.equal(strongSnapshotEvidence(input).status,'RESEARCH_WATCH');
  for(const q of [{ageSeconds:31},{spreadPct:1},{bidQuantity:NaN},{askQuantity:0}])assert.equal(strongSnapshotEvidence({...input,quality:{...quality,...q}}).status,'WAIT');

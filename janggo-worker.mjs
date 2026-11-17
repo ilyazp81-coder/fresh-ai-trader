@@ -1,4 +1,5 @@
 import {telegramHealth} from './router.mjs';
+import {eligibleExpiry} from './expiry-policy.mjs';
 import {sharedBudgetEnabled,sharedResearchEnvironment,researchAi,RESEARCH_AI_MODEL} from './shared-ai-client.mjs';
 import {paperSize} from './paper-sizing.mjs';
 import {platformFetch} from './platform.mjs';
@@ -871,7 +872,7 @@ async function loadInstruments(e){
 // A missing or invalid spot reference blocks selection rather than guessing an ATM strike.
 function select(rows,underlying,spot,max=12){
  if(!Number.isFinite(spot)||spot<=0)return [];
- const a=rows.filter(x=>x.underlying===underlying);
+ const a=rows.filter(x=>x.underlying===underlying&&eligibleExpiry(x.expiry));
  const exp=[...new Set(a.map(x=>x.expiry))].sort((x,y)=>parseExpiry(x)-parseExpiry(y))[0];
  const b=a.filter(x=>x.expiry===exp);
  const strikes=[...new Set(b.map(x=>x.strike))].sort((x,y)=>Math.abs(x-spot)-Math.abs(y-spot));

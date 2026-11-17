@@ -1,5 +1,5 @@
 import {signCommand,readSigned} from './router.mjs';
-const COOKIE='__Host-janggo_desk',MAX_AGE=28800;
+const COOKIE='__Host-janggo_desk',MAX_AGE=30*86400;
 const hex=n=>[...crypto.getRandomValues(new Uint8Array(n))].map(x=>x.toString(16).padStart(2,'0')).join('');
 const hash=async s=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s)))].map(x=>x.toString(16).padStart(2,'0')).join('');
 export const sameOrigin=r=>r.headers.get('origin')===new URL(r.url).origin;
@@ -19,11 +19,11 @@ export async function deskSessionRequest(request,env,storage){
   if(!validChallenge)return privateJson({approved:false});
   const key='desk:challenge:'+d.challenge,p=await storage.get(key);if(!p||p.expires<=now)return privateJson({approved:false});
   const s=await storage.get('desk:session:'+p.hash);if(!s||s.expires<=now)return privateJson({approved:false});
-  await storage.put('desk:session:'+p.hash,{approved:true,expires:now+MAX_AGE*1000});await storage.delete(key);return privateJson({approved:true});
+  await storage.put('desk:session:'+p.hash,{approved:true,expires:now+MAX_AGE*1000,sessionPolicy:'30_DAYS_FIXED'});await storage.delete(key);return privateJson({approved:true});
  }
  if(!validHash)return privateJson({approved:false});
  const key='desk:session:'+d.hash,s=await storage.get(key);
- if(d.action==='check')return privateJson({approved:s?.approved===true&&s.expires>now,expires:s?.expires>now?s.expires:null});
+ if(d.action==='check'){const approved=s?.approved===true&&s.expires>now;if(approved&&!s.sessionPolicy){s.expires=s.expires-28800000+MAX_AGE*1000;s.sessionPolicy='30_DAYS_FIXED';await storage.put(key,s);}return privateJson({approved,expires:s?.expires>now?s.expires:null});}
  if(d.action==='logout'){await storage.delete(key);return privateJson({approved:false});}
  if(d.action!=='begin'||!validChallenge)return privateJson({error:'INVALID_ACTION'},400);
  const all=await storage.list({prefix:'desk:',limit:128});let pending=0;
@@ -32,6 +32,7 @@ export async function deskSessionRequest(request,env,storage){
  const expires=now+300000;await storage.put({[key]:{approved:false,expires},['desk:challenge:'+d.challenge]:{hash:d.hash,expires}});return privateJson({approved:false,expires});
 }
 export async function approvedDesk(request,env){const cookie=deskCookie(request);return cookie?(await deskRpc(env,'check',{hash:await hash(cookie)})).approved===true:false;}
+export async function deskSessionStatus(request,env){const cookie=deskCookie(request);if(!cookie)return privateJson({approved:false});const state=await deskRpc(env,'check',{hash:await hash(cookie)}),remaining=Math.max(0,Math.min(MAX_AGE,Math.floor((state.expires-Date.now())/1000)));return privateJson({...state,sessionDays:30},200,state.approved?{'set-cookie':COOKIE+'='+cookie+'; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age='+remaining}:{});}
 let botName=null;
 export async function beginDesk(request,env){
  if(!sameOrigin(request))return privateJson({error:'ORIGIN_REJECTED'},403);

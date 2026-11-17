@@ -1,7 +1,9 @@
+import {eligibleExpiry} from './expiry-policy.mjs';
 // Engineering filters for fewer experimental alerts; no claim of validated accuracy.
 export const RESEARCH_ENTRY_POLICY={version:'movement-research-v2',tradeCountLimit:null,countMode:'QUALIFYING_MOVEMENTS',minimumSpotMovePct:0.2,minimumPremiumMovePct:3,maximumPremiumMovePct:6,maximumSpreadPct:0.75,minimumOiChangePct:1,minimumVolumeLots:10};
 const wait=reason=>({status:'WAIT',reason});
 export function strongSnapshotEvidence({contract,history,spotHistory,quality,now=Date.now()}){
+ if(!eligibleExpiry(contract?.expiry,now))return wait('same-day, expired or unknown contract expiry');
  const lot=Number(contract?.lotSize??contract?.lotsize),p=RESEARCH_ENTRY_POLICY;
  if(!contract||quality?.state!=='FRESH'||!Number.isFinite(quality.ageSeconds)||quality.ageSeconds<0||quality.ageSeconds>30||!quality.hasOi||!quality.hasSpread||!Number.isFinite(quality.spreadPct)||quality.spreadPct>p.maximumSpreadPct||!(lot>0)||!Number.isFinite(quality.bidQuantity)||!Number.isFinite(quality.askQuantity)||quality.bidQuantity<2*lot||quality.askQuantity<2*lot)return wait('strong liquidity/freshness gate');
  if(!Array.isArray(history)||history.length<4||!Array.isArray(spotHistory)||spotHistory.length<4)return wait('need four independent observations');
@@ -28,6 +30,7 @@ export function researchAlertCapacity(claims,index,now,signalId,position){
 }
 
 export function confirmResearchQuote(w,contract,q,now=Date.now()){
+ if(!eligibleExpiry(contract?.expiry,now))return null;
  const lot=Number(contract?.lotSize??contract?.lotsize),entry=q?.ask;
  if(w?.entryPolicy!==RESEARCH_ENTRY_POLICY.version||!w.candleConfirmation?.ok||q?.state!=='FRESH'||!Number.isFinite(q.ageSeconds)||q.ageSeconds<0||q.ageSeconds>30||!Number.isFinite(q.spreadPct)||q.spreadPct>0.75||!q.hasOi||!q.hasSpread||!Number.isFinite(lot)||lot<=0||!Number.isFinite(q.bidQuantity)||!Number.isFinite(q.askQuantity)||q.bidQuantity<2*lot||q.askQuantity<2*lot||!Number.isFinite(entry)||entry<=0||Math.abs(entry-w.referencePremium)/w.referencePremium>0.005)return null;
  const risk=entry-w.hypotheticalSL,reward=w.hypotheticalTarget-entry;

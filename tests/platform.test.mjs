@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {signCommand} from '../router.mjs';
-import {deskSessionRequest,beginDesk,approvedDesk,deskRpc} from '../platform-auth.mjs';
+import {deskSessionRequest,beginDesk,approvedDesk,deskRpc,deskSessionStatus} from '../platform-auth.mjs';
 import {platformFetch} from '../platform.mjs';
 import {deskTrade,deskTotals} from '../platform-data.mjs';
 import {deskJs,deskHtml} from '../platform-page.mjs';
@@ -11,6 +11,12 @@ function storage(){const values=new Map();return {values,get:async k=>values.get
 function environment(){const env={TELEGRAM_BOT_TOKEN:'test-token-not-for-browser',TELEGRAM_CHAT_ID:'123',MARKET_DATA_PROVIDER:'KOTAK_NEO'},st=storage();env.PAPER_COORDINATOR={idFromName:n=>n,get:()=>({fetch:async(url,init)=>deskSessionRequest(new Request(url,init),env,st)})};return {env,st};}
 async function signed(env,data){const body=JSON.stringify({command:'platform-session',chatId:'123',at:Date.now(),...data});return new Request('https://desk.internal/internal/platform-session',{method:'POST',headers:{'x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});}
 const deps={date:'2026-11-16',session:{valid:true,open:'09:15',close:'15:30'},marketOpen:false,read:async()=>null};
+test('an existing approved browser upgrades once to a fixed 30-day cookie and logout still revokes it',async t=>{
+ const now=Date.parse('2026-11-17T10:00:00Z');t.mock.method(Date,'now',()=>now);const {env,st}=environment(),sid='c'.repeat(64),hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(sid)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+ await st.put('desk:session:'+hash,{approved:true,expires:now+3600000});const req=new Request('https://example.test/platform/session',{headers:{cookie:'__Host-janggo_desk='+sid}}),r=await deskSessionStatus(req,env),s=await r.json();assert.equal(s.approved,true);assert.equal(s.sessionDays,30);assert.ok(s.expires>now+29*86400000);assert.match(r.headers.get('set-cookie'),/HttpOnly; Secure; SameSite=Strict/);
+ const expires=s.expires;await deskSessionStatus(req,env);assert.equal((await st.get('desk:session:'+hash)).expires,expires);
+ await deskSessionRequest(await signed(env,{action:'logout',hash}),env,st);assert.equal((await(await deskSessionStatus(req,env)).json()).approved,false);
+});
 test('owner-signed, expiring, one-use approval is required and nonce alone is never a browser session',async t=>{
  let now=Date.parse('2026-11-16T12:00:00Z');t.mock.method(Date,'now',()=>now);const {env,st}=environment(),hash='a'.repeat(64),challenge='b'.repeat(32);
  assert.equal((await deskSessionRequest(new Request('https://desk.internal/internal/platform-session',{method:'POST',body:'{}'}),env,st)).status,403);
@@ -18,7 +24,8 @@ test('owner-signed, expiring, one-use approval is required and nonce alone is ne
  let r=await deskSessionRequest(await signed(env,{action:'check',hash}),env,st);assert.equal((await r.json()).approved,false);
  r=await deskSessionRequest(await signed(env,{action:'approve',challenge}),env,st);assert.equal((await r.json()).approved,true);
  r=await deskSessionRequest(await signed(env,{action:'approve',challenge}),env,st);assert.equal((await r.json()).approved,false);
- now+=28800001;r=await deskSessionRequest(await signed(env,{action:'check',hash}),env,st);assert.equal((await r.json()).approved,false);
+ now+=86400000;r=await deskSessionRequest(await signed(env,{action:'check',hash}),env,st);assert.equal((await r.json()).approved,true);
+ now+=29*86400000+1;r=await deskSessionRequest(await signed(env,{action:'check',hash}),env,st);assert.equal((await r.json()).approved,false);
  const wrong=await signed(env,{action:'approve',challenge,chatId:'456'});assert.equal((await deskSessionRequest(wrong,env,st)).status,403);
 });
 test('browser login keeps the broker/bot secret off the page, sets a secure cookie and rejects cross-site login',async t=>{
