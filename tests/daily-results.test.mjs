@@ -6,7 +6,7 @@ test('a confirmed BUY_PE alert starts one tracked paper position without a dupli
  const RealDate=Date,now=Date.parse('2026-11-12T14:40:00+05:30');
  t.mock.method(globalThis,'Date',class extends RealDate{constructor(...args){super(...(args.length?args:[now]))}static now(){return now}});t.mock.method(Date,'now',()=>now);
  const state=new Map(),env={__verifiedCalendar:{source:'NSE_OFFICIAL_FO',years:['2026'],holidays:[]},STATE:{get:async k=>state.get(k)||null,put:async(k,v)=>state.set(k,v)}};
- const watch={signalId:'sensex-episode-1',quotedAt:now,entryPolicy:'movement-research-v2',candleConfirmation:{ok:true},status:'RESEARCH_WATCH',underlying:'SENSEX',symbol:'SENSEX_TEST_PE',side:'PE',referencePremium:100,hypotheticalSL:95,hypotheticalTarget:110,spotMovePct:-.2,premiumMovePct:2,oiDelta:100};
+ const watch={signalId:'sensex-episode-1',quotedAt:now,entryPolicy:'movement-research-v3',candleConfirmation:{ok:true},status:'RESEARCH_WATCH',underlying:'SENSEX',symbol:'SENSEX_TEST_PE',side:'PE',referencePremium:100,hypotheticalSL:95,hypotheticalTarget:110,spotMovePct:-.2,premiumMovePct:2,oiDelta:100};
  const scan={at:new Date(now).toISOString(),scanHealthy:true,scanSummarySaved:true,kvStateSaved:true,strategyWatches:[watch],directionalReview:{decisions:[{symbol:watch.symbol,action:'BUY_PE'}]},paperContractEvidence:{[watch.symbol]:{symbol:watch.symbol,token:'123',exchange:'BFO',side:'PE',expiry:'2026-11-19T10:00:00Z',lotSize:20}}};
  state.set('scan:last',JSON.stringify(scan));state.set('rolling:2026-11-12',JSON.stringify({'BFO:123':[{t:now,p:100}]}));state.set('directional-alerts:2026-11-12',JSON.stringify({[watch.signalId]:{state:'SENT',at:now}}));
  t.mock.method(globalThis,'fetch',async()=>assert.fail('Confirmed entry must not notify twice'));

@@ -1,6 +1,6 @@
 import {eligibleExpiry} from './expiry-policy.mjs';
 // Engineering filters for fewer experimental alerts; no claim of validated accuracy.
-export const RESEARCH_ENTRY_POLICY={version:'movement-research-v2',tradeCountLimit:null,countMode:'QUALIFYING_MOVEMENTS',minimumSpotMovePct:0.2,minimumPremiumMovePct:3,maximumPremiumMovePct:6,maximumSpreadPct:0.75,minimumOiChangePct:1,minimumVolumeLots:10};
+export const RESEARCH_ENTRY_POLICY={version:'movement-research-v3',tradeCountLimit:null,countMode:'QUALIFYING_MOVEMENTS',minimumSpotMovePct:0.2,minimumPremiumMovePct:3,maximumPremiumMovePct:null,maximumSpreadPct:0.75,minimumOiChangePct:1,minimumVolumeLots:10};
 const wait=reason=>({status:'WAIT',reason});
 export function strongSnapshotEvidence({contract,history,spotHistory,quality,now=Date.now()}){
  if(!eligibleExpiry(contract?.expiry,now))return wait('same-day, expired or unknown contract expiry');
@@ -13,7 +13,7 @@ export function strongSnapshotEvidence({contract,history,spotHistory,quality,now
  const premium=(h[3].p/h[0].p-1)*100,spot=(s[3].p/s[0].p-1)*100,oi=(h[3].oi/h[0].oi-1)*100,lastPremium=(h[3].p/h[2].p-1)*100,lastSpot=(s[3].p/s[2].p-1)*100*side;
  const volume=h[3].v-h[2].v,rate=volume/(h[3].t-h[2].t),baseline=(h[2].v-h[0].v)/(h[2].t-h[0].t);
  if(spot*side<p.minimumSpotMovePct||lastSpot<0.04)return wait('strong spot direction not established');
- if(premium<p.minimumPremiumMovePct||premium>p.maximumPremiumMovePct||lastPremium<0.5||lastPremium>2.5||h.slice(1).some((x,i)=>x.p<=h[i].p))return wait('strong sustained premium gate or late-entry cap');
+ if(premium<p.minimumPremiumMovePct||lastPremium<0.5||h.slice(1).some((x,i)=>x.p<=h[i].p))return wait('strong sustained premium gate');
  if(oi<p.minimumOiChangePct||h[3].oi<h[2].oi||volume<p.minimumVolumeLots*lot||baseline<=0||rate<1.5*baseline)return wait('strong OI/volume expansion missing');
  const round=x=>+x.toFixed(2);return {status:'RESEARCH_WATCH',entryPolicy:p.version,strategy:'strong_spot_premium_oi_candles',symbol:contract.symbol,underlying:contract.underlying,side:contract.side,spotMovePct:round(spot),premiumMovePct:round(premium),oiDelta:round(h[3].oi-h[0].oi),oiChangePct:round(oi),volumeRateExpansion:round(rate/baseline),quotedAt:now-quality.ageSeconds*1000,referencePremium:round(h[3].p),hypotheticalSL:round(h[3].p*.97),hypotheticalTarget:round(h[3].p*1.05),reason:'Sustained premium and spot momentum, OI expansion, accelerating volume and tight liquid book; experimental, not performance validated',executable:false};
 }

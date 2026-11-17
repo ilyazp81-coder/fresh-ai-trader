@@ -14,8 +14,9 @@ test('same-day and missing expiry block research and the final price recheck',()
 });
 test('only sustained, liquid, expanding and non-chased evidence reaches AI eligibility',()=>{
  assert.equal(strongSnapshotEvidence(input).status,'RESEARCH_WATCH');
+ assert.equal(strongSnapshotEvidence({...input,history:h.map((x,i)=>({...x,p:[100,102,104,110][i]}))}).status,'RESEARCH_WATCH');
  for(const q of [{ageSeconds:31},{spreadPct:1},{bidQuantity:NaN},{askQuantity:0}])assert.equal(strongSnapshotEvidence({...input,quality:{...quality,...q}}).status,'WAIT');
- for(const history of [h.map((x,i)=>({...x,p:100+i*.2})),h.map((x,i)=>({...x,p:[100,102,104,110][i]})),h.map(x=>({...x,oi:10000})),h.map((x,i)=>({...x,v:1000+i*100})),h.map((x,i)=>({...x,t:x.t-(i===0?300000:0)}))])assert.equal(strongSnapshotEvidence({...input,history}).status,'WAIT');
+ for(const history of [h.map((x,i)=>({...x,p:100+i*.2})),h.map(x=>({...x,oi:10000})),h.map((x,i)=>({...x,v:1000+i*100})),h.map((x,i)=>({...x,t:x.t-(i===0?300000:0)}))])assert.equal(strongSnapshotEvidence({...input,history}).status,'WAIT');
  const w=strongSnapshotEvidence(input);assert.equal(researchCandleConfirmation(w,market,now).ok,true);assert.equal(researchCandleConfirmation({...w,side:'PE'},market,now).ok,false);assert.equal(researchCandleConfirmation(w,{...market,candleFresh:false},now).ok,false);assert.equal(researchCandleConfirmation(w,{...market,at:now-300000},now).ok,false);
  assert.equal(researchAlertCapacity({},'NIFTY',now),true);assert.equal(researchAlertCapacity({NIFTY_X:{state:'SENT',at:now-3600000}},'NIFTY',now),true);assert.equal(researchAlertCapacity({a:{at:now-1000}},'NIFTY',now),true);assert.equal(researchAlertCapacity({a:{at:0},b:{at:0}},'NIFTY',now),true);
 });
