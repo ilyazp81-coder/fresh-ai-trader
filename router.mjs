@@ -51,3 +51,12 @@ export async function hydrateBrokerIdentity(env){
  const ip=value=>typeof value==='string'&&/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)?value:null;
  env.__brokerIdentity={mac,publicIp:ip(identity.publicIp),localIp:ip(identity.localIp),at:Date.now()};
 }
+
+let telegramHealthCache=null;
+export async function telegramHealth(env){
+ const at=Date.now();if(!env.TELEGRAM_BOT_TOKEN)return {configured:false,at:new Date(at).toISOString(),reason:'BOT_TOKEN_MISSING'};
+ const fingerprint=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(env.TELEGRAM_BOT_TOKEN)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+ if(telegramHealthCache?.fingerprint===fingerprint&&at-telegramHealthCache.at<60000)return telegramHealthCache.result;
+ let result;try{const response=await fetch('https://api.telegram.org/bot'+env.TELEGRAM_BOT_TOKEN+'/getWebhookInfo',{signal:AbortSignal.timeout(5000)}),body=await response.json();result={at:new Date(at).toISOString(),configured:response.ok&&body.ok===true&&body.result?.url==='https://fresh-ai-trader.ilyazp81.workers.dev/telegram-webhook',pendingUpdates:Number(body.result?.pending_update_count)||0,lastErrorAt:body.result?.last_error_date?new Date(Number(body.result.last_error_date)*1000).toISOString():null,recentDeliveryError:Number(body.result?.last_error_date)*1000>=at-300000,messageSentByCheck:false};}catch{result={at:new Date(at).toISOString(),configured:false,reason:'TELEGRAM_HEALTH_UNAVAILABLE',messageSentByCheck:false};}
+ telegramHealthCache={fingerprint,at,result};return result;
+}

@@ -65,3 +65,5 @@ test('broker metadata is accepted only for the same account and explicit local s
  await hydrateBrokerIdentity(wrong);
  assert.equal(wrong.__brokerIdentity.accountMatches,false);assert.equal(wrong.__brokerIdentity.mac,undefined);
 });
+
+test('live Telegram health only reads webhook metadata, caches across invocation wrappers and never exposes the token',async t=>{const {telegramHealth}=await import('../router.mjs');let calls=0;const env={TELEGRAM_BOT_TOKEN:'health-only-private-token'};t.mock.method(globalThis,'fetch',async(url,init)=>{calls++;assert.ok(url.endsWith('/getWebhookInfo'));assert.equal(init.method,undefined);return Response.json({ok:true,result:{url:'https://fresh-ai-trader.ilyazp81.workers.dev/telegram-webhook',pending_update_count:0}});});const a=await telegramHealth(env);assert.equal(a.configured,true);assert.equal(a.pendingUpdates,0);assert.equal(a.messageSentByCheck,false);assert.ok(!JSON.stringify(a).includes(env.TELEGRAM_BOT_TOKEN));await telegramHealth({...env});assert.equal(calls,1);});
