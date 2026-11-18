@@ -50,7 +50,12 @@
     }
   },
   "keep_vars": true,
-  "vars": {"TRADE_UNDERLYINGS":"NIFTY", "MARKET_DATA_PROVIDER":"KOTAK_NEO", "AI_SHARED_BUDGET":"yes"},
+  "vars": {
+    "TRADE_UNDERLYINGS": "NIFTY",
+    "MARKET_DATA_PROVIDER": "KOTAK_NEO",
+    "AI_SHARED_BUDGET": "yes",
+    "NIFTY_COMBINED_DECISION": "yes"
+  },
   "services": [
     {
       "binding": "OPTION_CHAIN",

@@ -16,6 +16,7 @@ import {refreshCandleEvidence,packCandleCache,readPackedCandleCache,authorizedCa
 import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
 import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity,signCommand } from './router.mjs';
+import {combinedNiftyEnabled,buildNiftyContext} from './nifty-context.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
 // Paper-only alerts; live broker validation pending.
 
@@ -684,7 +685,7 @@ const put=async(e,k,v,ttl)=>{
  try {await e.STATE.put(brokerDataKey(e,k),JSON.stringify(v),ttl?{expirationTtl:Math.max(60,ttl)}:undefined);return true}
  catch(err){kvWriteSkipped++;kvWriteErrors.push(String(err?.message||err).slice(0,100));return false}
 };
-export const researchEntriesPaused=async e=>(await get(e,'platform:research-paused'))===true;
+export const researchEntriesPaused=async e=>combinedNiftyEnabled(e)||(await get(e,'platform:research-paused'))===true;
 const cfg=e=>[...(useNeo(e)?['OPTION_CHAIN']:['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED']),'TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET'].filter(k=>!e[k]);
 // Never echo configured credentials into Worker logs or Telegram diagnostics.
 const safeError=(error,env={})=>{
@@ -4021,6 +4022,12 @@ export default {
  async fetch(req,e,executionCtx){e=sharedResearchEnvironment(e);e.__kvWritesThisInvocation=0;
 if(new URL(req.url).pathname==='/platform'||new URL(req.url).pathname.startsWith('/platform/')){await hydrateExchangeCalendar(e);return platformFetch(req,e,{read:key=>get(e,key),date:day(),session:sessionConfig(e),marketOpen:marketOpen(e)});}
 
+if(new URL(req.url).pathname==='/internal/nifty-context'&&req.method==='POST'){
+ const signed=await readSigned(req,e);if(!signed||signed.command!=='nifty-context')return new Response('Forbidden',{status:403});
+ if(!combinedNiftyEnabled(e))return Response.json({combinedDecision:false,underlying:'NIFTY'},{status:409});
+ const [market,position]=await Promise.all([get(e,'marketintel:NIFTY'),get(e,'research:paper:position:'+day()+':NIFTY')]);
+ return Response.json(buildNiftyContext(market,position));
+}
 if(new URL(req.url).pathname==='/internal/research-audit'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='research-audit'||!['NIFTY','SENSEX'].includes(signed.index))return new Response('Forbidden',{status:403});
  const index=signed.index,key='deployment:research-data-v1:'+index;
