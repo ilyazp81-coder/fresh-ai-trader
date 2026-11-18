@@ -79,4 +79,6 @@ test('an approved browser initializes against the actual page IDs and loads the 
  assert.equal(nodes.get('login-panel').hidden,true);assert.equal(nodes.get('logout').hidden,false);assert.equal(nodes.get('market-state').textContent,'Market closed');assert.equal(nodes.get('notice').hidden,true,nodes.get('notice').textContent);
  for(const id of ['refresh','export','chart-series','chain-lots','research-lots','save-chain','save-research'])assert.equal(nodes.get(id).disabled,false,id);
  assert.ok(calls.some(p=>p.endsWith('/data')));assert.ok(calls.some(p=>p.includes('/chart?')));assert.match(nodes.get('chain-size').textContent,/1 lot/);
+ context.testPayload={...data,chain:{...data.chain,aiDecisionMode:'SINGLE_FINAL_AI'},commodity:{connected:true,enabled:true,paperAlertsEnabled:false,newEntriesEnabled:false,lots:1,entryWindow:{open:Date.now()+60000,configuredStartIst:'16:00'}}};
+ vm.runInNewContext('render(testPayload)',context);assert.match(nodes.get('chain-method').textContent,/Mistral/);assert.equal(nodes.get('commodity-state').textContent,'Entries from 16:00 IST');
 });
