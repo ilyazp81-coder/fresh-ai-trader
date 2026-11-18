@@ -17,6 +17,7 @@ import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
 import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity,signCommand } from './router.mjs';
 import {combinedNiftyEnabled,buildNiftyContext} from './nifty-context.mjs';
+import {watchCore} from './service-watch.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
 // Paper-only alerts; live broker validation pending.
 
@@ -4070,7 +4071,10 @@ await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/dail
  return json({ok:true});
  }catch(err){log('webhook',err);return json({error:'handler failed'},500)}}return json({error:'not found'},404)},
  async scheduled(ev,e,ctx){e=sharedResearchEnvironment(e);e.__kvWritesThisInvocation=0;ctx.waitUntil((async()=>{try{
+  await watchCore({check:()=>chainCommand(e,'health-audit'),read:()=>get(e,'watch:core-service'),write:v=>put(e,'watch:core-service',v,86400*7),send:text=>telegram(e,text)});
+  if(ev?.cron==='*/5 12-18 * * *')return;
   await hydrateExchangeCalendar(e);
+  if(combinedNiftyEnabled(e)&&!marketOpen(e)){await freshDailyResults(e);return;}
   if(useNeo(e)&&!marketOpen(e))await neoResearchAudit(e);
   await put(e,'cron:last-trigger',{at:new Date().toISOString(),version:VERSION,scheduledTime:ev?.scheduledTime||null,marketOpen:marketOpen(e)},86400*3);
   // Daily autonomous AI hypothesis generation and independent index-proxy research.
