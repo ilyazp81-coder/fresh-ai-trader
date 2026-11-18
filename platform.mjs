@@ -1,5 +1,6 @@
+import {niftyOnly} from './entry-policy.mjs';
 import {paperSize} from './paper-sizing.mjs';
-import {deskHtml,deskCss,deskJs} from './platform-page.mjs';
+import {deskHtml,deskHtmlFor,deskCss,deskJs} from './platform-page.mjs';
 import {approvedDesk,beginDesk,logoutDesk,privateJson,sameOrigin,deskSessionStatus} from './platform-auth.mjs';
 import {deskSnapshot} from './platform-data.mjs';
 import {chainCommand} from './router.mjs';
@@ -7,6 +8,7 @@ const headers={'cache-control':'no-store','x-content-type-options':'nosniff','re
 const snapshots=new WeakMap(),charts=new WeakMap();
 async function snapshot(env,deps){const old=snapshots.get(env);if(old&&Date.now()-old.at<15000)return old.promise;const promise=deskSnapshot(env,deps);snapshots.set(env,{at:Date.now(),promise});try{return await promise}catch(e){snapshots.delete(env);throw e;}}
 async function chart(env,deps,tradeId){
+ if(niftyOnly(env)&&tradeId==='commodity')throw Error('CHART_NOT_LISTED');
  let instrumentToken='Nifty 50',exchangeSegment='nse_cm',symbol='NIFTY 50',kind='INDEX';
  if(tradeId==='commodity'){const c=(await snapshot(env,deps)).commodity?.marketSample;if(!c||!/^\d{1,12}$/.test(c.token||''))throw Error('CHART_DATA_UNAVAILABLE');instrumentToken=c.token;exchangeSegment='mcx_fo';symbol=c.symbol;kind='OPTION';}
  else if(tradeId&&tradeId!=='index'){
@@ -29,7 +31,7 @@ async function chart(env,deps,tradeId){
 export async function platformFetch(request,env,deps){
  const path=new URL(request.url).pathname;if(path!=='/platform'&&!path.startsWith('/platform/'))return null;
  try{
-  if(request.method==='GET'&&(path==='/platform'||path==='/platform/'))return new Response(deskHtml,{headers:{...headers,'content-type':'text/html; charset=utf-8'}});
+  if(request.method==='GET'&&(path==='/platform'||path==='/platform/'))return new Response(deskHtmlFor(env),{headers:{...headers,'content-type':'text/html; charset=utf-8'}});
   if(request.method==='GET'&&path==='/platform/style.css')return new Response(deskCss,{headers:{...headers,'content-type':'text/css; charset=utf-8'}});
   if(request.method==='GET'&&path==='/platform/app.js')return new Response(deskJs,{headers:{...headers,'content-type':'text/javascript; charset=utf-8'}});
   if(path==='/platform/auth'&&request.method==='POST')return await beginDesk(request,env);
@@ -41,6 +43,7 @@ export async function platformFetch(request,env,deps){
   if(path==='/platform/settings'&&request.method==='POST'){
    if(!sameOrigin(request))return privateJson({message:'Use settings from your own desk page.'},403);
    const raw=await request.text();if(raw.length>256)return privateJson({message:'Invalid size setting.'},400);let d;try{d=JSON.parse(raw);paperSize(1,d.lots)}catch{return privateJson({message:'Choose a whole number from 1 to 10 lots.'},400);}
+   if(d.project==='commodity'&&niftyOnly(env))return privateJson({message:'Crude has been retired. This workspace is NIFTY only.'},409);
    if(!['chain','research','commodity'].includes(d.project))return privateJson({message:'Choose one of your two desks.'},400);
    if(d.project==='chain')await chainCommand(env,'paper-settings',{lots:d.lots});else if(d.project==='commodity')await chainCommand(env,'commodity-settings',{lots:d.lots});else await env.STATE.put('platform:paper-lots',JSON.stringify(d.lots));
    snapshots.delete(env);return privateJson({project:d.project,lots:d.lots,newEntriesOnly:true,ordersEnabled:false});

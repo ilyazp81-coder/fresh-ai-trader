@@ -30,8 +30,7 @@
   ],
   "triggers": {
     "crons": [
-      "*/3 3-11 * * *",
-      "*/5 12-18 * * *"
+      "*/3 3-10 * * 1-5"
     ]
   },
   "observability": {
@@ -55,7 +54,9 @@
     "TRADE_UNDERLYINGS": "NIFTY",
     "MARKET_DATA_PROVIDER": "KOTAK_NEO",
     "AI_SHARED_BUDGET": "yes",
-    "NIFTY_COMBINED_DECISION": "yes"
+    "NIFTY_COMBINED_DECISION": "yes",
+    "NIFTY_ONLY": "yes",
+    "COMMODITY_ENABLED": "no"
   },
   "services": [
     {
