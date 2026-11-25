@@ -41,16 +41,7 @@ export async function brokerSlot(env,kind){
  if(at>now)await new Promise(r=>setTimeout(r,at-now));
 }
 
-export async function hydrateBrokerIdentity(env){
- if(!env.OPTION_CHAIN||!env.SMART_CLIENT_CODE)return;
- if(env.__brokerIdentity?.at&&Date.now()-env.__brokerIdentity.at<1800000)return;
- const identity=await chainCommand(env,'identity');
- const expected=[...new Uint8Array(await crypto.subtle.digest('SHA-256',enc.encode(String(env.SMART_CLIENT_CODE))))].map(x=>x.toString(16).padStart(2,'0')).join('');
- if(identity.clientHash!==expected){env.__brokerIdentity={at:Date.now(),accountMatches:false};return;}
- const mac=typeof identity.mac==='string'&&/^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/i.test(identity.mac)?identity.mac:null;
- const ip=value=>typeof value==='string'&&/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)?value:null;
- env.__brokerIdentity={mac,publicIp:ip(identity.publicIp),localIp:ip(identity.localIp),at:Date.now()};
-}
+
 
 let telegramHealthCache=null;
 export async function telegramHealth(env){

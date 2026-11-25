@@ -1,3 +1,9 @@
+# Kotak Neo / NIFTY only
+
+Active market data, contract selection and paper scanning use Kotak Neo for NIFTY only. Angel One transport, SENSEX/BFO and Crude/MCX scanners are removed. Historical trade records remain in existing storage. Legacy Durable Object exports and migration names are inert compatibility shells; no historical database or namespace is deleted.
+
+The existing Mistral option-chain decision flow, initial SL/targets, sampled bid exit monitoring, trailing math, 80-call session pacing and dashboard authentication are preserved. No real trading credentials or order activation are added by this cleanup.
+
 # Fresh AI trader — focused transport and shared-bot fixes
 
 The existing research scanner, paper lifecycle and evidence gates are retained.

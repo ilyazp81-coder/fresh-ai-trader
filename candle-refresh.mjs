@@ -16,13 +16,13 @@ export async function requestCandleCache(env,stub,command,cache){
  return stub.fetch('https://coordinator.internal/internal/candle-cache',{method:'POST',headers:{'content-type':'application/json','x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});
 }
 // Refresh both independent index research views; quotes never substitute for OHLC.
-export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,today,analyse,saveEvidence,safeError,enabledIndices=['NIFTY','SENSEX']}){
+export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,today,analyse,saveEvidence,safeError,enabledIndices=['NIFTY']}){
  const cache=await readCache()||{rows:{},errors:{}};cache.rows||={};cache.errors||={};
  const outcomes={},fresh=[];
  // Both indices share one broker history quota. Do not make another request
  // during a known throttle, including one saved for the other index.
  let sharedBlock=Object.values(cache.errors).find(x=>x?.retryAfter>now&&/RATE_LIMITED|HTTP 429/.test(x.reason||''));
- for(const index of [...new Set(enabledIndices)].filter(x=>['NIFTY','SENSEX'].includes(x))){
+ for(const index of [...new Set(enabledIndices)].filter(x=>['NIFTY'].includes(x))){
   try{
    if(sharedBlock)throw Error(sharedBlock.reason);
    const blocked=cache.errors[index];if(blocked?.retryAfter>now)throw Error(blocked.reason);
@@ -83,7 +83,7 @@ export async function refreshCandleEvidence({now,day,readCache,writeCache,seed,t
 // Durable Object KV values have a per-value size limit. Keep history in small chunks.
 export function packCandleCache(cache){
  const writes={},manifest={at:cache.at,errors:cache.errors||{},backfillErrors:cache.backfillErrors||{},seedDays:cache.seedDays||{},indices:{}};
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   const rows=cache.rows?.[index]||[];if(rows.length>5000)throw Error('HISTORY_CACHE_TOO_LARGE');
   manifest.indices[index]=Math.ceil(rows.length/100);
   for(let i=0;i<rows.length;i+=100){const part=rows.slice(i,i+100);if(new TextEncoder().encode(JSON.stringify(part)).length>110000)throw Error('HISTORY_CHUNK_TOO_LARGE');writes['candles:'+index+':'+i/100]=part;}
@@ -92,6 +92,6 @@ export function packCandleCache(cache){
 }
 export async function readPackedCandleCache(storage){
  const manifest=await storage.get('candles:manifest');if(!manifest)return null;
- const rows={};for(const index of ['NIFTY','SENSEX']){const count=manifest.indices[index]||0;if(count>50)throw Error('INVALID_HISTORY_MANIFEST');rows[index]=(await Promise.all(Array.from({length:count},(_,i)=>storage.get('candles:'+index+':'+i)))).flatMap(x=>Array.isArray(x)?x:[]);}
+ const rows={};for(const index of ['NIFTY']){const count=manifest.indices[index]||0;if(count>50)throw Error('INVALID_HISTORY_MANIFEST');rows[index]=(await Promise.all(Array.from({length:count},(_,i)=>storage.get('candles:'+index+':'+i)))).flatMap(x=>Array.isArray(x)?x:[]);}
  return {at:manifest.at,rows,errors:manifest.errors||{},backfillErrors:manifest.backfillErrors||{},seedDays:manifest.seedDays||{}};
 }

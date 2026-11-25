@@ -55,8 +55,7 @@
     "MARKET_DATA_PROVIDER": "KOTAK_NEO",
     "AI_SHARED_BUDGET": "yes",
     "NIFTY_COMBINED_DECISION": "yes",
-    "NIFTY_ONLY": "yes",
-    "COMMODITY_ENABLED": "no"
+    "NIFTY_ONLY": "yes"
   },
   "services": [
     {

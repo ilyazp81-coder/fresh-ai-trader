@@ -5,7 +5,7 @@ export async function deploymentAudit({read,write,probe,status,send}) {
  const result={at:new Date().toISOString(),ordersEnabled:false,liveMarketSignalsVerified:false};
  result.chain=await status();
  result.history=[];
- for(const index of ['NIFTY','SENSEX']) {
+ for(const index of ['NIFTY']) {
   const p=await probe(index);
   result.history.push({index,status:p.status,candles:p.candles||0,diagnostic:p.diagnostic||null});
  }

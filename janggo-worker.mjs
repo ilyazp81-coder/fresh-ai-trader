@@ -1,3 +1,4 @@
+import {normalizeBrokerCandles} from './broker-candles.mjs';
 import {telegramHealth} from './router.mjs';
 import {eligibleExpiry} from './expiry-policy.mjs';
 import {sharedBudgetEnabled,sharedResearchEnvironment,researchAi,RESEARCH_AI_MODEL} from './shared-ai-client.mjs';
@@ -6,8 +7,8 @@ import {platformFetch} from './platform.mjs';
 import {deskSessionRequest,deskRpc,privateJson} from './platform-auth.mjs';
 import {useNeo,neoQuotes,neoInstruments,neoHistoryWindow} from './neo-service.mjs';
 import {entryAllowed,entryUniverse,niftyOnly,tradePreferences} from './entry-policy.mjs';
-export async function scanContracts(e,all,name,spot){const rows=select(all,name,spot);const p=await get(e,'research:paper:position:'+day()+':'+name);if(p?.status==='OPEN'){const held=all.find(x=>x.exchange===p.exchange&&String(x.token)===String(p.token)&&x.underlying===name);if(held&&!rows.some(x=>x.exchange===held.exchange&&String(x.token)===String(held.token)))rows.push(held);}return rows;}
-export async function scanIndices(e){const names=entryUniverse(e);for(const name of ['NIFTY','SENSEX'])if(!names.includes(name)){const pos=await get(e,'research:paper:position:'+day()+':'+name);if(pos?.status==='OPEN')names.push(name);}return names;}
+export async function scanContracts(e,all,name,spot){if(name!=='NIFTY')return [];const rows=select(all,name,spot);const p=await get(e,'research:paper:position:'+day()+':'+name);if(p?.status==='OPEN'){const held=all.find(x=>x.exchange===p.exchange&&String(x.token)===String(p.token)&&x.underlying===name);if(held&&!rows.some(x=>x.exchange===held.exchange&&String(x.token)===String(held.token)))rows.push(held);}return rows;}
+export async function scanIndices(){return ['NIFTY'];}
 import {paperTrail} from './paper-trailing.mjs';
 import {RESEARCH_ENTRY_POLICY,strongSnapshotEvidence,researchCandleConfirmation,researchAlertCapacity,confirmResearchQuote} from './strong-entry.mjs';
 import {researchDailySummary,researchDailyMessage} from './daily-results.mjs';
@@ -15,7 +16,7 @@ import {parseAiJson} from './ai-json.mjs';
 import {refreshCandleEvidence,packCandleCache,readPackedCandleCache,authorizedCandleCacheRequest,requestCandleCache} from './candle-refresh.mjs';
 import {researchAudit} from './research-audit.mjs';
 import {deploymentAudit} from './deployment-audit.mjs';
-import { chainCommand,ensureBotRouter,readSigned,brokerSlot,hydrateBrokerIdentity,signCommand } from './router.mjs';
+import { chainCommand,ensureBotRouter,readSigned,brokerSlot,signCommand } from './router.mjs';
 import {combinedNiftyEnabled,buildNiftyContext} from './nifty-context.mjs';
 import {watchCore} from './service-watch.mjs';
 // JANGGO Cloud AI V111 single-file bundle. Generated from original V111 modules.
@@ -29,7 +30,7 @@ __modules["premium-forward.mjs"] = (() => {
 const premiumKey = (r) => [r.index,r.symbol,r.token,r.expiry,r.side].join(':');
 const number = x => typeof x==='number' && Number.isFinite(x);
 function validatePremiumTick(t, now=Date.now(), maxAgeMs=15000) {
-  if (!t || !['NIFTY','SENSEX'].includes(t.index) || !['CE','PE'].includes(t.side) ||
+  if (!t || !['NIFTY'].includes(t.index) || !['CE','PE'].includes(t.side) ||
       !t.symbol || !t.token || !t.expiry || !number(t.bid) || !number(t.ask) ||
       t.bid<=0 || t.ask<t.bid || !number(t.ts) || t.ts>now+2000 || now-t.ts>maxAgeMs ||
       !number(t.lotSize) || !Number.isInteger(t.lotSize) || t.lotSize<=0 ||
@@ -81,7 +82,7 @@ return {premiumKey,validatePremiumTick,openPaperOption,updatePaperOption,premium
 // MODULE: premium-tracker.mjs
 __modules["premium-tracker.mjs"] = (() => {
 const {openPaperOption,updatePaperOption,premiumMetrics,validatePremiumTick} = __modules["premium-forward.mjs"];
-const INDEXES=new Set(['NIFTY','SENSEX']);
+const INDEXES=new Set(['NIFTY']);
 const key=n=>'premium:tracker:'+n;
 async function trackerRead(kv,index){if(!INDEXES.has(index))throw Error('INVALID_INDEX');return (await kv.get(key(index),'json'))||{position:null,trades:[],lastTickAt:null,enabled:false};}
 async function trackerRegister(kv,index,contract,levels,attribution=null){
@@ -147,7 +148,7 @@ const finite=x=>typeof x==='number'&&Number.isFinite(x);
 const stamp=x=>typeof x==='number'?x:Date.parse(x||'');
 function assessPaperCandidate({index,market,options,now=Date.now(),marketOpen=false}={}){
  const reasons=[];
- if(!['NIFTY','SENSEX'].includes(index))reasons.push('INVALID_INDEX');
+ if(!['NIFTY'].includes(index))reasons.push('INVALID_INDEX');
  if(!marketOpen)reasons.push('MARKET_CLOSED');
  if(market?.underlying!==index||options?.underlying!==index)reasons.push('MISSING_MATCHED_EVIDENCE');
  for(const [label,item,age] of [['MARKET',market,300000],['OPTIONS',options,90000]]){
@@ -193,7 +194,7 @@ __modules["strategy-selection.mjs"] = (() => {
 // V105 research-only strategy selection. Paper outcomes must be attributable to a frozen strategy.
 // No live signals, no orders, and no promotion from simulated results alone.
 const {trackerRead} = __modules["premium-tracker.mjs"];
-const INDEXES=['NIFTY','SENSEX'];
+const INDEXES=['NIFTY'];
 const finite=x=>typeof x==='number'&&Number.isFinite(x);
 function evaluateStrategyCandidates(candidates,{minTrades=30,minDays=10,minProfitFactor=1.2,maxDrawdown=5000}={}){
  if(!Array.isArray(candidates))throw Error('INVALID_CANDIDATES');
@@ -252,7 +253,7 @@ __modules["strategy-attribution.mjs"] = (() => {
 // V106: explicit, immutable strategy-to-paper attribution. Never retroactively label legacy trades.
 const {trackerRead,trackerRegister} = __modules["premium-tracker.mjs"];
 const {evaluateStrategyCandidates} = __modules["strategy-selection.mjs"];
-const indexes=new Set(['NIFTY','SENSEX']);
+const indexes=new Set(['NIFTY']);
 const registryKey=i=>'research:strategy-candidates:'+i;
 async function registerAttributedPaper(kv,index,strategyId,contract,levels){
  if(!indexes.has(index))throw Error('INVALID_INDEX');
@@ -288,7 +289,7 @@ __modules["auto-paper-selection.mjs"] = (() => {
 const {assessPaperCandidate} = __modules["paper-candidate.mjs"];
 const {registerAttributedPaper} = __modules["strategy-attribution.mjs"];
 const {trackerRead} = __modules["premium-tracker.mjs"];
-const validIndex=i=>['NIFTY','SENSEX'].includes(i);
+const validIndex=i=>['NIFTY'].includes(i);
 const key=i=>'research:strategy-candidates:'+i;
 const reject=(index,reason)=>({index,status:'WAIT',reasons:[reason],paperOnly:true,productionSignalsEnabled:false,ordersEnabled:false});
 async function autoSelectPaper(kv,{index,market,options,marketOpen=false,now=Date.now(),maxEvidenceAgeMs=90000}={}){
@@ -327,12 +328,12 @@ return {autoSelectPaper};
 __modules["scheduled-paper-cycle.mjs"] = (() => {
 // Scheduled research-paper cycle. No orders or production alerts.
 // One writer per index is required: configure a single Worker cron deployment.
-async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY','SENSEX'],review,track,select,loadEvidence,now=()=>Date.now()}={}){
+async function runScheduledPaperCycle({kv,marketOpen,indices=['NIFTY'],review,track,select,loadEvidence,now=()=>Date.now()}={}){
  if(!kv||typeof kv.put!=='function'||typeof kv.get!=='function')throw Error('KV_REQUIRED');
  if(!marketOpen)return {status:'MARKET_CLOSED',results:[],ordersEnabled:false,productionSignalsEnabled:false};
  const results=[];
  for(const index of indices){
-  if(!['NIFTY','SENSEX'].includes(index))continue;
+  if(!['NIFTY'].includes(index))continue;
   const result={index,at:now(),tracking:null,review:null,selection:null,status:'WAIT'};
   try{
    // Sequential: settle exits before considering any new paper entry.
@@ -401,7 +402,7 @@ __modules["strategy-review-cycle.mjs"] = (() => {
 // V107 complete research review cycle: deterministic, read-only, fail closed.
 // Does not promote strategies, open paper positions, or send production alerts.
 const {attributedPerformance} = __modules["strategy-attribution.mjs"];
-const INDEXES=['NIFTY','SENSEX'];
+const INDEXES=['NIFTY'];
 const KEY=i=>'research:review:'+i;
 async function reviewStrategyIndex(kv,index,{now=Date.now()}={}){
  if(!INDEXES.includes(index))throw Error('INVALID_INDEX');
@@ -433,66 +434,7 @@ return {reviewStrategyIndex,reviewAllStrategies,lastStrategyReview};
 })();
 
 // MODULE: angel-data-transport.mjs
-__modules["angel-data-transport.mjs"] = (() => {
-// V100: read-only Angel One historical transport. Never submits orders.
-class AngelDataError extends Error {
- constructor(code,status=0){super(`ANGEL_${code}${status?` HTTP ${status}`:''}`);this.name='AngelDataError';this.code=code;this.status=status;}
-}
-function retryDelay(response,attempt){
- const raw=response?.headers?.get?.('Retry-After');
- const seconds=raw===null||raw===undefined?NaN:Number(raw);
- return Number.isFinite(seconds)&&seconds>=0?Math.min(2000,seconds*1000):Math.min(2000,350*(attempt+1));
-}
-async function historicalRequest(url,options,{label='historical',timeoutMs=15000,retries=1,fetchImpl=fetch,sleepImpl=ms=>new Promise(r=>setTimeout(r,ms)),beforeRequest=async()=>{}}={}){
- for(let attempt=0;attempt<=retries;attempt++){
-  let response;
-  try{await beforeRequest();}catch{throw new AngelDataError('REQUEST_PACING_UNAVAILABLE');}
-  try{response=await fetchImpl(url,{...options,signal:AbortSignal.timeout(timeoutMs)});}
-  catch(err){if(attempt<retries){await sleepImpl(350*(attempt+1));continue;}throw new AngelDataError(err?.name==='TimeoutError'?'TIMEOUT':'TRANSPORT');}
-  if(response.status===429||response.status>=500){
-   if(attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
-   throw new AngelDataError(response.status===429?'RATE_LIMITED':'BROKER_UNAVAILABLE',response.status);
-  }
-  // A broker may use HTTP 403 for throttling as well as permission failures.
-  // Read only a bounded response for classification; never log raw broker data.
-  if(response.status===401||response.status===403){
-   let hint='';try{hint=(await response.text()).slice(0,512).toLowerCase();}catch{}
-   const throttled=response.status===403&&/rate.?limit|too many requests|throttl|exceeded.*limit|exceed(?:ed|ing).*access rate|exceed.*rate/.test(hint);
-   if(throttled&&attempt<retries){await sleepImpl(retryDelay(response,attempt));continue;}
-   throw new AngelDataError(throttled?'RATE_LIMITED':'ACCESS_DENIED',response.status);
-  }
-  // Never log broker response bodies or authorization headers. Classify safely.
-  let payload;
-  try{const raw=await response.text();if(!raw.trim())throw Error('EMPTY');payload=JSON.parse(raw);}
-  catch{throw new AngelDataError(response.status===400?'BAD_REQUEST_NON_JSON':'NON_JSON_RESPONSE',response.status);}
-  if(!response.ok||payload?.status!==true||!Array.isArray(payload?.data)){
-   const code=response.status===400?'BAD_REQUEST':response.status===403?'ACCESS_DENIED':
-    response.ok&&payload?.status===false?'BROKER_REJECTED':'INVALID_CANDLE_RESPONSE';
-   throw new AngelDataError(code,response.status);
-  }
-  return payload;
- }
- throw new AngelDataError('UNAVAILABLE');
-}
-function normalizeAngelCandles(data,{intervalMs=60000,now=Date.now(),closedOnly=true}={}){
- if(!Array.isArray(data))throw new AngelDataError('INVALID_CANDLE_ARRAY');
- const parsed=data.map(row=>{
-  if(!Array.isArray(row)||row.length<6)return null;
-  // SmartAPI timestamps without an offset represent exchange-local IST.
-  // Date.parse() otherwise interprets them as UTC in Workers, shifting candles 5h30m.
-  const rawTime=String(row[0]??'').trim();
-  const match=rawTime.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?$/);
-  const t=Date.parse(match?`${match[1]}T${match[2]}+05:30`:rawTime);
-  const [o,h,l,c,v]=row.slice(1,6).map(Number);
-  if(!Number.isFinite(t)||![o,h,l,c,v].every(Number.isFinite)||[o,h,l,c].some(x=>x<=0)||h<Math.max(o,c,l)||l>Math.min(o,c,h)||v<0)return null;
-  return {t,o,h,l,c,v};
- }).filter(Boolean).sort((a,b)=>a.t-b.t);
- const unique=new Map();for(const candle of parsed){if(closedOnly&&candle.t+intervalMs>now)continue;unique.set(candle.t,candle);}
- return [...unique.values()];
-}
 
-return {AngelDataError,retryDelay,historicalRequest,normalizeAngelCandles};
-})();
 
 // MODULE: live-readiness.mjs
 __modules["live-readiness.mjs"] = (() => {
@@ -506,7 +448,7 @@ function assessLiveReadiness({probe,now=Date.now(),marketOpen=false,calendarConf
  if(!telegramDelivered)blockers.push('TELEGRAM_DELIVERY_UNVERIFIED');
  if(!probe?.allPassed)blockers.push('BROKER_MARKET_PROBE_FAILED');
  const result={};
- for(const name of ['NIFTY','SENSEX']){
+ for(const name of ['NIFTY']){
   const row=probe?.indices?.[name];const issues=[];
   if(!row?.ok)issues.push('OPTION_COVERAGE_INCOMPLETE');
   const c=row?.coverage;
@@ -537,7 +479,7 @@ const finite = x => typeof x === 'number' && Number.isFinite(x);
 const timestamp = x => { const n=typeof x==='number'?x:Date.parse(x); return Number.isFinite(n)?n:NaN; };
 function evaluateOptionEvidence({underlying,options,market,now=Date.now(),marketOpen=false,forwardCertified=false}={}) {
  const reasons=[];
- if(!['NIFTY','SENSEX'].includes(underlying))reasons.push('INVALID_UNDERLYING');
+ if(!['NIFTY'].includes(underlying))reasons.push('INVALID_UNDERLYING');
  if(!marketOpen)reasons.push('MARKET_NOT_OPEN');
  if(!options||options.underlying!==underlying)reasons.push('OPTION_SNAPSHOT_MISSING');
  if(!market||market.underlying!==underlying)reasons.push('INDEX_EVIDENCE_MISSING');
@@ -565,11 +507,11 @@ function evaluateOptionEvidence({underlying,options,market,now=Date.now(),market
   evidenceChecksPassed:reasons.length===0,reasons,limitations:['No validated option premium outcomes or transaction costs','Certification alone never enables production signals','Snapshot evidence cannot prove live executable fills']};
 }
 
-// JANGGO CLOUD v60 | Pretrained-AI research scanner, read-only Angel data, Telegram alerts. No broker orders.
-const {historicalRequest,normalizeAngelCandles} = __modules["angel-data-transport.mjs"];
+// JANGGO CLOUD v60 | Pretrained-AI research scanner, read-only Kotak Neo data, Telegram alerts. No broker orders.
+
 const { assessLiveReadiness } = __modules["live-readiness.mjs"];
 const TZ='Asia/Kolkata';
-const VERSION='janggo-unified-2026-11-11-history-chain-router-v7';
+const VERSION='janggo-kotak-nifty-router-2026-11-25-v8';
 // Scanner failure recovery: clear broker failure stages and avoid repeated master fetches.
 // Shared rounding helper used by scanner, research brain, options and paper lifecycle.
 const round2=x=>Number.isFinite(Number(x))?Math.round((Number(x)+Number.EPSILON)*100)/100:null;
@@ -602,9 +544,8 @@ function batchSafetyAudit(e){
   officialFetchTimestamp:Number.isFinite(fresh)&&fresh<=now+60000&&now-fresh<14*86400000,
   manualDatesValid:manual.every(iso),
   holidayMatchExplainable:!(holiday(e))||manual.includes(today)||!!dates?.includes(today),
-  bseIndependentCalendar:false
  };
- return {version:VERSION,date:today,checks,passed:Object.values(checks).filter(Boolean).length,total:Object.keys(checks).length,session:sessionConfig(e),holidayEvidence:holidayEvidence(e),manualDates:manual.length,officialDates:dates?.length||0,officialTodayMatch:!!dates?.includes(today),manualTodayMatch:manual.includes(today),calendarFetchedAt:cal?.fetchedAt||null,warning:'BSE F&O independent calendar unverified; checks are diagnostics only, never permission to trade.',ordersEnabled:false,productionSignalsVerified:false};
+ return {version:VERSION,date:today,checks,passed:Object.values(checks).filter(Boolean).length,total:Object.keys(checks).length,session:sessionConfig(e),holidayEvidence:holidayEvidence(e),manualDates:manual.length,officialDates:dates?.length||0,officialTodayMatch:!!dates?.includes(today),manualTodayMatch:manual.includes(today),calendarFetchedAt:cal?.fetchedAt||null,warning:'NSE calendar checks are diagnostics only, never permission to trade.',ordersEnabled:false,productionSignalsVerified:false};
 }
 const calendarConfigured=e=>!!autoCalendar(e)?.years?.includes(day().slice(0,4))&&autoCalendar(e)?.source==='NSE_OFFICIAL_FO';
 const calendarKey='calendar:nse:fo:verified';
@@ -687,11 +628,11 @@ const put=async(e,k,v,ttl)=>{
  catch(err){kvWriteSkipped++;kvWriteErrors.push(String(err?.message||err).slice(0,100));return false}
 };
 export const researchEntriesPaused=async e=>combinedNiftyEnabled(e)||(await get(e,'platform:research-paused'))===true;
-const cfg=e=>[...(useNeo(e)?['OPTION_CHAIN']:['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED']),'TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET'].filter(k=>!e[k]);
+const cfg=e=>['OPTION_CHAIN','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET'].filter(k=>!e[k]);
 // Never echo configured credentials into Worker logs or Telegram diagnostics.
 const safeError=(error,env={})=>{
  let message=String(error?.message||error||'unknown error');
- for(const name of ['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET','SMART_CLIENT_MAC','SMART_CLIENT_PUBLIC_IP','SMART_CLIENT_LOCAL_IP']){
+ for(const name of ['NEO_API_TOKEN','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_WEBHOOK_SECRET']){
   const secret=String(env[name]||'');
   if(secret.length>=4)message=message.split(secret).join('[REDACTED]');
  }
@@ -736,140 +677,35 @@ async function telegram(e,message){
  return {delivered:true,parts:ids.length,messageIds:ids};
 }
 
-function totpBytes(s){let n=0,bits=0,a=[];for(const c of String(s).toUpperCase().replace(/[\s=]/g,'')){const v='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(c);if(v<0)throw Error('Invalid TOTP seed');n=(n<<5)|v;bits+=5;if(bits>=8){bits-=8;a.push((n>>>bits)&255)}}if(a.length<10)throw Error('TOTP seed too short');return new Uint8Array(a)}
-async function totp(seed){const k=await crypto.subtle.importKey('raw',totpBytes(seed),{name:'HMAC',hash:'SHA-1'},false,['sign']);const data=new Uint8Array(8);let c=BigInt(Math.floor(Date.now()/30000));for(let i=7;i>=0;i--){data[i]=Number(c&255n);c>>=8n}const s=new Uint8Array(await crypto.subtle.sign('HMAC',k,data));const p=s[19]&15;return String(((((s[p]&127)<<24)|((s[p+1]&255)<<16)|((s[p+2]&255)<<8)|(s[p+3]&255))%1000000)).padStart(6,'0')}
-const angelHeaders=e=>({'Content-Type':'application/json','Accept':'application/json','X-UserType':'USER','X-SourceID':'WEB','X-ClientLocalIP':e.SMART_CLIENT_LOCAL_IP||e.__brokerIdentity?.localIp||'127.0.0.1','X-ClientPublicIP':e.SMART_CLIENT_PUBLIC_IP||e.__brokerIdentity?.publicIp||'127.0.0.1','X-MACAddress':e.SMART_CLIENT_MAC||e.__brokerIdentity?.mac||'00:00:00:00:00:00','X-PrivateKey':e.SMART_API_KEY});
+
+
+
 // Network failures are bounded, classified and retried only for transient conditions.
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 // HTTP retry policy: retry only transport errors, HTTP 429 and HTTP 5xx.
 // Never retry credential rejection or malformed responses as if they were outages.
-async function brokerRequest(url,options,label,{timeoutMs=15000,retries=1,env=null}={}){
- let last;
- for(let attempt=0;attempt<=retries;attempt++){
-  let response;
-  if(env){try{await brokerSlot(env,url.includes('/quote')?'quote':'login');}catch{throw Error(label+' REQUEST_PACING_UNAVAILABLE');}}
-  try{
-   response=await fetch(url,{...options,signal:AbortSignal.timeout(timeoutMs)});
-  }catch(err){
-   last=Error(label+' transport '+(err?.name==='TimeoutError'?'TIMEOUT':String(err?.message||err)).slice(0,110));
-   if(attempt>=retries)break;
-   await sleep(350*(attempt+1));
-   continue;
-  }
-  let payload;
-  try{payload=await response.json()}
-  catch{
-   const status=response.status;
-   const category=status===429?'RATE_LIMITED':status===401||status===403?'ACCESS_DENIED':status>=500?'BROKER_UNAVAILABLE':'NON_JSON_RESPONSE';
-   last=Error(label+' '+category+' HTTP '+status+'; broker did not return JSON');
-   // Access denied is not a transient network failure. Retry only 429/5xx.
-   if((status===429||status>=500)&&attempt<retries){
-    const raw=response.headers?.get?.('Retry-After');
-    const delay=raw!==null&&Number.isFinite(Number(raw))?Math.min(2000,Math.max(0,Number(raw)*1000)):500*(attempt+1);
-    await sleep(delay);continue;
-   }
-   throw last;
-  }
-  if(response.status===429||response.status>=500){
-   last=Error(label+' HTTP '+response.status+': '+String(payload?.message||'broker temporarily unavailable').slice(0,100));
-   if(attempt>=retries)break;
-   const retryAfter=response.headers.get('Retry-After');
-   const seconds=retryAfter===null?NaN:Number(retryAfter);
-   const pause=Number.isFinite(seconds)&&seconds>=0?Math.min(2000,seconds*1000):500*(attempt+1);
-   await sleep(pause);
-   continue;
-  }
-  if(!response.ok||payload?.status!==true){
-   throw Error(label+' HTTP '+response.status+': '+String(payload?.message||payload?.errorcode||'broker rejected request').slice(0,130));
-  }
-  return payload;
- }
- throw last||Error(label+' request failed');
-}
+
 // Isolate-local short session cache reduces duplicate TOTP logins across cron and diagnostics.
 // A failed login never gets cached. Expiry is deliberately conservative.
-let authCache=null, authInFlight=null;
-async function session(e){
- if(useNeo(e))return 'KOTAK_NEO_READ_ONLY';
- const missing=['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED'].filter(x=>!e[x]);
- if(missing.length)throw Error('Missing Angel secrets: '+missing.join(','));
- await hydrateBrokerIdentity(e);
- const identity=String(e.SMART_CLIENT_CODE)+'|'+String(e.SMART_API_KEY);
- if(authCache?.identity===identity&&authCache.until>Date.now())return authCache.jwt;
- if(authInFlight)return authInFlight;
- authInFlight=(async()=>{
-  const x=await brokerRequest('https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword',{
-   method:'POST',headers:angelHeaders(e),body:JSON.stringify({clientcode:e.SMART_CLIENT_CODE,password:e.SMART_PIN,totp:await totp(e.SMART_TOTP_SEED)})
-  },'Angel login',{timeoutMs:16000,retries:1,env:e});
-  if(!x.data?.jwtToken)throw Error('Angel login returned no JWT');
-  authCache={identity,jwt:x.data.jwtToken,until:Date.now()+3*60000};
-  return authCache.jwt;
- })();
- try{return await authInFlight}finally{authInFlight=null}
-}
+
+async function session(){return 'KOTAK_NEO_READ_ONLY';}
 // Broker request input gate: prevent malformed/oversized quote batches.
 function quoteRequestAudit(exchange,tokens){
- const allowed=['NSE','BSE','NFO','BFO','MCX','CDS'];
+ const allowed=['NSE','NFO'];
  const values=Array.isArray(tokens)?tokens:[];
  const unique=[...new Set(values.map(x=>String(x).trim()))];
  const checks={exchangeAllowed:allowed.includes(exchange),tokensArray:Array.isArray(tokens),nonEmpty:unique.length>0,maximumBatch:unique.length<=50,tokenFormat:unique.every(x=>/^\d{1,12}$/.test(x)),noDuplicates:unique.length===values.length};
  return {checks,passed:Object.values(checks).every(Boolean),count:unique.length,normalized:unique};
 }
-async function quotes(e,jwt,exchange,tokens){
- if(useNeo(e))return neoQuotes(e,exchange,tokens);
- const audit=quoteRequestAudit(exchange,tokens);if(!audit.passed)throw Error('QUOTE_REQUEST_INVALID: '+Object.entries(audit.checks).filter(([,ok])=>!ok).map(([k])=>k).join(','));
- const url='https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/';
- const request=token=>({method:'POST',headers:{...angelHeaders(e),Authorization:'Bearer '+token},body:JSON.stringify({mode:'FULL',exchangeTokens:{[exchange]:tokens}})});
- try{const x=await brokerRequest(url,request(jwt),'Angel '+exchange+' quote',{timeoutMs:15000,retries:1,env:e});if(!Array.isArray(x.data?.fetched))throw Error('Angel '+exchange+' quote response missing fetched array');return x.data.fetched}
- catch(err){
-  if(!/401|403|token|jwt|session|unauthoriz/i.test(String(err.message)))throw err;
-  authCache=null;
-  const fresh=await session(e);
-  const x=await brokerRequest(url,request(fresh),'Angel '+exchange+' quote reauth',{timeoutMs:15000,retries:0,env:e});
-  if(!Array.isArray(x.data?.fetched))throw Error('Angel '+exchange+' quote response missing fetched array');return x.data.fetched;
- }
-}
+async function quotes(e,_session,exchange,tokens){return neoQuotes(e,exchange,tokens);}
 // Angel instrument master is public reference data; its availability/schema can change.
-const MASTER='https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json';
+
 function parseExpiry(s){if(!s)return NaN;if(/^\d{4}-\d{2}-\d{2}$/.test(s))return Date.parse(s+'T15:30:00+05:30');const v=Date.parse(s);if(Number.isFinite(v))return v;const m=String(s).toUpperCase().match(/^(\d{1,2})([A-Z]{3})(\d{4})$/);if(!m)return NaN;return Date.parse(`${m[1]} ${m[2]} ${m[3]} 15:30 GMT+0530`)}
 // Cache the FILTERED instrument master, not the multi-megabyte raw master.
 // Cloudflare Cache API avoids an expensive master download on each scheduled scan.
-let masterMemory=null, masterInFlight=null;
-async function instruments(e){
- if(useNeo(e))return neoInstruments(e,await scanIndices(e));
- if(masterInFlight)return masterInFlight;
- masterInFlight=loadInstruments(e);
- try{return await masterInFlight}finally{masterInFlight=null}
-}
-async function loadInstruments(e){
- const now=Date.now();
- if(masterMemory?.at&&now-masterMemory.at<4*3600000)return masterMemory.rows;
- const cache=typeof caches!=='undefined'?caches.default:null;
- const key=new Request('https://janggo-cache.invalid/instruments-v50');
- let stored=null;
- if(cache){try{const hit=await cache.match(key);if(hit)stored=await hit.json()}catch{}}
- if(!stored&&hasKV(e))stored=await get(e,'master:cache');
- if(stored?.rows?.length&&now-stored.at<4*3600000){masterMemory=stored;return stored.rows}
- try{
-  let r;let error;
-  for(let i=0;i<2;i++){
-   try{r=await fetch(MASTER,{signal:AbortSignal.timeout(i?22000:16000)});if(!r.ok)throw Error('HTTP '+r.status);break}
-   catch(err){error=err;if(i===0)await sleep(500)}
-  }
-  if(!r)throw Error('Instrument master fetch: '+String(error?.message||error));
-  const all=await r.json();if(!Array.isArray(all))throw Error('Instrument master schema invalid');
-  const rows=all.filter(x=>['NFO','BFO'].includes(x.exch_seg)&&/^(NIFTY|SENSEX)$/.test(String(x.name||''))&&/^(CE|PE)$/.test(String(x.symbol||'').slice(-2))&&Number.isFinite(parseExpiry(x.expiry))&&parseExpiry(x.expiry)>=now).map(x=>({exchange:x.exch_seg,token:String(x.token),symbol:String(x.symbol),underlying:x.name,expiry:String(x.expiry),strike:Number(x.strike)/100,side:x.symbol.slice(-2),lotsize:Number(x.lotsize||0)})).filter(x=>x.token&&Number.isFinite(x.strike)&&x.strike>0);
-  if(!rows.length)throw Error('No current NIFTY/SENSEX option instruments found');
-  masterMemory={at:now,rows};
-  if(cache){try{await cache.put(key,new Response(JSON.stringify(masterMemory),{headers:{'Cache-Control':'public, max-age=14400','Content-Type':'application/json'}}))}catch(err){log('master cache',err)}}
-  return rows;
- }catch(err){
-  // Stale cached master is usable only for still-valid listed expiries, never expired contracts.
-  const fallback=stored?.rows?.filter(x=>parseExpiry(x.expiry)>=now)||[];
-  if(fallback.length){masterMemory={at:now,rows:fallback};return fallback}
-  throw Error('Instrument master unavailable: '+String(err.message).slice(0,120));
- }
-}
+
+async function instruments(e){return neoInstruments(e,['NIFTY']);}
+
 // Select contracts around the actual underlying reference, never the midpoint of the instrument master.
 // A missing or invalid spot reference blocks selection rather than guessing an ATM strike.
 function select(rows,underlying,spot,max=12){
@@ -884,8 +720,8 @@ function select(rows,underlying,spot,max=12){
 }
 // Reference spot instruments can be overridden if Angel changes index symbols/tokens.
 async function spotReference(e,jwt,name){
- const exchange=name==='NIFTY'?'NSE':'BSE';
- const token=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
+ const exchange='NSE';
+ const token=String(e.NIFTY_SPOT_TOKEN||'99926000');
  const data=await quotes(e,jwt,exchange,[token]);
  const q=data.find(x=>String(x.symbolToken??x.symboltoken??x.symbol_token??x.token)===token);
  const value=num(q?.ltp);
@@ -1269,7 +1105,7 @@ async function forwardAudit(e){
 }
 
 // Price-based observations only: quote snapshots do not establish a validated trade setup.
-// Read-only scan checks both indices and all selected option quotes without consuming KV writes.
+// Read-only scan checks NIFTY and all selected option quotes without consuming KV writes.
 // It does NOT pretend to produce independently verified buy/sell signals.
 async function scanQuotesOnly(e){
  if(!marketOpen(e))return {version:VERSION,mode:'MARKET_CLOSED',reason:sessionConfig(e).reason||'Outside trading hours',contracts:0,quoted:0};
@@ -1455,7 +1291,7 @@ async function pipelineTriage(e){
    caution:'Snapshot filters are not independently validated trading strategies; do not loosen solely to generate alerts.'},
   verificationBlockers:{historicalCandles:'CHECK_MARKETINTEL_SEPARATELY',greeks:'INDEPENDENT_VERIFICATION_REQUIRED',
    news:'INDEPENDENT_VERIFICATION_REQUIRED',optionPremiumBacktest:'INDEPENDENT_FORWARD_EVIDENCE_REQUIRED',
-   telegramSignalLifecycle:'LIVE_END_TO_END_RECEIPT_REQUIRED',bseFoCalendar:'INDEPENDENT_BSE_VERIFICATION_REQUIRED'},
+   telegramSignalLifecycle:'LIVE_END_TO_END_RECEIPT_REQUIRED'},
   experimentalAlertsSent:r?.directionalAlertsSent||0,experimentalAlertsSkipped:r?.directionalAlertsSkipped||null,
   note:'Read-only diagnostics; historical state is not proof of live market data or a validated trade signal.',ordersEnabled:false};
 }
@@ -1485,7 +1321,7 @@ function phase3ObservationAudit(rows,tfMinutes,now=Date.now()){
 }
 async function phase3CandleStatus(e){
  const state=await get(e,`rolling:${day()}`)||{};const out={version:VERSION,at:new Date().toISOString(),source:'PHASE3_PORT_OBSERVATION_AUDIT',historicalApi403Bypassed:false,verifiedCandles:false,ordersEnabled:false,indices:{}};
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   const rows=state['spot:'+index]||[];
   out.indices[index]={observations:rows.length,timeframes:Object.fromEntries([1,3,5,15].map(tf=>[tf+'m',phase3ObservationAudit(rows,tf)]))};
  }
@@ -1499,10 +1335,10 @@ async function scan(e,{send=true}={}){
  // Fetch independent login and instrument metadata concurrently to reduce cold-start latency.
  // allSettled prevents an unhandled rejection when either source fails.
  const [authResult,masterResult]=await Promise.allSettled([session(e),instruments(e)]);
- if(authResult.status==='rejected')result.issues.push('Angel login: '+String(authResult.reason?.message||authResult.reason).slice(0,140));
+ if(authResult.status==='rejected')result.issues.push('Broker session: '+String(authResult.reason?.message||authResult.reason).slice(0,140));
  if(masterResult.status==='rejected')result.issues.push('Instrument master: '+String(masterResult.reason?.message||masterResult.reason).slice(0,140));
  if(result.issues.length){
-  result.failureStage=authResult.status==='rejected'?'ANGEL_AUTH':'INSTRUMENT_MASTER';
+  result.failureStage=authResult.status==='rejected'?'BROKER_DATA':'INSTRUMENT_MASTER';
   result.scanHealthy=false;result.scanSummarySaved=await put(e,'scan:last',result,86400);return result;
  }
  const jwt=authResult.value,all=masterResult.value;
@@ -1552,7 +1388,7 @@ async function scan(e,{send=true}={}){
   }catch(err){result.issues.push(name+': '+String(err.message).slice(0,160));result.indices[name]={status:'FAILED',reason:String(err.message).slice(0,160),contracts:0,quoted:0,fresh:0}}
  }
  const alertClaims=await get(e,'directional-alerts:'+day());
- const activePaper=Object.fromEntries(await Promise.all(['NIFTY','SENSEX'].map(async index=>[index,await get(e,'research:paper:position:'+day()+':'+index)])));
+ const activePaper=Object.fromEntries(await Promise.all(['NIFTY'].map(async index=>[index,await get(e,'research:paper:position:'+day()+':'+index)])));
  result.strategyWatches=result.strategyWatches.filter(w=>researchAlertCapacity(alertClaims,w.underlying,now,w.signalId,activePaper[w.underlying]));
  result.entryPolicy=RESEARCH_ENTRY_POLICY;
  // One grounded pretrained-AI inference per scan. A second independent inference
@@ -1609,7 +1445,7 @@ async function scan(e,{send=true}={}){
  // Mandatory independent evidence gate. Cached historical index candles alone
  // cannot certify an option-premium entry; news and Greeks must not be invented.
  // The research scanner and WAIT diagnostics continue running while alerts are blocked.
- const readiness=await Promise.all(['NIFTY','SENSEX'].map(n=>pipelineReadiness(e,n)));
+ const readiness=await Promise.all(['NIFTY'].map(n=>pipelineReadiness(e,n)));
  result.evidenceReadiness=Object.fromEntries(readiness.map(r=>[r.index,r.checks]));
  if(readiness.some(r=>!r.allVerified)){
    // User explicitly requested experimental directional alerts. Do not claim production validation.
@@ -1652,7 +1488,7 @@ function evaluateSnapshotStrategy(input){return strongSnapshotEvidence(input);}
 async function scanStatus(e){
  const last=await get(e,'scan:last');
  const ageMinutes=last?.at?Math.round((Date.now()-Date.parse(last.at))/60000):null;
- return {version:VERSION,ist:day()+' '+clock(),calendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),cron:'*/3 3-11 * * * (UTC); market-session gated',calendarSource:autoCalendar(e)?.source||'UNVERIFIED',calendarFetchedAt:autoCalendar(e)?.fetchedAt||null,calendarCurrentYearCovered:!!autoCalendar(e)?.years?.includes(day().slice(0,4)),scanExpectedNow:marketOpen(e),lastCronTrigger:await get(e,'cron:last-trigger'),lastCalendarRefresh:await get(e,calendarAuditKey),lastScan: last||null,lastScanAgeMinutes:ageMinutes,scanRecent:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6,scanHealthy:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6&&!!last&&last.contracts>0&&last.quoted===last.contracts&&last.quoteFresh===last.quoted&&!last.issues?.length&&last.kvStateSaved===true&&last.scanSummarySaved===true,brokerQuotesVerifiedInScheduledScan:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6&&!!last&&last.contracts>0&&last.quoted===last.contracts&&last.quoteFresh===last.quoted,kvStateSaved:last?.kvStateSaved??null,kvSummarySaved:last?.scanSummarySaved??null,issues:[...(last?.issues||[]),...(!calendarConfigured(e)?['VERIFIED_NSE_FO_CALENDAR_MISSING']:[]),'BSE_FO_CALENDAR_NOT_INDEPENDENTLY_VERIFIED'],verifiedBuySellSignals:false,ordersPlaced:false};
+ return {version:VERSION,ist:day()+' '+clock(),calendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),cron:'*/3 3-11 * * * (UTC); market-session gated',calendarSource:autoCalendar(e)?.source||'UNVERIFIED',calendarFetchedAt:autoCalendar(e)?.fetchedAt||null,calendarCurrentYearCovered:!!autoCalendar(e)?.years?.includes(day().slice(0,4)),scanExpectedNow:marketOpen(e),lastCronTrigger:await get(e,'cron:last-trigger'),lastCalendarRefresh:await get(e,calendarAuditKey),lastScan: last||null,lastScanAgeMinutes:ageMinutes,scanRecent:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6,scanHealthy:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6&&!!last&&last.contracts>0&&last.quoted===last.contracts&&last.quoteFresh===last.quoted&&!last.issues?.length&&last.kvStateSaved===true&&last.scanSummarySaved===true,brokerQuotesVerifiedInScheduledScan:ageMinutes!==null&&ageMinutes>=0&&ageMinutes<=6&&!!last&&last.contracts>0&&last.quoted===last.contracts&&last.quoteFresh===last.quoted,kvStateSaved:last?.kvStateSaved??null,kvSummarySaved:last?.scanSummarySaved??null,issues:[...(last?.issues||[]),...(!calendarConfigured(e)?['VERIFIED_NSE_FO_CALENDAR_MISSING']:[]),...[]],verifiedBuySellSignals:false,ordersPlaced:false};
 }
 async function ai(e,text){if(sharedBudgetEnabled(e))return 'AI quota is reserved for qualifying trading reviews. General AI chat is disabled in this free session mode. /status and /paper remain available without AI.';if(!e.AI)return 'AI binding missing';try{const r=await e.AI.run(aiModel(e),{messages:[{role:'system',content:'You are Janggo, a helpful Hinglish research assistant. You have no live quotes or verified news in this conversation. Do not invent prices, trades, win rates or current events. No order placement.'},{role:'user',content:String(text).slice(0,3000)}],max_tokens:450});return String(r.response||'No AI response')}catch(err){log('AI',err);return 'AI unavailable; check Cloudflare model catalog and logs.'}}
 
@@ -1762,7 +1598,7 @@ async function discover(e){
  const id='discovery:'+Date.now()+':'+crypto.randomUUID().slice(0,8);
  await put(e,id,proposal,86400*90);await put(e,'discovery:index',[...index,id].slice(-50),86400*90);
  const result={at:Date.now(),id,proposal};await put(e,'discovery:last',result,6*3600);
- return {stored:true,...result,warning:'AI hypothesis only. Use /validate nifty or /validate sensex for limited index-only research proxy backtests. No strategy promotion or trading signal.'};
+ return {stored:true,...result,warning:'AI hypothesis only. Use /validate nifty for limited index-only research proxy backtests. No strategy promotion or trading signal.'};
 }
 // Autonomous research scheduler: bounded, resumable and fail-closed. It does not
 // equate an index-only proxy with an option strategy or authorize live signals.
@@ -1778,7 +1614,7 @@ async function autonomousResearchCycle(e){
   const proposed=await discover(e);
   result.stages.push({name:'AI_DISCOVERY',status:proposed.stored?'STORED':proposed.duplicate?'DUPLICATE':'CACHED',id:proposed.id||null});
  }catch(err){result.stages.push({name:'AI_DISCOVERY',status:'FAILED',reason:String(err.message||err).slice(0,120)})}
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   try{
    const validated=await validateHypotheses(e,index);
    result.stages.push({name:'HISTORICAL_PROXY_'+index,status:'COMPLETED',tested:validated.tested||0,optionPremiumValidated:false});
@@ -1835,41 +1671,15 @@ async function parseHistoricalResponse(response, label){
  }
  return data;
 }
-// Single bounded compatibility fallback for Angel One historical date formatting.
+// Single bounded compatibility fallback for Kotak Neo historical date formatting.
 // Never retry auth/permission errors with a changed payload, and never invent bars.
-async function fetchHistoricalWindow(e,jwt,{exchange,symboltoken,interval,fromdate,todate,label}){
- if(useNeo(e))return neoHistoryWindow(e,{exchange,symboltoken,interval,fromdate,todate});
- const url='https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
- const headers={...angelHeaders(e),Authorization:'Bearer '+jwt};
- const request=(from,to)=>historicalRequest(url,{method:'POST',headers,
-  body:JSON.stringify({exchange,symboltoken,interval,fromdate:from,todate:to})},
-  {label,retries:0,beforeRequest:()=>brokerSlot(e,'history')});
- const from=fromdate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1'),to=todate.replace(/(\d{2}:\d{2}):\d{2}$/,'$1');
- try{return await request(from,to)}catch(err){
-  if(err?.code==='RATE_LIMITED'&&e.OPTION_CHAIN)await chainCommand(e,'broker-cooldown',{kind:'history'}).catch(()=>{});
-  if(!/HTTP 400|BAD_REQUEST/.test(String(err?.message||err))||(from===fromdate&&to===todate))throw err;
-  return request(fromdate,todate);
- }
-}
+async function fetchHistoricalWindow(e,_session,options){return neoHistoryWindow(e,options);}
 
-async function historicalProbe(e,name){
- const at=Date.now(),date=istDateTime(new Date()).slice(0,10),exchange=name==='SENSEX'?'BSE':'NSE';
- const token=String(name==='SENSEX'?(e.SENSEX_SPOT_TOKEN||'99919000'):(e.NIFTY_SPOT_TOKEN||'99926000'));
- const result={version:VERSION,index:name,at:new Date(at).toISOString(),ordersEnabled:false,
-  identityMetadata:{publicIpConfigured:!!e.SMART_CLIENT_PUBLIC_IP,macConfigured:!!e.SMART_CLIENT_MAC},
-  pacing:e.OPTION_CHAIN?'SHARED_D1_COORDINATOR':'ISOLATE_LOCAL_ONLY'};
- try{
-  const jwt=await session(e);
-  result.identityMetadata={publicIpConfigured:!!(e.SMART_CLIENT_PUBLIC_IP||e.__brokerIdentity?.publicIp),macConfigured:!!(e.SMART_CLIENT_MAC||e.__brokerIdentity?.mac)};
-  const data=await fetchHistoricalWindow(e,jwt,{exchange,symboltoken:token,interval:'ONE_MINUTE',fromdate:date+' 09:15:00',todate:date+' 09:20:00',label:'BOUNDED_HISTORY_PROBE'});
-  const candles=normalizeAngelCandles(data.data,{intervalMs:60000});
-  return {...result,status:candles.length?'CANDLES_RETURNED':'EMPTY_BROKER_WINDOW',candles:candles.length,firstAt:candles[0]?new Date(candles[0].t).toISOString():null,lastAt:candles.at(-1)?new Date(candles.at(-1).t).toISOString():null};
- }catch(err){return {...result,status:'UNAVAILABLE',diagnostic:safeError(err,e).slice(0,200)};}
-}
+async function historicalProbe(e,name){if(name!=='NIFTY')return {status:'UNSUPPORTED_INDEX',index:name,ordersEnabled:false};const date=day();try{const data=await neoHistoryWindow(e,{exchange:'NSE',symboltoken:String(e.NIFTY_SPOT_TOKEN||'99926000'),interval:'ONE_MINUTE',fromdate:date+' 09:15:00',todate:date+' 09:20:00'}),candles=normalizeBrokerCandles(data.data,{intervalMs:60000});return {version:VERSION,index:name,provider:'KOTAK_NEO',at:new Date().toISOString(),status:candles.length?'CANDLES_RETURNED':'EMPTY_BROKER_WINDOW',candles:candles.length,firstAt:candles[0]?new Date(candles[0].t).toISOString():null,lastAt:candles.at(-1)?new Date(candles.at(-1).t).toISOString():null,ordersEnabled:false};}catch(error){return {status:'UNAVAILABLE',diagnostic:safeError(error,e),ordersEnabled:false};}}
 
 async function historicalCandles(e,jwt,name,days=7){
- const exchange=name==='NIFTY'?'NSE':'BSE';
- const symboltoken=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
+ const exchange='NSE';
+ const symboltoken=String(e.NIFTY_SPOT_TOKEN||'99926000');
  // Avoid large multi-day broker requests; only request valid IST market windows.
  const end=new Date(), all=[];
  for(let offset=Math.min(7,Math.max(1,days))-1;offset>=0;offset--){
@@ -1883,12 +1693,12 @@ async function historicalCandles(e,jwt,name,days=7){
   if(offset>0)await new Promise(resolve=>setTimeout(resolve,650));
  }
  if(!all.length)throw Error('NO_HISTORICAL_CANDLES_RETURNED');
- return normalizeAngelCandles(all,{intervalMs:300000});
+ return normalizeBrokerCandles(all,{intervalMs:300000});
 }
 // v19: read-only index candle intelligence. No orders and no trading signal promotion.
 async function minuteCandles(e,jwt,name,days=7){
- const exchange=name==='NIFTY'?'NSE':'BSE';
- const symboltoken=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
+ const exchange='NSE';
+ const symboltoken=String(e.NIFTY_SPOT_TOKEN||'99926000');
  // Query each IST calendar day separately. Large 1-minute ranges can be rejected
  // by the broker; never silently synthesize missing historical bars.
  const end=new Date(), maxDays=Math.max(1,Math.min(7,days));
@@ -1905,7 +1715,7 @@ async function minuteCandles(e,jwt,name,days=7){
   if(offset>0)await new Promise(resolve=>setTimeout(resolve,650));
  }
  if(!all.length)throw new Error('NO_HISTORICAL_CANDLES_RETURNED');
- return normalizeAngelCandles(all,{intervalMs:60000});
+ return normalizeBrokerCandles(all,{intervalMs:60000});
 }
 // Only broker-provided, closed, consecutive 1-minute bars may form higher frames.
 // Exchange session starts at 09:15 IST. No cross-session or gap-filled bars.
@@ -1959,7 +1769,7 @@ async function liveObservationEvidence(e,name){
 async function marketIntelligence(e,name){
  const failureKey='marketintel:error:'+name;
  const previous=await get(e,failureKey);
- if(previous?.transportVersion==='history-router-v7' && Number(previous.retryAfter||0)>Date.now())return {version:VERSION,underlying:name,status:'HISTORICAL_BACKOFF',historicalError:previous.message,historicalApiState:'CIRCUIT_OPEN',historicalRecovery:'Check Angel One historical API entitlement, credentials and permitted outbound IP; live REST quote success does not establish historical permission.',retryAfter:new Date(previous.retryAfter).toISOString(),fallback:await liveObservationEvidence(e,name),signalEligible:false,ordersPlaced:false};
+ if(previous?.transportVersion==='history-router-v7' && Number(previous.retryAfter||0)>Date.now())return {version:VERSION,underlying:name,status:'HISTORICAL_BACKOFF',historicalError:previous.message,historicalApiState:'CIRCUIT_OPEN',historicalRecovery:'Check Kotak Neo historical API entitlement, credentials and permitted outbound IP; live REST quote success does not establish historical permission.',retryAfter:new Date(previous.retryAfter).toISOString(),fallback:await liveObservationEvidence(e,name),signalEligible:false,ordersPlaced:false};
  let rows;
  try{const jwt=await session(e);rows=await minuteCandles(e,jwt,name)}catch(err){
   const message=String(err?.message||err).slice(0,220);
@@ -1970,7 +1780,7 @@ async function marketIntelligence(e,name){
   // Suppress repeat historical requests for 30 minutes; REST quotes remain independent.
   const delay=isDenied?1800000:isBadRequest?600000:isLimited?300000:60000;
   await put(e,failureKey,{message,transportVersion:'history-router-v7',at:new Date().toISOString(),retryAfter:Date.now()+delay},86400*2);
-  return {version:VERSION,underlying:name,status:'HISTORICAL_UNAVAILABLE',historicalError:message,historicalApiState:isDenied?'PERMISSION_OR_AUTH_BLOCKED':isLimited?'RATE_LIMITED':'TEMPORARILY_UNAVAILABLE',historicalRecovery:isDenied?'Check Angel One historical API entitlement and IP restrictions; do not retry every cron.':'Retry only after backoff; do not synthesize candles.',retryAfter:new Date(Date.now()+delay).toISOString(),fallback:await liveObservationEvidence(e,name),signalEligible:false,ordersPlaced:false};
+  return {version:VERSION,underlying:name,status:'HISTORICAL_UNAVAILABLE',historicalError:message,historicalApiState:isDenied?'PERMISSION_OR_AUTH_BLOCKED':isLimited?'RATE_LIMITED':'TEMPORARILY_UNAVAILABLE',historicalRecovery:isDenied?'Check Kotak Neo historical API entitlement and IP restrictions; do not retry every cron.':'Retry only after backoff; do not synthesize candles.',retryAfter:new Date(Date.now()+delay).toISOString(),fallback:await liveObservationEvidence(e,name),signalEligible:false,ordersPlaced:false};
  }
 const result=buildMarketIntelligence(name,rows);await put(e,'marketintel:'+name,{at:Date.now(),...result},86400);return result}
 
@@ -1978,7 +1788,7 @@ const result=buildMarketIntelligence(name,rows);await put(e,'marketintel:'+name,
 function buildMarketIntelligence(name,rows){return {version:VERSION,underlying:name,source:'Broker-provided ONE_MINUTE historical index candles',observations:rows.length,frames:[1,3,5,15].map(tf=>frameIntelligence(rows,tf)),signalEligible:false,ordersPlaced:false,limitations:['Historical index data only, not option CE/PE candles','Latest incomplete timeframe candles excluded','Broker historical feed may be delayed, rate-limited or unavailable','No option-chain OI, Greeks, PCR or verified news confluence','Indicators are descriptive, not validated buy/sell signals']};}
 async function refreshScheduledCandleEvidence(e){
  if(!marketOpen(e)||!e.PAPER_COORDINATOR)return {status:'SKIPPED'};
- const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName(useNeo(e)?'janggo-history-cache-kotak-v1':'janggo-history-cache-v1'));
+ const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName('janggo-history-cache-kotak-v1'));
  
  const jwt=await session(e),now=Date.now(),date=day(),schedule=sessionConfig(e);
  return refreshCandleEvidence({now,day:date,enabledIndices:entryUniverse(e),
@@ -1986,8 +1796,8 @@ async function refreshScheduledCandleEvidence(e){
   writeCache:async cache=>{const r=await requestCandleCache(e,stub,'cache-write',cache);if(!r.ok)throw Error('CANDLE_CACHE_SAVE_FAILED');},
   seed:index=>minuteCandles(e,jwt,index,7),
   today:async index=>{
-   const result=await fetchHistoricalWindow(e,jwt,{exchange:index==='NIFTY'?'NSE':'BSE',symboltoken:String(index==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000')),interval:'ONE_MINUTE',fromdate:date+' '+schedule.open+':00',todate:istDateTime(new Date(now))<date+' '+schedule.close+':00'?istDateTime(new Date(now)):date+' '+schedule.close+':00',label:'CURRENT_SESSION_CANDLES'});
-   return normalizeAngelCandles(result.data,{intervalMs:60000,now});
+   const result=await fetchHistoricalWindow(e,jwt,{exchange:'NSE',symboltoken:String(e.NIFTY_SPOT_TOKEN||'99926000'),interval:'ONE_MINUTE',fromdate:date+' '+schedule.open+':00',todate:istDateTime(new Date(now))<date+' '+schedule.close+':00'?istDateTime(new Date(now)):date+' '+schedule.close+':00',label:'CURRENT_SESSION_CANDLES'});
+   return normalizeBrokerCandles(result.data,{intervalMs:60000,now});
   },analyse:buildMarketIntelligence,saveEvidence:(index,result)=>put(e,'marketintel:'+index,result,86400),safeError:error=>safeError(error,e)});
 }
 
@@ -2035,15 +1845,15 @@ function tenHistoricalChecks(rows,name){
 }
 async function unifiedResearchBatch(e){
  const report={version:VERSION,at:new Date().toISOString(),mode:'READ_ONLY_RESEARCH_BATCH',ordersPlaced:false,productionSignalsVerified:false,indices:{}};
- const results=await Promise.allSettled(['NIFTY','SENSEX'].map(async name=>{
+ const results=await Promise.allSettled(['NIFTY'].map(async name=>{
   const jwt=await session(e),rows=await historicalCandles(e,jwt,name,7);
   return tenHistoricalChecks(rows,name);
  }));
  for(let i=0;i<2;i++){
-  const name=['NIFTY','SENSEX'][i],r=results[i];
+  const name=['NIFTY'][i],r=results[i];
   report.indices[name]=r.status==='fulfilled'?r.value:{status:'BROKER_HISTORY_UNAVAILABLE',error:String(r.reason?.message||r.reason).slice(0,180),checksPassed:0};
  }
- report.next='Use /backtest nifty or /backtest sensex for existing index-only benchmark; /forwardaudit for independent forward-test readiness.';
+ report.next='Use /backtest nifty for existing index-only benchmark; /forwardaudit for independent forward-test readiness.';
  return report;
 }
 async function backtestResearch(e,name){
@@ -2054,7 +1864,7 @@ async function backtestResearch(e,name){
  // Split on chronological candle boundary, with indicator warmup in holdout.
  const train=benchmarkTrades(candles.slice(0,split));
  const holdout=benchmarkTrades(candles.slice(Math.max(0,split-22))).filter(t=>t.entryAt>=candles[split].t);
- const result={version:VERSION,at:new Date().toISOString(),underlying:name,source:useNeo(e)?'Kotak Neo historical 5-minute index candles':'Angel One historical 5-minute index candles',candles:candles.length,train:summarizeTrades(train),holdout:summarizeTrades(holdout),strategy:'EMA9/EMA21 bullish crossover; next-bar open; 0.4% stop; 0.8% target; max 12 bars',eligibleForSignals:false,limitations:['Underlying index only, NOT CE/PE premium or option Greeks','One illustrative fixed benchmark, NOT autonomous AI strategy validation','No fees, slippage, bid/ask, fills, or market impact','7 calendar days only; too short for statistically reliable inference','Intrabar stop-first assumption; no orders placed']};
+ const result={version:VERSION,at:new Date().toISOString(),underlying:name,source:'Kotak Neo historical 5-minute index candles',candles:candles.length,train:summarizeTrades(train),holdout:summarizeTrades(holdout),strategy:'EMA9/EMA21 bullish crossover; next-bar open; 0.4% stop; 0.8% target; max 12 bars',eligibleForSignals:false,limitations:['Underlying index only, NOT CE/PE premium or option Greeks','One illustrative fixed benchmark, NOT autonomous AI strategy validation','No fees, slippage, bid/ask, fills, or market impact','7 calendar days only; too short for statistically reliable inference','Intrabar stop-first assumption; no orders placed']};
  await put(e,'backtest:'+name,result,86400*7);return result;
 }
 
@@ -2119,7 +1929,7 @@ async function validateHypotheses(e,name){
   const audit=await recordValidationAudit(e,name,result,splitTime,candles);
   results.push({...result,auditDuplicate: audit.duplicate,independentForwardTests:0});
  }
- return {version:VERSION,at:new Date().toISOString(),underlying:name,candles:candles.length,source:useNeo(e)?'Kotak Neo historical index 5-minute candles':'Angel One historical index 5-minute candles',tested:results.length,results,autoPromotion:false,ordersPlaced:false,limitations:['AI prose is NOT executed; only strictly allowlisted proxy strategies are evaluated','Underlying index only, not option premium, OI or Greeks','Seven calendar days, potentially too few samples','Fixed stop 0.4%, target 0.8%, max 12 bars; no costs, slippage or fills','Chronological 70/30 holdout with warmup; exploratory research, not statistically verified','No automatic signal activation']};
+ return {version:VERSION,at:new Date().toISOString(),underlying:name,candles:candles.length,source:'Kotak Neo historical index 5-minute candles',tested:results.length,results,autoPromotion:false,ordersPlaced:false,limitations:['AI prose is NOT executed; only strictly allowlisted proxy strategies are evaluated','Underlying index only, not option premium, OI or Greeks','Seven calendar days, potentially too few samples','Fixed stop 0.4%, target 0.8%, max 12 bars; no costs, slippage or fills','Chronological 70/30 holdout with warmup; exploratory research, not statistically verified','No automatic signal activation']};
 }
 
 
@@ -2145,7 +1955,7 @@ async function recordValidationAudit(e,underlying,result,splitTime,candles){
 // not a forward result and cannot activate production signals.
 async function forwardRegister(e,underlying,id){
  if(!hasKV(e))return {ok:false,error:'KV binding unavailable'};
- if(!['NIFTY','SENSEX'].includes(underlying))return {ok:false,error:'Unsupported index'};
+ if(!['NIFTY'].includes(underlying))return {ok:false,error:'Unsupported index'};
  if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid hypothesis id'};
  const proposal=await get(e,id);
  if(!proposal)return {ok:false,error:'Hypothesis not found in KV'};
@@ -2189,7 +1999,7 @@ async function forwardRegistry(e){
 // This is a research evidence trail, NOT a strategy backtest, option fill, or trading signal.
 async function forwardObserve(e,underlying,id){
  if(!hasKV(e))return {ok:false,error:'KV unavailable'};
- if(!['NIFTY','SENSEX'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid registration parameters'};
+ if(!['NIFTY'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid registration parameters'};
  const reg=await get(e,`forward:registration:${underlying}:${id}`);
  if(!reg)return {ok:false,error:'Forward registration required'};
  const proposal=await get(e,id);
@@ -2262,7 +2072,7 @@ function forwardEvaluate(rows,spec,registeredAt,now=Date.now()){
  return {ok:true,closedIndexCandles:candles.length,completedProxyTrades:trades.length,winRatePct:trades.length?+(100*winners.length/trades.length).toFixed(2):null,profitFactor:loss>0?+(profit/loss).toFixed(3):null,grossTotalPct:+equity.toFixed(4),maxDrawdownGrossPct:+maxDrawdown.toFixed(4),gapsSkipped:gaps,trades:trades.slice(-30),eligibleForSignals:false,approved:false,forwardEvidenceOnly:true,limitations:['INDEX proxy only; not CE/PE option premiums','No brokerage, taxes, spread, slippage or live fills','Missing candles and overnight gaps excluded','Not independent proof of profitability','No automatic strategy promotion or order execution']};
 }
 async function forwardPerformance(e,underlying,id){
- if(!['NIFTY','SENSEX'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid parameters'};
+ if(!['NIFTY'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid parameters'};
  const reg=await get(e,`forward:registration:${underlying}:${id}`);
  if(!reg)return {ok:false,error:'Registration required'};
  const proposal=await get(e,id),audit=await get(e,`audit:${underlying}:${id}`);
@@ -2277,7 +2087,7 @@ async function forwardAutoCollect(e){
  if(!Array.isArray(keys))return {error:'Invalid registry'};
  const active=[];
  for(const key of keys.slice(-20)){
-  const m=/^forward:registration:(NIFTY|SENSEX):(hypothesis:[a-zA-Z0-9:_-]{1,100})$/.exec(key);
+  const m=/^forward:registration:(NIFTY):(hypothesis:[a-zA-Z0-9:_-]{1,100})$/.exec(key);
   if(m)active.push({underlying:m[1],id:m[2]});
  }
  const results=[];
@@ -2292,7 +2102,7 @@ async function forwardAutoCollect(e){
 }
 
 async function forwardObservations(e,underlying,id){
- if(!['NIFTY','SENSEX'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid parameters'};
+ if(!['NIFTY'].includes(underlying)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(id))return {ok:false,error:'Invalid parameters'};
  const reg=await get(e,`forward:registration:${underlying}:${id}`);
  if(!reg)return {ok:false,error:'Not registered'};
  const ledger=await get(e,`forward:observations:${underlying}:${id}`);
@@ -2353,14 +2163,14 @@ function chainMetrics(rows){
 }
 function brokerGreek(q,k){const fields=q.greeks??q.optionGreeks??{};const raw=fields[k]??q[k];if(raw===null||raw===undefined||raw==='')return null;const v=Number(raw);return Number.isFinite(v)?v:null}
 async function optionsIntelligence(e,name){
- if(!['NIFTY','SENSEX'].includes(name))throw Error('Unsupported index');
+ if(!['NIFTY'].includes(name))throw Error('Unsupported index');
  if(!marketOpen(e))return {status:'MARKET_CLOSED',marketOpen:false,version:VERSION};
  const jwt=await session(e),spot=await spotReference(e,jwt,name),all=await instruments(e),cs=select(all,name,spot.value,24);
  const groups={};for(const c of cs)(groups[c.exchange]??=[]).push(c.token);
  const data=[];for(const [exchange,tokens] of Object.entries(groups))for(let i=0;i<tokens.length;i+=50)data.push(...await quotes(e,jwt,exchange,tokens.slice(i,i+50)));
  const map=new Map(data.map(q=>[String(q.symbolToken??q.symboltoken??q.symbol_token??q.token),q]));
  const chain=[];for(const c of cs){const q=map.get(c.token);if(!q)continue;const v=quoteQuality(q);chain.push({exchange:'NFO',token:String(c.token),lotSize:Number.isInteger(Number(c.lotSize))&&Number(c.lotSize)>0?Number(c.lotSize):null,quoteAt:q.exchFeedTime??q.exchangeTime??q.timestamp??null,symbol:c.symbol,side:c.side,strike:c.strike,expiry:c.expiry,ltp:Number.isFinite(v.price)?v.price:null,oi:v.oi,volume:Number.isFinite(v.volume)?v.volume:null,spreadPct:v.spreadPct,fresh:v.state,delta:brokerGreek(q,'delta'),gamma:brokerGreek(q,'gamma'),theta:brokerGreek(q,'theta'),vega:brokerGreek(q,'vega')})}
- const metrics=chainMetrics(chain);const report={version:VERSION,at:new Date().toISOString(),underlying:name,spot:spot.value,spotSource:spot.source??(useNeo(e)?'Kotak Neo':'Angel One'),metrics,chain,greeksCoverage:chain.filter(x=>x.delta!==null&&x.gamma!==null&&x.theta!==null&&x.vega!==null).length,signalEligible:false,ordersPlaced:false,notes:['Broker Greeks are optional; null means not supplied, never inferred','Limited near-spot strike selection, not full chain','Research only: no validated buy/sell recommendation','Data is a snapshot, not a real-time streaming feed']};
+ const metrics=chainMetrics(chain);const report={version:VERSION,at:new Date().toISOString(),underlying:name,spot:spot.value,spotSource:spot.source??('Kotak Neo'),metrics,chain,greeksCoverage:chain.filter(x=>x.delta!==null&&x.gamma!==null&&x.theta!==null&&x.vega!==null).length,signalEligible:false,ordersPlaced:false,notes:['Broker Greeks are optional; null means not supplied, never inferred','Limited near-spot strike selection, not full chain','Research only: no validated buy/sell recommendation','Data is a snapshot, not a real-time streaming feed']};
  await put(e,'options:'+name,{...report,at:Date.now()},900);return report;
 }
 function headlineRisk(items){const risk=/(war|attack|tariff|sanction|inflation|rate hike|crash|emergency|geopolitical|conflict|oil spike)/i;const count=items.filter(x=>risk.test(x.title)).length;return {riskKeywordMatches:count,flag:count?'HEADLINE_RISK_REVIEW':'NO_KEYWORD_MATCH',warning:'Keyword screening is NOT article verification, a complete economic calendar or predictive sentiment'};}
@@ -2425,11 +2235,11 @@ async function marketDataProbe(e,existingJwt=null){
  const report={version:VERSION,checkedAt:new Date().toISOString(),ordersPlaced:false,indices:{},allPassed:false};
  let jwt;try{jwt=existingJwt||await session(e)}catch(err){report.error='Angel authentication: '+String(err.message).slice(0,180);return report}
  let master;try{master=await instruments(e)}catch(err){report.error='Instrument master: '+String(err.message).slice(0,180);return report}
- for(const name of ['NIFTY','SENSEX']){
+ for(const name of ['NIFTY']){
   const row={ok:false,underlying:name};report.indices[name]=row;
   try{
-   const ex=name==='NIFTY'?'NSE':'BSE';
-   const tok=String(name==='NIFTY'?(e.NIFTY_SPOT_TOKEN||'99926000'):(e.SENSEX_SPOT_TOKEN||'99919000'));
+   const ex='NSE';
+   const tok=String(e.NIFTY_SPOT_TOKEN||'99926000');
    const raw=(await quotes(e,jwt,ex,[tok])).find(x=>String(x.symbolToken??x.symboltoken??x.symbol_token??x.token)===tok);
    if(raw){row.spotDiagnostic={exchange:ex,token:tok,ltp:Number(raw.ltp),timestampFields:{exchFeedTime:raw.exchFeedTime??null,exchTradeTime:raw.exchTradeTime??null,exchangeTime:raw.exchangeTime??null,lastTradeTime:raw.lastTradeTime??null,last_traded_time:raw.last_traded_time??null},freshness:quoteTimestamp(raw)};}
    const spot=await spotReference(e,jwt,name);row.spot=spot.value;
@@ -2476,13 +2286,13 @@ async function systemDiagnostics(e){
 
 // V116 combined read-only audit; each module fails independently.
 async function batchAudit(e,probe=false){
- const names=['NIFTY','SENSEX'];
+ const names=['NIFTY'];
  const jobs=await Promise.allSettled([systemDiagnostics(e),scanStatus(e),newsDigest(e),forwardAudit(e),paperReport(e),...names.map(n=>pipelineReadiness(e,n))]);
  const v=i=>jobs[i].status==='fulfilled'?jobs[i].value:{error:String(jobs[i].reason?.message||jobs[i].reason).slice(0,180)};
  const news=v(2);
  const result={version:VERSION,at:new Date().toISOString(),mode:'READ_ONLY_MULTI_MODULE_AUDIT',
   calendar:{configured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),holidayEvidence:holidayEvidence(e)},
-  diagnostics:v(0),scanner:v(1),indices:{NIFTY:v(5),SENSEX:v(6)},
+  diagnostics:v(0),scanner:v(1),indices:{NIFTY:v(5)},
   news:{coverage:news.coverage||null,issues:news.issues||[],sources:news.sourceStatus||[],error:news.error||null,verifiedArticles:false,staleFallback:!!news.staleFallback},
   forwardTesting:v(3),paperPerformance:v(4),verifiedProductionSignals:false,ordersPlaced:false};
  if(probe)result.live=await fullCheck(e);
@@ -2504,11 +2314,11 @@ async function offlineIntegrationAudit(e){
  const [auth,master]=await Promise.allSettled([session(e),instruments(e)]);
  result.checks.angelAuthentication=auth.status==='fulfilled';
  result.checks.instrumentMaster=master.status==='fulfilled'&&Array.isArray(master.value)&&master.value.length>0;
- if(auth.status==='rejected')result.errors.push('ANGEL_AUTH: '+String(auth.reason?.message||auth.reason).slice(0,160));
+ if(auth.status==='rejected')result.errors.push('BROKER_DATA: '+String(auth.reason?.message||auth.reason).slice(0,160));
  if(master.status==='rejected')result.errors.push('INSTRUMENT_MASTER: '+String(master.reason?.message||master.reason).slice(0,160));
  if(result.checks.instrumentMaster){
   const rows=master.value;
-  for(const name of ['NIFTY','SENSEX']){
+  for(const name of ['NIFTY']){
    const candidates=rows.filter(x=>String(x.name||x.underlying||'').toUpperCase()===name||String(x.symbol||'').toUpperCase().startsWith(name));
    const ce=candidates.filter(x=>/CE$/i.test(String(x.symbol||''))).length;
    const pe=candidates.filter(x=>/PE$/i.test(String(x.symbol||''))).length;
@@ -2516,7 +2326,7 @@ async function offlineIntegrationAudit(e){
   }
  }
  result.checks.niftyMasterPresence=!!result.indices.NIFTY?.candidateInstruments;
- result.checks.sensexMasterPresence=!!result.indices.SENSEX?.candidateInstruments;
+ 
  result.checks.noFakeLiveQuoteClaim=true;
  result.checks.signalSafetyFailClosed=true;
  result.elapsedMs=Date.now()-started;
@@ -2525,9 +2335,9 @@ async function offlineIntegrationAudit(e){
  return result;
 }
 async function brokerBatchAudit(e){
- const required=['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED'];
+ const required=['OPTION_CHAIN'];
  const credentials=Object.fromEntries(required.map(k=>[k,!!e[k]]));
- const validation={nseSpot:quoteRequestAudit('NSE',['99926000']),bseSpot:quoteRequestAudit('BSE',['99919000']),nfoOption:quoteRequestAudit('NFO',['12345']),bfoOption:quoteRequestAudit('BFO',['12345']),rejectBadToken:!quoteRequestAudit('NFO',['invalid']).passed,rejectEmpty:!quoteRequestAudit('NSE',[]).passed,rejectOversize:!quoteRequestAudit('NSE',Array.from({length:51},(_,i)=>String(i+1))).passed,rejectDuplicates:!quoteRequestAudit('NSE',['1','1']).passed};
+ const validation={nseSpot:quoteRequestAudit('NSE',['99926000']),nfoOption:quoteRequestAudit('NFO',['12345']),rejectBadToken:!quoteRequestAudit('NFO',['invalid']).passed,rejectEmpty:!quoteRequestAudit('NSE',[]).passed,rejectOversize:!quoteRequestAudit('NSE',Array.from({length:51},(_,i)=>String(i+1))).passed,rejectDuplicates:!quoteRequestAudit('NSE',['1','1']).passed};
  const out={version:VERSION,at:new Date().toISOString(),mode:'READ_ONLY_NO_ORDERS',session:sessionConfig(e),marketOpen:marketOpen(e),credentialsConfigured:Object.values(credentials).every(Boolean),credentialPresence:credentials,quoteRequestValidation:Object.fromEntries(Object.entries(validation).map(([k,v])=>[k,typeof v==='boolean'?v:v.passed])),angelLogin:{status:'NOT_TESTED'},marketData:{status:'NOT_TESTED'},verifiedProductionSignals:false,ordersPlaced:false};
  if(!out.credentialsConfigured){out.angelLogin={status:'BLOCKED',reason:'Missing broker secrets'};return out;}
  let jwt;
@@ -2540,8 +2350,8 @@ async function brokerBatchAudit(e){
 // One-command end-to-end diagnostics. Distinguish configuration from live verification.
 // Consolidated read-only readiness audit. Never promotes strategies or sends orders.
 async function finalBatchAudit(e){
- const [scan,obs,hn,hs]=await Promise.all([scanStatus(e),phase3CandleStatus(e),get(e,'marketintel:error:NIFTY'),get(e,'marketintel:error:SENSEX')]);
- const historical={};for(const [name,v] of [['NIFTY',hn],['SENSEX',hs]])historical[name]=v?{state:Number(v.retryAfter)>Date.now()?'BACKOFF':'RETRY_ALLOWED',lastError:v.message||null,retryAfter:v.retryAfter?new Date(v.retryAfter).toISOString():null}:{state:'UNKNOWN_NOT_TESTED',note:'No stored historical failure is not evidence that historical candles work.'};
+ const [scan,obs,hn,hs]=await Promise.all([scanStatus(e),phase3CandleStatus(e),get(e,'marketintel:error:NIFTY'),Promise.resolve(null)]);
+ const historical={};for(const [name,v] of [['NIFTY',hn]])historical[name]=v?{state:Number(v.retryAfter)>Date.now()?'BACKOFF':'RETRY_ALLOWED',lastError:v.message||null,retryAfter:v.retryAfter?new Date(v.retryAfter).toISOString():null}:{state:'UNKNOWN_NOT_TESTED',note:'No stored historical failure is not evidence that historical candles work.'};
  const versionMatch=scan.lastScan?.version===VERSION;
  const cronVersion=scan.lastCronTrigger?.version||null;
  const scanAge=scan.lastScanAgeMinutes;
@@ -2562,12 +2372,12 @@ async function fullCheck(e){
   scanVersionAudit:{workerVersion:VERSION,storedScanVersion:d.lastScanSummary?.version||null,versionMatch:!!d.lastScanSummary&&d.lastScanSummary.version===VERSION,note:'A stored scan may have been produced by an older deployment. Compare again after the next scheduled cron; a mismatch is diagnostic, not proof that the scanner is broken.'},
   live:{angelLogin:{status:'NOT_TESTED'},marketData:{status:'NOT_TESTED'},aiInference:{status:'NOT_TESTED'},telegramDelivery:{status:'NOT_TESTED'}},
   verifiedProductionSignals:false,blockers:[...d.issues]};
- if(cfg(e).filter(x=>x.startsWith('SMART_')).length===0){
+ if(cfg(e).filter(x=>x==='OPTION_CHAIN').length===0){
   try{const start=Date.now();result._jwt=await session(e);result.live.angelLogin={status:'PASS',latencyMs:Date.now()-start}}catch(err){result.live.angelLogin={status:'FAIL',reason:String(err.message).slice(0,140)}}
  }else result.live.angelLogin={status:'BLOCKED',reason:'Missing Angel secrets'};
  if(marketOpen(e)&&result.live.angelLogin.status==='PASS'){
   try{const r=await marketDataProbe(e,result._jwt);result.live.marketData={status:r.allPassed?'PASS':'FAIL',indices:r.indices,verifiedBuySellSignals:false,reason:r.error||(!r.allPassed?'Independent quote probe failed; see indices':'')};if(!r.allPassed&&result.scanHealthy!==false)result.live.marketData.note='Independent probe can fail even when previous scheduled quotes were fresh; inspect index errors and do not assume a broker-wide outage.'}catch(err){result.live.marketData={status:'FAIL',reason:String(err.message).slice(0,140)}}
- }else result.live.marketData={status:'NOT_TESTED',reason:marketOpen(e)?'Angel login failed':'Market closed or calendar unconfigured'};
+ }else result.live.marketData={status:'NOT_TESTED',reason:marketOpen(e)?'Broker session failed':'Market closed or calendar unconfigured'};
  if(e.AI){try{const a=await e.AI.run(aiModel(e),{messages:[{role:'user',content:'Reply exactly OK'}],max_tokens:12});result.live.aiInference={status:a?.response?'PASS':'FAIL'}}catch(err){result.live.aiInference={status:'FAIL',reason:String(err.message).slice(0,120)}}}
  else result.live.aiInference={status:'BLOCKED',reason:'AI binding missing'};
  // This Telegram reply itself verifies delivery when received; do not send a duplicate test message.
@@ -2590,7 +2400,7 @@ function staticAudit(e){
  const secrets=cfg(e),s=sessionConfig(e);
  return {version:VERSION,checkedAt:new Date().toISOString(),mode:'SIGNALS_ONLY_RESEARCH',
   checks:{kv:hasKV(e),aiBinding:!!e.AI,telegramCredentials:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID,
-   telegramWebhookSecret:!!e.TELEGRAM_WEBHOOK_SECRET,angelCredentials:['SMART_API_KEY','SMART_CLIENT_CODE','SMART_PIN','SMART_TOTP_SEED'].every(k=>!!e[k]),
+   telegramWebhookSecret:!!e.TELEGRAM_WEBHOOK_SECRET,brokerDataConfigured:['OPTION_CHAIN'].every(k=>!!e[k]),
    calendarConfigured:calendarConfigured(e),sessionDefinitionValid:s.valid||s.reason==='Weekend or configured holiday'},
   missingSecrets:secrets,session:s,
   productionReadiness:'NOT VERIFIED',
@@ -2628,10 +2438,10 @@ async function pipelineReadiness(e,name){
  return {version:VERSION,index:name,at:new Date(now).toISOString(),checks,blockers,allVerified:blockers.length===0,decision:'WAIT',productionSignalsEnabled:false,ordersEnabled:false,notes:['Read-only audit: /marketintel and /options refresh research snapshots, not production certification','News verification, option-premium backtest, and live Telegram delivery require independent evidence','Missing evidence never becomes an inferred BUY/SELL recommendation']};
 }
 function signalPreview(name='NIFTY'){
- const isSensex=name==='SENSEX';
- const label=isSensex?'SENSEX':'NIFTY 50';
- const strike=isSensex?'80000':'25000';
- const premium=isSensex?210:125;
+ const isSensex=false;
+ const label='NIFTY 50';
+ const strike='25000';
+ const premium=125;
  const stop=premium-12, target1=premium+18, target2=premium+30;
  return `🧪 JANGGO AI — SIGNAL FORMAT DEMO\n⚠️ SIMULATED EXAMPLE • NOT LIVE • DO NOT TRADE\n\n📊 Index: ${label}\n📈 Hypothetical bias: BULLISH\n🎯 Example contract: ${label} ${strike} CE (NOT a verified listed contract)\n💵 Example premium: ₹${premium.toFixed(2)}\n🟢 Example ENTRY: ₹${premium.toFixed(2)}\n🛑 Example SL: ₹${stop.toFixed(2)}\n🎯 Example T1: ₹${target1.toFixed(2)}\n🎯 Example T2: ₹${target2.toFixed(2)}\n📉 Example trailing: tighten only after favorable movement\n🧠 Example reason: trend + momentum + volume + OI alignment (NOT measured)\n📰 News: NOT CHECKED\n📡 Live Angel One quote: NOT USED\n🔒 Signal-only; zero orders\n\nReal alerts require fresh verified quotes, strategy evidence and explicit activation. This is a formatting preview, not a BUY recommendation.`;
 }
@@ -2689,7 +2499,7 @@ function integratedSignalGate(x){
 async function integratedTenModuleAudit(e){
  const now=Date.now(), result={version:VERSION,at:new Date(now).toISOString(),mode:'READ_ONLY_INTEGRATED_TEN_MODULE_AUDIT',ordersEnabled:false,modules:{},tests:{}};
  const record=(name,ready,detail)=>result.modules[name]={ready,detail};
- record('historicalMarketData',false,'Use /researchbatch: Angel One historical candles fetched on demand; not proven by this audit');
+ record('historicalMarketData',false,'Use /researchbatch: Kotak Neo historical candles fetched on demand; not proven by this audit');
  record('aiStrategyDiscovery',!!e.AI,'AI binding presence only. Use /discover and /validate; not self-validating');
  record('backtesting',true,'Index-only /backtest exists; option premium and transaction-cost backtest NOT established');
  record('paperSignalSimulator',true,'Existing /papercandidate and premium forward tracking; no simulated fills without quote evidence');
@@ -2820,11 +2630,11 @@ function offlineReplayRegression(){
 async function optionBacktest(e,raw){
  const args=raw.trim().split(/\s+/),exchange=String(args[1]||'').toUpperCase(),token=String(args[2]||'');
  const quantity=Number(args[3]||1),fee=Number(args[4]||40);
- if(!['NFO','BFO'].includes(exchange)||!/^\d{2,12}$/.test(token)||!Number.isInteger(quantity)||quantity<1||quantity>100000||!Number.isFinite(fee)||fee<0||fee>10000)throw Error('Usage: /optionbacktest NFO|BFO TOKEN [quantity] [roundTripFeeINR]');
+ if(!['NFO'].includes(exchange)||!/^\d{2,12}$/.test(token)||!Number.isInteger(quantity)||quantity<1||quantity>100000||!Number.isFinite(fee)||fee<0||fee>10000)throw Error('Usage: /optionbacktest NFO TOKEN [quantity] [roundTripFeeINR]');
  const jwt=await session(e),end=new Date(),start=new Date(end.getTime()-7*86400000);
- const response=await historicalRequest('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData',{method:'POST',headers:{...angelHeaders(e),Authorization:'Bearer '+jwt},body:JSON.stringify({exchange,symboltoken:token,interval:'FIVE_MINUTE',fromdate:istDateTime(start),todate:istDateTime(end)})},{label:'OPTION_PREMIUM_RESEARCH',beforeRequest:()=>brokerSlot(e,'history')});
- const candles=normalizeAngelCandles(response.data,{intervalMs:300000});
- const result={version:VERSION,mode:'HISTORICAL_OPTION_RESEARCH_ONLY',exchange,token,source:useNeo(e)?'Kotak Neo historical option premium candles':'Angel One historical option premium candles',...optionReplay(candles,{quantity,feePerRoundTrip:fee})};
+ const response=await fetchHistoricalWindow(e,jwt,{exchange,symboltoken:token,interval:'FIVE_MINUTE',fromdate:istDateTime(start),todate:istDateTime(end)});
+ const candles=normalizeBrokerCandles(response.data,{intervalMs:300000});
+ const result={version:VERSION,mode:'HISTORICAL_OPTION_RESEARCH_ONLY',exchange,token,source:'Kotak Neo historical option premium candles',...optionReplay(candles,{quantity,feePerRoundTrip:fee})};
  await put(e,'optionbacktest:last',result,86400*3);return result;
 }
 
@@ -2837,15 +2647,16 @@ if(['/oc','/ocstatus','/ocscan','/ocpause','/ocresume','/ocreport'].includes(cmd
  catch(err){await telegram(e,'[OPTION CHAIN] Router unavailable: '+safeError(err,e).slice(0,160));}return;
 }
 if(cmd==='/botroute'){await telegram(e,JSON.stringify(await ensureBotRouter(e),null,2));return;}
+if(/(?:^|\s)(?:sensex|crude(?:oil)?|mcx|bfo)(?:\s|$)/i.test(raw)||cmd==='/sensex'){await telegram(e,'This bot supports Kotak Neo and NIFTY only.');return;}
 if(cmd==='/histprobe'){
- const index=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';
+ const index='NIFTY';
  await telegram(e,JSON.stringify(await historicalProbe(e,index),null,2));return;
 }
-let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud '+VERSION+' — scheduled scan diagnostics, 3-minute research scan\n/ocstatus option-chain-only project\n/ocscan request chain snapshot\n/ocpause pause new chain alerts\n/ocresume resume chain paper alerts\n/histprobe nifty|sensex bounded historical check\n/botroute central bot routing status\n/status configuration\n/aimodel pretrained model configuration\n/testbroker active broker data status\n/scan live option research watch\n/nifty /sensex AI checklist\n/briefing pre-market news\n/news dated news headlines\n/newsquality news feed freshness\n/dataquality data limitations\n/readiness honest deployment readiness\n/diagnostics config, broker-data and signal readiness\n/liveprobe broker login, AI inference and Telegram configuration\n/marketprobe live spot and option quote data verification\n/livereadiness — fail-closed combined broker coverage audit\n/scanstatus actual scheduled scan result (read-only)\n/strategywatch observation-based strategy research\n/fullcheck single-command live system diagnostics\n/batchcheck combined scanner, news, strategy and paper audit\n/batchprobe batch audit plus live AI/broker checks\n/finalcheck consolidated configuration and honest signal-readiness gate\n/paper /performance paper research counts\n/forwardaudit — independent forward-test readiness and blockers\n/forwardstart nifty hypothesis:ID — preregister an historically tested research hypothesis\n/forwardregistry — list frozen forward research registrations\n/forwardintegrity — audit frozen specs and baseline provenance\n/forwardobserve nifty hypothesis:ID — capture new post-registration CLOSED index candles\n/forwardobservations nifty hypothesis:ID — view observation count\n/forwardperformance nifty hypothesis:ID — index proxy performance\n/forwardauto — latest automatic collection status\n/brain — research brain status\n/discover — generate one AI research hypothesis (not a signal)\n/hypotheses — list stored research hypotheses\n/validate nifty or sensex — historical index-only proxy validation\n/strategies — strategy knowledge and data requirements\n/opensource — public documentation source health\n/researchbatch — ten historical-data checks for both indices (read-only)\n/backtest nifty or /backtest sensex — historical benchmark\n/optionbacktest NFO|BFO TOKEN [quantity] [roundTripFeeINR] — historical option premium replay\n/replaycheck — six offline option replay regression checks\n/finalbatch — consolidated read-only batch audit\n/candlecheck — Phase3 observation gaps and candle evidence (read-only)\n/marketintel nifty or /marketintel sensex — 1m/3m/5m/15m index research\n/options nifty or /options sensex — broker OI, PCR, Greeks coverage\n/decision nifty or /decision sensex — integrated evidence and WAIT gate\n/evidence nifty or /evidence sensex — explainable multi-source research bias (not a trade signal)\n/researchgate nifty or /researchgate sensex — validation audit and no-promotion gate\n/signals — observed shadow signal lifecycle, NOT trade signals\n/signalpreview nifty or /signalpreview sensex — clearly simulated Telegram alert format\n/signalstatus — automatic AI-assisted candidate alert status\n/pipelinecheck nifty or sensex — independent evidence readiness audit\n/refreshresearch nifty or sensex — refresh broker candles and option metrics (read-only)\n/calendar — configured trading session and scheduling status\n/calendarrefresh — retry official NSE F&O calendar retrieval (read-only)\n/holidayaudit — explain manual vs official holiday match\n/batchsafety — ten independent calendar and safety checks\n/brokerbatch — read-only broker login, quote input gates and market probe\n/quickstatus — single concise status and experimental alerts\n/scanissues — exact scan failures, quote coverage and alert blockers\n/offlineaudit — holiday-safe Angel login and instrument master integration audit\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/aimodel')out=`Pretrained Cloudflare Workers AI model: ${aiModel(e)}\nNo self-learning or automatic model changes. Model availability must be tested on deployment.`;else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode AI_ASSISTED_RESEARCH_ALERTS ${VERSION}\nHoliday calendar ${calendarConfigured(e)?'configured':'MISSING — scheduled scans blocked'}`;else if(cmd==='/signalpreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=signalPreview(name)}else if(cmd==='/pipelinecheck'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await pipelineReadiness(e,name),null,2)}else if(cmd==='/refreshresearch'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';const jobs=await Promise.allSettled([marketIntelligence(e,name),optionsIntelligence(e,name)]);out=JSON.stringify({index:name,at:new Date().toISOString(),marketIntelligence:jobs[0].status==='fulfilled'?'REFRESHED':String(jobs[0].reason?.message||jobs[0].reason).slice(0,160),optionsIntelligence:jobs[1].status==='fulfilled'?'REFRESHED':String(jobs[1].reason?.message||jobs[1].reason).slice(0,160),readiness:await pipelineReadiness(e,name),signalsEnabled:false,ordersPlaced:false},null,2)}else if(cmd==='/signalstatus'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,directionalReview:r?.directionalReview||null,directionalAlertsSent:r?.directionalAlertsSent||0,directionalAlertsSkipped:r?.directionalAlertsSkipped||'',issues:r?.issues||[],verifiedProductionSignals:false,note:'Snapshot-based signals are not independently validated; no orders.'},null,2)}else if(cmd==='/testangel'||cmd==='/testbroker'){try{if(useNeo(e))out=JSON.stringify(await chainCommand(e,'neo-status'),null,2);else{await session(e);out='Angel login returned; quote access separately unverified. No orders.'}}catch(err){out='❌ Angel login failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scanQuotesOnly(e),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await groundedAnalysis(e,cmd==='/nifty'?'NIFTY':'SENSEX');else if(cmd==='/briefing')out=await briefing(e);else if(cmd==='/brain')out=JSON.stringify(await brainReport(e),null,2);else if(cmd==='/learning')out='Disabled: pretrained AI only; no self-learning.';else if(cmd==='/strategies')out=JSON.stringify(strategyReadiness(),null,2);else if(cmd==='/discover'){try{out=JSON.stringify(await discover(e),null,2)}catch(err){out='Research discovery unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/hypotheses'){try{out=JSON.stringify(await discoveryReport(e),null,2)}catch(err){out='Hypothesis registry unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/opensource'){try{out=JSON.stringify(openSourceReport(await openSourceKnowledge(e)),null,2)}catch(err){out='Open-source documentation unavailable: '+String(err.message).slice(0,200)}}else if(cmd==='/replaycheck')out=JSON.stringify(offlineReplayRegression(),null,2);else if(cmd==='/optionbacktest'){try{out=JSON.stringify(await optionBacktest(e,raw),null,2)}catch(err){out='Option backtest unavailable: '+String(err.message).slice(0,230)}}else if(cmd==='/integratedaudit')out=JSON.stringify(await integratedTenModuleAudit(e),null,2);else if(cmd==='/researchbatch'){out=JSON.stringify(await unifiedResearchBatch(e),null,2)}else if(cmd==='/backtest'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await backtestResearch(e,name),null,2)}catch(err){out='Backtest unavailable: '+String(err.message).slice(0,250)}}else if(cmd==='/validate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await validateHypotheses(e,name),null,2)}catch(err){out='Research validation unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/finalbatch'||cmd==='/finalstatus')out=JSON.stringify(await finalBatchAudit(e),null,2);else if(cmd==='/candlecheck')out=JSON.stringify(await phase3CandleStatus(e),null,2);else if(cmd==='/marketintel'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await marketIntelligence(e,name),null,2)}catch(err){out='Multi-timeframe research unavailable: '+String(err.message).slice(0,240)}}else if(cmd==='/newsquality'){const n=await newsDigest(e);out=JSON.stringify({at:new Date(n.at).toISOString(),coverage:n.coverage,sources:n.sourceStatus,issues:n.issues,latest:n.items.slice(0,3),staleFallback:!!n.staleFallback,verifiedArticles:false,economicCalendarIntegrated:false},null,2)}else if(cmd==='/news'){const n=await newsDigest(e);out='📰 NEWS HEADLINE CONTEXT (not independently verified)\n'+n.items.slice(0,8).map(x=>'• '+x.source+': '+x.title).join('\n')+'\nIssues: '+(n.issues.join('; ')||'none')+'\nNot an entry signal.';}else if(cmd==='/options'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{const o=await optionsIntelligence(e,name);out=JSON.stringify({...o,chain:o.chain?.slice(0,8)},null,2)}catch(err){out='Options intelligence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/decision'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await integratedResearch(e,name),null,2)}else if(cmd==='/evidence'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';try{out=JSON.stringify(await decisionEvidence(e,name),null,2)}catch(err){out='Evidence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/researchgate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await researchGate(e,name),null,2)}else if(cmd==='/signals')out=JSON.stringify(await lifecycleReport(e),null,2);else if(cmd==='/calendar')out=calendarMessage(e)+'\nLast refresh: '+JSON.stringify(await get(e,calendarAuditKey)||{status:'NOT_ATTEMPTED'});else if(cmd==='/calendarrefresh')out=JSON.stringify({version:VERSION,refresh:await refreshExchangeCalendar(e,{force:true}),audit:await get(e,calendarAuditKey),calendarConfigured:calendarConfigured(e),nseOnly:true,bseVerified:false,ordersPlaced:false},null,2);else if(cmd==='/scanstatus')out=JSON.stringify(await scanStatus(e),null,2);else if(cmd==='/strategywatch'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,watches:r?.strategyWatches||[],aiReview:r?.aiReview||null,waitReasons:r?.strategyWaitReasons||{},verifiedBuySellSignals:false,note:'Research only; snapshots are not candles. No live recommendations or orders.'},null,2)}else if(cmd==='/batchcheck'||cmd==='/batchprobe')out=JSON.stringify(await batchAudit(e,cmd==='/batchprobe'),null,2);else if(cmd==='/scanissues')out=JSON.stringify(await pipelineTriage(e),null,2);else if(cmd==='/offlineaudit')out=JSON.stringify(await offlineIntegrationAudit(e),null,2);else if(cmd==='/quickstatus'){const x=await get(e,'scan:last');out=JSON.stringify({version:VERSION,marketOpen:marketOpen(e),session:sessionConfig(e),holidayEvidence:holidayEvidence(e),lastScanAt:x?.at||null,scanHealthy:!!x?.scanHealthy,experimentalBuySellAlertsSent:x?.directionalAlertsSent||0,experimentalAlertsSkipped:x?.directionalAlertsSkipped||'NO_SCAN',signalMode:'EXPERIMENTAL_ONLY_NOT_VALIDATED',ordersEnabled:false},null,2)}else if(cmd==='/brokerbatch')out=JSON.stringify(await brokerBatchAudit(e),null,2);else if(cmd==='/batchsafety')out=JSON.stringify(batchSafetyAudit(e),null,2);else if(cmd==='/holidayaudit')out=JSON.stringify({version:VERSION,session:sessionConfig(e),evidence:holidayEvidence(e),safety:'Holiday match does not automatically authorize trading'},null,2);else if(cmd==='/repaircheck'){const [n,d,st]=await Promise.allSettled([newsDigest(e),systemDiagnostics(e),scanStatus(e)]);const value=r=>r.status==='fulfilled'?r.value:{error:String(r.reason?.message||r.reason).slice(0,150)};const news=value(n);out=JSON.stringify({version:VERSION,at:new Date().toISOString(),modules:{news:{sources:news.sourceStatus||[],relevantHeadlines:news.items?.length||0,staleFallback:!!news.staleFallback,issues:news.issues||[],sample:(news.items||[]).slice(0,3)},angel:{credentialsConfigured:cfg(e).length===0,loginNotProbed:true},niftyAndSensex:{scanner:value(st),dataStatus:'LIVE_MARKET_PROBE_REQUIRED'},ai:{binding:!!e.AI,productionStrategyValidated:false},paper:{automaticResearchOnly:true},telegram:{transportConfigured:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID},risk:{realOrdersDisabled:true,signalsFailClosed:true}},diagnostics:value(d),verifiedProductionSignals:false,ordersPlaced:false},null,2);}else if(cmd==='/fullcheck')out=JSON.stringify(await fullCheck(e),null,2);else if(cmd==='/finalcheck')out=JSON.stringify(staticAudit(e),null,2);else if(cmd==='/diagnostics')out=JSON.stringify(await systemDiagnostics(e),null,2);else if(cmd==='/liveprobe')out=JSON.stringify(await liveProbe(e),null,2);else if(cmd==='/livereadiness'){const probe=await marketDataProbe(e);const report=assessLiveReadiness({probe,marketOpen:marketOpen(e),calendarConfigured:calendarConfigured(e)});out=JSON.stringify({...report,aiVerified:false,telegramDelivered:false,note:'AI and Telegram cannot be certified by a broker-only probe; use /liveprobe and verify delivery independently.'},null,2)}else if(cmd==='/marketprobe')out=JSON.stringify(await marketDataProbe(e),null,2);else if(cmd==='/readiness'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,worker:true,kv:hasKV(e),aiBinding:!!e.AI,missingSecrets:cfg(e),holidayCalendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),lastScan:r,spotAwareContractSelection:true,singleSnapshotWatchAlertsDisabled:true,verifiedLiveSignals:false,shadowLifecycleTracking:true,historicalBenchmarkAvailable:false,multiTimeframeResearchAvailable:false,aiProxyValidationAvailable:true,verifiedHistoricalBacktests:false,verifiedGreeks:false,verifiedUnderlyingConfirmation:false,quoteTimestampGate:true,verifiedNews:false,datedHeadlineFreshnessGate:true,verifiedStrategySelfImprovement:false,aiHypothesisGeneration:true,automaticStrategyPromotion:false,curatedOpenSourceReadmeRetrieval:true,automatedOrders:false},null,2)}else if(cmd==='/dataquality'){const r=await get(e,'scan:last');out=JSON.stringify({lastScan:r,checks:'Fresh broker timestamp, OI and bid/ask spread required for research alerts. Quotes without parseable timestamps are counted but excluded from research lifecycle updates. Basic historical research exists; production-grade backtesting, verified Greeks and verified news are not established.'},null,2)}else if(cmd==='/forwardstart'){const parts=raw.split(/\s+/);const name=String(parts[1]||'').toUpperCase();out=JSON.stringify(await forwardRegister(e,name,parts[2]||''),null,2)}else if(cmd==='/forwardregistry')out=JSON.stringify(await forwardRegistry(e),null,2);else if(cmd==='/forwardintegrity')out=JSON.stringify(await forwardIntegrity(e),null,2);else if(cmd==='/forwardobserve'){const p=raw.split(/\s+/);try{out=JSON.stringify(await forwardObserve(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}catch(err){out='Forward observation failed: '+String(err.message).slice(0,180)}}else if(cmd==='/forwardobservations'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardObservations(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/forwardperformance'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardPerformance(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/papercandidate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(assessPaperCandidate({index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/paperresearchstart'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await registerResearchPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/autopaper'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await autoSelectPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/attributedperformance'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await attributedPerformance(e.STATE,name),null,2)}else if(cmd==='/attributedpaperstart'){const p=raw.split(/\s+/);try{const index=String(p[1]||'').toUpperCase();out=JSON.stringify(await registerAttributedPaper(e.STATE,index,p[2],{exchange:p[3],token:p[4],symbol:p[5],side:p[6],expiry:p[7],lotSize:Number(p[8])},{stop:Number(p[9]),target:Number(p[10]),lots:Number(p[11]||1)}),null,2)}catch(err){out='Attributed paper registration rejected: '+String(err.message)}}else if(cmd==='/strategyreview'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await lastStrategyReview(e.STATE,name),null,2)}else if(cmd==='/strategyselect'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await paperStrategySelectionReport(e.STATE,name),null,2)}else if(cmd==='/premiumreport'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(await trackerReport(e.STATE,name),null,2)}else if(cmd==='/premiumregister'){const p=raw.split(/\s+/);const name=String(p[1]||'').toUpperCase();try{out=JSON.stringify(await trackerRegister(e.STATE,name,{exchange:p[2],token:p[3],symbol:p[4],side:p[5],expiry:p[6],lotSize:Number(p[7])},{stop:Number(p[8]),target:Number(p[9]),lots:Number(p[10]||1)}),null,2)}catch(err){out='Paper registration rejected: '+String(err.message)}}else if(cmd==='/forwardauto')out=JSON.stringify(await get(e,'forward:lastAuto')||{status:'NO_AUTOMATIC_COLLECTION_YET'},null,2);else if(cmd==='/optiongate'){const name=raw.toUpperCase().includes('SENSEX')?'SENSEX':'NIFTY';out=JSON.stringify(evaluateOptionEvidence({underlying:name,options:await get(e,'options:'+name),market:await get(e,'marketintel:'+name),marketOpen:marketOpen(e),forwardCertified:false}),null,2)}else if(cmd==='/forwardaudit')out=JSON.stringify(await forwardAudit(e),null,2);else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else if(cmd.startsWith('/'))out=`Unknown JANGGO command: ${cmd}\nUse /help. Trading commands are never routed to general AI.`;else out=await ai(e,raw);await telegram(e,out)}
+let out='';if(['/start','/help'].includes(cmd))out='🤖 Janggo Cloud '+VERSION+' — scheduled scan diagnostics, 3-minute research scan\n/ocstatus option-chain-only project\n/ocscan request chain snapshot\n/ocpause pause new chain alerts\n/ocresume resume chain paper alerts\n/histprobe nifty bounded historical check\n/botroute central bot routing status\n/status configuration\n/aimodel pretrained model configuration\n/testbroker active broker data status\n/scan live option research watch\n/nifty AI checklist\n/briefing pre-market news\n/news dated news headlines\n/newsquality news feed freshness\n/dataquality data limitations\n/readiness honest deployment readiness\n/diagnostics config, broker-data and signal readiness\n/liveprobe broker login, AI inference and Telegram configuration\n/marketprobe live spot and option quote data verification\n/livereadiness — fail-closed combined broker coverage audit\n/scanstatus actual scheduled scan result (read-only)\n/strategywatch observation-based strategy research\n/fullcheck single-command live system diagnostics\n/batchcheck combined scanner, news, strategy and paper audit\n/batchprobe batch audit plus live AI/broker checks\n/finalcheck consolidated configuration and honest signal-readiness gate\n/paper /performance paper research counts\n/forwardaudit — independent forward-test readiness and blockers\n/forwardstart nifty hypothesis:ID — preregister an historically tested research hypothesis\n/forwardregistry — list frozen forward research registrations\n/forwardintegrity — audit frozen specs and baseline provenance\n/forwardobserve nifty hypothesis:ID — capture new post-registration CLOSED index candles\n/forwardobservations nifty hypothesis:ID — view observation count\n/forwardperformance nifty hypothesis:ID — index proxy performance\n/forwardauto — latest automatic collection status\n/brain — research brain status\n/discover — generate one AI research hypothesis (not a signal)\n/hypotheses — list stored research hypotheses\n/validate nifty — historical index-only proxy validation\n/strategies — strategy knowledge and data requirements\n/opensource — public documentation source health\n/researchbatch — ten historical-data checks for NIFTY (read-only)\n/backtest nifty — historical benchmark\n/optionbacktest NFO TOKEN [quantity] [roundTripFeeINR] — historical option premium replay\n/replaycheck — six offline option replay regression checks\n/finalbatch — consolidated read-only batch audit\n/candlecheck — Phase3 observation gaps and candle evidence (read-only)\n/marketintel nifty — 1m/3m/5m/15m index research\n/options nifty — broker OI, PCR, Greeks coverage\n/decision nifty — integrated evidence and WAIT gate\n/evidence nifty — explainable multi-source research bias (not a trade signal)\n/researchgate nifty — validation audit and no-promotion gate\n/signals — observed shadow signal lifecycle, NOT trade signals\n/signalpreview nifty — clearly simulated Telegram alert format\n/signalstatus — automatic AI-assisted candidate alert status\n/pipelinecheck nifty — independent evidence readiness audit\n/refreshresearch nifty — refresh broker candles and option metrics (read-only)\n/calendar — configured trading session and scheduling status\n/calendarrefresh — retry official NSE F&O calendar retrieval (read-only)\n/holidayaudit — explain manual vs official holiday match\n/batchsafety — ten independent calendar and safety checks\n/brokerbatch — read-only broker login, quote input gates and market probe\n/quickstatus — single concise status and experimental alerts\n/scanissues — exact scan failures, quote coverage and alert blockers\n/offlineaudit — holiday-safe Broker session and instrument master integration audit\nAny message: chat with AI\n⚠️ No automated orders or certified buy/sell signals.';else if(cmd==='/aimodel')out=`Pretrained Cloudflare Workers AI model: ${aiModel(e)}\nNo self-learning or automatic model changes. Model availability must be tested on deployment.`;else if(cmd==='/status')out=`System online | IST ${day()} ${clock()}\nMarket clock ${marketOpen(e)?'OPEN':'CLOSED'} (holiday list must be maintained)\nKV ${hasKV(e)?'yes':'missing'} | AI ${e.AI?'yes':'missing'}\nMissing secrets: ${cfg(e).join(', ')||'none'}\nLast scan: ${JSON.stringify(await get(e,'scan:last')||'none').slice(0,450)}\nMode AI_ASSISTED_RESEARCH_ALERTS ${VERSION}\nHoliday calendar ${calendarConfigured(e)?'configured':'MISSING — scheduled scans blocked'}`;else if(cmd==='/signalpreview'){const name='NIFTY';out=signalPreview(name)}else if(cmd==='/pipelinecheck'){const name='NIFTY';out=JSON.stringify(await pipelineReadiness(e,name),null,2)}else if(cmd==='/refreshresearch'){const name='NIFTY';const jobs=await Promise.allSettled([marketIntelligence(e,name),optionsIntelligence(e,name)]);out=JSON.stringify({index:name,at:new Date().toISOString(),marketIntelligence:jobs[0].status==='fulfilled'?'REFRESHED':String(jobs[0].reason?.message||jobs[0].reason).slice(0,160),optionsIntelligence:jobs[1].status==='fulfilled'?'REFRESHED':String(jobs[1].reason?.message||jobs[1].reason).slice(0,160),readiness:await pipelineReadiness(e,name),signalsEnabled:false,ordersPlaced:false},null,2)}else if(cmd==='/signalstatus'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,directionalReview:r?.directionalReview||null,directionalAlertsSent:r?.directionalAlertsSent||0,directionalAlertsSkipped:r?.directionalAlertsSkipped||'',issues:r?.issues||[],verifiedProductionSignals:false,note:'Snapshot-based signals are not independently validated; no orders.'},null,2)}else if(cmd==='/testangel'||cmd==='/testbroker'){try{if(useNeo(e))out=JSON.stringify(await chainCommand(e,'neo-status'),null,2);else{await session(e);out='Broker session returned; quote access separately unverified. No orders.'}}catch(err){out='❌ Broker session failed: '+err.message}}else if(cmd==='/scan'){try{out=JSON.stringify(await scanQuotesOnly(e),null,2)}catch(err){out='Scan failed: '+err.message}}else if(cmd==='/nifty'||cmd==='/sensex')out=await groundedAnalysis(e,cmd==='/nifty'?'NIFTY':'SENSEX');else if(cmd==='/briefing')out=await briefing(e);else if(cmd==='/brain')out=JSON.stringify(await brainReport(e),null,2);else if(cmd==='/learning')out='Disabled: pretrained AI only; no self-learning.';else if(cmd==='/strategies')out=JSON.stringify(strategyReadiness(),null,2);else if(cmd==='/discover'){try{out=JSON.stringify(await discover(e),null,2)}catch(err){out='Research discovery unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/hypotheses'){try{out=JSON.stringify(await discoveryReport(e),null,2)}catch(err){out='Hypothesis registry unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/opensource'){try{out=JSON.stringify(openSourceReport(await openSourceKnowledge(e)),null,2)}catch(err){out='Open-source documentation unavailable: '+String(err.message).slice(0,200)}}else if(cmd==='/replaycheck')out=JSON.stringify(offlineReplayRegression(),null,2);else if(cmd==='/optionbacktest'){try{out=JSON.stringify(await optionBacktest(e,raw),null,2)}catch(err){out='Option backtest unavailable: '+String(err.message).slice(0,230)}}else if(cmd==='/integratedaudit')out=JSON.stringify(await integratedTenModuleAudit(e),null,2);else if(cmd==='/researchbatch'){out=JSON.stringify(await unifiedResearchBatch(e),null,2)}else if(cmd==='/backtest'){const name='NIFTY';try{out=JSON.stringify(await backtestResearch(e,name),null,2)}catch(err){out='Backtest unavailable: '+String(err.message).slice(0,250)}}else if(cmd==='/validate'){const name='NIFTY';try{out=JSON.stringify(await validateHypotheses(e,name),null,2)}catch(err){out='Research validation unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/finalbatch'||cmd==='/finalstatus')out=JSON.stringify(await finalBatchAudit(e),null,2);else if(cmd==='/candlecheck')out=JSON.stringify(await phase3CandleStatus(e),null,2);else if(cmd==='/marketintel'){const name='NIFTY';try{out=JSON.stringify(await marketIntelligence(e,name),null,2)}catch(err){out='Multi-timeframe research unavailable: '+String(err.message).slice(0,240)}}else if(cmd==='/newsquality'){const n=await newsDigest(e);out=JSON.stringify({at:new Date(n.at).toISOString(),coverage:n.coverage,sources:n.sourceStatus,issues:n.issues,latest:n.items.slice(0,3),staleFallback:!!n.staleFallback,verifiedArticles:false,economicCalendarIntegrated:false},null,2)}else if(cmd==='/news'){const n=await newsDigest(e);out='📰 NEWS HEADLINE CONTEXT (not independently verified)\n'+n.items.slice(0,8).map(x=>'• '+x.source+': '+x.title).join('\n')+'\nIssues: '+(n.issues.join('; ')||'none')+'\nNot an entry signal.';}else if(cmd==='/options'){const name='NIFTY';try{const o=await optionsIntelligence(e,name);out=JSON.stringify({...o,chain:o.chain?.slice(0,8)},null,2)}catch(err){out='Options intelligence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/decision'){const name='NIFTY';out=JSON.stringify(await integratedResearch(e,name),null,2)}else if(cmd==='/evidence'){const name='NIFTY';try{out=JSON.stringify(await decisionEvidence(e,name),null,2)}catch(err){out='Evidence unavailable: '+String(err.message).slice(0,220)}}else if(cmd==='/researchgate'){const name='NIFTY';out=JSON.stringify(await researchGate(e,name),null,2)}else if(cmd==='/signals')out=JSON.stringify(await lifecycleReport(e),null,2);else if(cmd==='/calendar')out=calendarMessage(e)+'\nLast refresh: '+JSON.stringify(await get(e,calendarAuditKey)||{status:'NOT_ATTEMPTED'});else if(cmd==='/calendarrefresh')out=JSON.stringify({version:VERSION,refresh:await refreshExchangeCalendar(e,{force:true}),audit:await get(e,calendarAuditKey),calendarConfigured:calendarConfigured(e),nseOnly:true,bseVerified:false,ordersPlaced:false},null,2);else if(cmd==='/scanstatus')out=JSON.stringify(await scanStatus(e),null,2);else if(cmd==='/strategywatch'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,at:r?.at||null,watches:r?.strategyWatches||[],aiReview:r?.aiReview||null,waitReasons:r?.strategyWaitReasons||{},verifiedBuySellSignals:false,note:'Research only; snapshots are not candles. No live recommendations or orders.'},null,2)}else if(cmd==='/batchcheck'||cmd==='/batchprobe')out=JSON.stringify(await batchAudit(e,cmd==='/batchprobe'),null,2);else if(cmd==='/scanissues')out=JSON.stringify(await pipelineTriage(e),null,2);else if(cmd==='/offlineaudit')out=JSON.stringify(await offlineIntegrationAudit(e),null,2);else if(cmd==='/quickstatus'){const x=await get(e,'scan:last');out=JSON.stringify({version:VERSION,marketOpen:marketOpen(e),session:sessionConfig(e),holidayEvidence:holidayEvidence(e),lastScanAt:x?.at||null,scanHealthy:!!x?.scanHealthy,experimentalBuySellAlertsSent:x?.directionalAlertsSent||0,experimentalAlertsSkipped:x?.directionalAlertsSkipped||'NO_SCAN',signalMode:'EXPERIMENTAL_ONLY_NOT_VALIDATED',ordersEnabled:false},null,2)}else if(cmd==='/brokerbatch')out=JSON.stringify(await brokerBatchAudit(e),null,2);else if(cmd==='/batchsafety')out=JSON.stringify(batchSafetyAudit(e),null,2);else if(cmd==='/holidayaudit')out=JSON.stringify({version:VERSION,session:sessionConfig(e),evidence:holidayEvidence(e),safety:'Holiday match does not automatically authorize trading'},null,2);else if(cmd==='/repaircheck'){const [n,d,st]=await Promise.allSettled([newsDigest(e),systemDiagnostics(e),scanStatus(e)]);const value=r=>r.status==='fulfilled'?r.value:{error:String(r.reason?.message||r.reason).slice(0,150)};const news=value(n);out=JSON.stringify({version:VERSION,at:new Date().toISOString(),modules:{news:{sources:news.sourceStatus||[],relevantHeadlines:news.items?.length||0,staleFallback:!!news.staleFallback,issues:news.issues||[],sample:(news.items||[]).slice(0,3)},angel:{credentialsConfigured:cfg(e).length===0,loginNotProbed:true},niftyAndSensex:{scanner:value(st),dataStatus:'LIVE_MARKET_PROBE_REQUIRED'},ai:{binding:!!e.AI,productionStrategyValidated:false},paper:{automaticResearchOnly:true},telegram:{transportConfigured:!!e.TELEGRAM_BOT_TOKEN&&!!e.TELEGRAM_CHAT_ID},risk:{realOrdersDisabled:true,signalsFailClosed:true}},diagnostics:value(d),verifiedProductionSignals:false,ordersPlaced:false},null,2);}else if(cmd==='/fullcheck')out=JSON.stringify(await fullCheck(e),null,2);else if(cmd==='/finalcheck')out=JSON.stringify(staticAudit(e),null,2);else if(cmd==='/diagnostics')out=JSON.stringify(await systemDiagnostics(e),null,2);else if(cmd==='/liveprobe')out=JSON.stringify(await liveProbe(e),null,2);else if(cmd==='/livereadiness'){const probe=await marketDataProbe(e);const report=assessLiveReadiness({probe,marketOpen:marketOpen(e),calendarConfigured:calendarConfigured(e)});out=JSON.stringify({...report,aiVerified:false,telegramDelivered:false,note:'AI and Telegram cannot be certified by a broker-only probe; use /liveprobe and verify delivery independently.'},null,2)}else if(cmd==='/marketprobe')out=JSON.stringify(await marketDataProbe(e),null,2);else if(cmd==='/readiness'){const r=await get(e,'scan:last');out=JSON.stringify({version:VERSION,worker:true,kv:hasKV(e),aiBinding:!!e.AI,missingSecrets:cfg(e),holidayCalendarConfigured:calendarConfigured(e),session:sessionConfig(e),marketOpen:marketOpen(e),lastScan:r,spotAwareContractSelection:true,singleSnapshotWatchAlertsDisabled:true,verifiedLiveSignals:false,shadowLifecycleTracking:true,historicalBenchmarkAvailable:false,multiTimeframeResearchAvailable:false,aiProxyValidationAvailable:true,verifiedHistoricalBacktests:false,verifiedGreeks:false,verifiedUnderlyingConfirmation:false,quoteTimestampGate:true,verifiedNews:false,datedHeadlineFreshnessGate:true,verifiedStrategySelfImprovement:false,aiHypothesisGeneration:true,automaticStrategyPromotion:false,curatedOpenSourceReadmeRetrieval:true,automatedOrders:false},null,2)}else if(cmd==='/dataquality'){const r=await get(e,'scan:last');out=JSON.stringify({lastScan:r,checks:'Fresh broker timestamp, OI and bid/ask spread required for research alerts. Quotes without parseable timestamps are counted but excluded from research lifecycle updates. Basic historical research exists; production-grade backtesting, verified Greeks and verified news are not established.'},null,2)}else if(cmd==='/forwardstart'){const parts=raw.split(/\s+/);const name=String(parts[1]||'').toUpperCase();out=JSON.stringify(await forwardRegister(e,name,parts[2]||''),null,2)}else if(cmd==='/forwardregistry')out=JSON.stringify(await forwardRegistry(e),null,2);else if(cmd==='/forwardintegrity')out=JSON.stringify(await forwardIntegrity(e),null,2);else if(cmd==='/forwardobserve'){const p=raw.split(/\s+/);try{out=JSON.stringify(await forwardObserve(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}catch(err){out='Forward observation failed: '+String(err.message).slice(0,180)}}else if(cmd==='/forwardobservations'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardObservations(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/forwardperformance'){const p=raw.split(/\s+/);out=JSON.stringify(await forwardPerformance(e,String(p[1]||'').toUpperCase(),p[2]||''),null,2)}else if(cmd==='/papercandidate'){const name='NIFTY';out=JSON.stringify(assessPaperCandidate({index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/paperresearchstart'){const name='NIFTY';out=JSON.stringify(await registerResearchPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/autopaper'){const name='NIFTY';out=JSON.stringify(await autoSelectPaper(e.STATE,{index:name,market:await get(e,'marketintel:'+name),options:await get(e,'options:'+name),marketOpen:marketOpen(e)}),null,2)}else if(cmd==='/attributedperformance'){const name='NIFTY';out=JSON.stringify(await attributedPerformance(e.STATE,name),null,2)}else if(cmd==='/attributedpaperstart'){const p=raw.split(/\s+/);try{const index=String(p[1]||'').toUpperCase();out=JSON.stringify(await registerAttributedPaper(e.STATE,index,p[2],{exchange:p[3],token:p[4],symbol:p[5],side:p[6],expiry:p[7],lotSize:Number(p[8])},{stop:Number(p[9]),target:Number(p[10]),lots:Number(p[11]||1)}),null,2)}catch(err){out='Attributed paper registration rejected: '+String(err.message)}}else if(cmd==='/strategyreview'){const name='NIFTY';out=JSON.stringify(await lastStrategyReview(e.STATE,name),null,2)}else if(cmd==='/strategyselect'){const name='NIFTY';out=JSON.stringify(await paperStrategySelectionReport(e.STATE,name),null,2)}else if(cmd==='/premiumreport'){const name='NIFTY';out=JSON.stringify(await trackerReport(e.STATE,name),null,2)}else if(cmd==='/premiumregister'){const p=raw.split(/\s+/);const name=String(p[1]||'').toUpperCase();try{out=JSON.stringify(await trackerRegister(e.STATE,name,{exchange:p[2],token:p[3],symbol:p[4],side:p[5],expiry:p[6],lotSize:Number(p[7])},{stop:Number(p[8]),target:Number(p[9]),lots:Number(p[10]||1)}),null,2)}catch(err){out='Paper registration rejected: '+String(err.message)}}else if(cmd==='/forwardauto')out=JSON.stringify(await get(e,'forward:lastAuto')||{status:'NO_AUTOMATIC_COLLECTION_YET'},null,2);else if(cmd==='/optiongate'){const name='NIFTY';out=JSON.stringify(evaluateOptionEvidence({underlying:name,options:await get(e,'options:'+name),market:await get(e,'marketintel:'+name),marketOpen:marketOpen(e),forwardCertified:false}),null,2)}else if(cmd==='/forwardaudit')out=JSON.stringify(await forwardAudit(e),null,2);else if(cmd==='/performance'||cmd==='/paper')out=JSON.stringify(await paperReport(e),null,2);else if(cmd.startsWith('/'))out=`Unknown JANGGO command: ${cmd}\nUse /help. Trading commands are never routed to general AI.`;else out=await ai(e,raw);await telegram(e,out)}
 // V103: manually registered paper contracts; scheduled quotes only, never real orders.
 async function premiumTrackerAuto(e){
  if(!hasKV(e)||!marketOpen(e))return;
- for(const name of ['NIFTY','SENSEX']){
+ for(const name of ['NIFTY']){
   try{
    const result=await trackerStep(e.STATE,name,async c=>{
     const jwt=await session(e),rows=await quotes(e,jwt,c.exchange,[String(c.token)]);
@@ -3011,7 +2822,7 @@ function paperIntegritySelftest(){
 async function persistedPaperIntegrity(e){
  if(!hasKV(e))return {ok:false,reason:'KV_UNAVAILABLE',ordersEnabled:false};
  const results=[];
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   try{const raw=await e.STATE.get('premium:tracker:'+index,'json');results.push({...auditPaperState(index,raw||{enabled:false,position:null,pending:null,trades:[]}),statePresent:raw!==null})}
   catch(err){results.push({index,ok:false,issues:['KV_READ_FAILED'],error:String(err.message||err).slice(0,100)})}
  }
@@ -3027,7 +2838,7 @@ function assessResearchPromotion(candidate, now=Date.now()) {
  const validNumber=(x)=>typeof x==='number'&&Number.isFinite(x);
  if(!candidate||typeof candidate!=='object')return {approved:false,reasons:['INVALID_CANDIDATE'],productionSignalsEnabled:false};
  if(!/^[A-Za-z0-9_.:-]{3,80}$/.test(String(candidate.id||'')))reasons.push('INVALID_ID');
- if(!['NIFTY','SENSEX'].includes(candidate.index))reasons.push('INVALID_INDEX');
+ if(!['NIFTY'].includes(candidate.index))reasons.push('INVALID_INDEX');
  if(!candidate.frozenSpecHash||!/^[a-f0-9]{64}$/i.test(candidate.frozenSpecHash))reasons.push('MISSING_FROZEN_SPEC_HASH');
  const h=candidate.holdout||{},f=candidate.forward||{};
  if(h.source!=='BROKER_OPTION_PREMIUM'||h.outOfSample!==true)reasons.push('HOLDOUT_NOT_INDEPENDENT_OPTION_DATA');
@@ -3048,7 +2859,7 @@ function assessResearchPromotion(candidate, now=Date.now()) {
 async function researchPromotionAudit(e){
  const results={};
  if(!hasKV(e))return {status:'BLOCKED',reason:'KV_UNAVAILABLE',productionSignalsEnabled:false};
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   try{
    const raw=await get(e,'research:promotion-evidence:'+index);
    const candidates=Array.isArray(raw)?raw.slice(0,30):[];
@@ -3069,7 +2880,7 @@ function researchPromotionSelftest(){
 async function runPaperResearchReview(e){
  const at=new Date().toISOString(), outcomes=[];
  if(!hasKV(e))return {at,status:'BLOCKED',reason:'KV_UNAVAILABLE',outcomes,productionSignalsEnabled:false};
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   let raw;
   try{raw=await get(e,'research:promotion-evidence:'+index)}
   catch(err){outcomes.push({index,status:'READ_ERROR',error:String(err.message||err).slice(0,120)});continue}
@@ -3114,7 +2925,7 @@ async function automaticForwardQualification(e){
  try{keys=await get(e,'forward:registrations')}catch(err){return {at,status:'BLOCKED',reason:'REGISTRY_READ_ERROR',outcomes,signalsEnabled:false}}
  if(!Array.isArray(keys))return {at,status:'BLOCKED',reason:'INVALID_REGISTRY',outcomes,signalsEnabled:false};
  for(const key of [...new Set(keys)].slice(-12)){
-  const m=/^forward:registration:(NIFTY|SENSEX):(hypothesis:[a-zA-Z0-9:_-]{1,100})$/.exec(String(key));
+  const m=/^forward:registration:(NIFTY):(hypothesis:[a-zA-Z0-9:_-]{1,100})$/.exec(String(key));
   if(!m){outcomes.push({status:'INVALID_REGISTRY_KEY'});continue}
   const [,index,id]=m;
   try{
@@ -3156,7 +2967,7 @@ function paperPromotionDecision(qualification, registration, now=Date.now()){
  if(qualification?.qualifiedProxy!==true || qualification?.state!=='INDEX_PROXY_RESEARCH_PASSED')reasons.push('FORWARD_PROXY_NOT_QUALIFIED');
  if(qualification?.approvedForSignals!==false || qualification?.ordersEnabled!==false)reasons.push('UNSAFE_QUALIFICATION_SCOPE');
  if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(qualification?.id||'')))reasons.push('INVALID_ID');
- if(!['NIFTY','SENSEX'].includes(qualification?.index))reasons.push('INVALID_INDEX');
+ if(!['NIFTY'].includes(qualification?.index))reasons.push('INVALID_INDEX');
  if(registration?.id!==qualification?.id || registration?.underlying!==qualification?.index)reasons.push('REGISTRATION_MISMATCH');
  if(!registration?.frozenTestSpec || !registration?.baselineHistoricalSignature)reasons.push('UNFROZEN_SPEC');
  const at=Date.parse(qualification?.at||'');
@@ -3169,7 +2980,7 @@ async function automaticPaperPromotion(e){
  const latest=await get(e,'research:forward-qualification:last');
  if(!latest || latest.status!=='COMPLETED' || !Array.isArray(latest.outcomes))return {at,status:'NO_COMPLETED_QUALIFICATION',outcomes,productionSignalsEnabled:false};
  for(const q of latest.outcomes.slice(-12)){
-  if(!['NIFTY','SENSEX'].includes(q?.index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(q?.id||'')))continue;
+  if(!['NIFTY'].includes(q?.index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(q?.id||'')))continue;
   try{
    const reg=await get(e,`forward:registration:${q.index}:${q.id}`);
    const decision=paperPromotionDecision(q,reg);
@@ -3228,7 +3039,7 @@ function evaluateReleaseEvidence(x, now=Date.now()) {
 }
 async function releaseEvidenceAudit(e){
  const [scan, n, s, paper] = await Promise.all([
-  get(e,'scan:last'),get(e,'strategy:approved:NIFTY'),get(e,'strategy:approved:SENSEX'),persistedPaperIntegrity(e)
+  get(e,'scan:last'),get(e,'strategy:approved:NIFTY'),Promise.resolve(null),persistedPaperIntegrity(e)
  ]);
  // No speculative mapping from arbitrary stored objects to independently certified evidence.
  const evidence={kv:hasKV(e),ai:!!e.AI,broker:cfg(e).length===0,
@@ -3238,7 +3049,7 @@ async function releaseEvidenceAudit(e){
   option:{fresh:false,spreadVerified:false,greeksVerified:false,expiryVerified:false},
   signal:{aiReviewed:false,riskApproved:false},delivery:{ready:false}};
  const result=evaluateReleaseEvidence(evidence);
- return {...result,indices:{NIFTY:{storedCandidate:!!n,independentlyCertified:false},SENSEX:{storedCandidate:!!s,independentlyCertified:false}},verifiedProductionSignals:false};
+ return {...result,indices:{NIFTY:{storedCandidate:!!n,independentlyCertified:false}},verifiedProductionSignals:false};
 }
 function releaseGateSelftest(){
  const now=Date.parse('2026-11-10T08:00:00.000Z');
@@ -3274,7 +3085,7 @@ function releaseGateSelftest(){
 function certifyOptionStrategyEvidence(x,now=Date.now()){
  const blockers=[];
  const validDate=v=>Number.isFinite(Date.parse(v||''))&&Date.parse(v)<=now&&Date.parse(v)>now-120*86400000;
- if(!x||!['NIFTY','SENSEX'].includes(x.index))blockers.push('INVALID_INDEX');
+ if(!x||!['NIFTY'].includes(x.index))blockers.push('INVALID_INDEX');
  if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(x?.id||'')))blockers.push('INVALID_STRATEGY_ID');
  if(!x?.frozenSpecHash||typeof x.frozenSpecHash!=='string')blockers.push('MISSING_FROZEN_SPEC');
  if(!validDate(x?.registeredAt))blockers.push('INVALID_REGISTRATION');
@@ -3307,7 +3118,7 @@ function certificationRegression(){
 }
 async function certificationAudit(e){
  const records=[];
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   const last=await get(e,'research:paper-promotion:last');
   for(const r of (last?.outcomes||[]).filter(x=>x.index===index).slice(-8)){
    const evidence=await get(e,`research:option-evidence:${index}:${r.id}`);
@@ -3335,7 +3146,7 @@ function validateOptionTradeLedger(ledger,index,id,minimum){
   if(!Number.isFinite(entry)||!Number.isFinite(exit)||entry>=exit||exit>Date.now())problems.push('INVALID_TRADE_TIMELINE');
   first=Math.min(first,entry);last=Math.max(last,exit);
   if(!['CE','PE'].includes(t?.side)||!Number.isFinite(t?.entryPremium)||t.entryPremium<=0||!Number.isFinite(t?.exitPremium)||t.exitPremium<0||!Number.isSafeInteger(t?.quantity)||t.quantity<=0)problems.push('INVALID_OPTION_TRADE');
-  if(t?.quoteSource!=='ANGEL_ONE'||!t?.entryQuoteAt||!t?.exitQuoteAt||!t?.contractToken||!t?.expiry)problems.push('MISSING_BROKER_QUOTE_PROVENANCE');
+  if(t?.quoteSource!=='KOTAK_NEO'||!t?.entryQuoteAt||!t?.exitQuoteAt||!t?.contractToken||!t?.expiry)problems.push('MISSING_BROKER_QUOTE_PROVENANCE');
   // Broker provenance must be temporally plausible, not just non-empty strings.
   const eq=Date.parse(t?.entryQuoteAt||''),xq=Date.parse(t?.exitQuoteAt||'');
   if(!Number.isFinite(eq)||!Number.isFinite(xq)||!Number.isFinite(entry)||!Number.isFinite(exit)||
@@ -3377,7 +3188,7 @@ async function attestCandidateFromKV(e,index,id){
 }
 function attestationRegression(){
  const now=Date.now(),iso=m=>new Date(now-m*60000).toISOString();
- const make=(n)=>({index:'NIFTY',strategyId:'hypothesis:demo',instrumentType:'OPTION_PREMIUM',trades:Array.from({length:n},(_,i)=>({id:'t'+i,entryAt:iso(1000-i*2),exitAt:iso(999-i*2),side:'CE',entryPremium:100,exitPremium:102,quantity:25,feesINR:5,slippageINR:1,netINR:44,quoteSource:'ANGEL_ONE',entryQuoteAt:iso(1000-i*2),exitQuoteAt:iso(999-i*2),contractToken:'123',expiry:'2026-11-26'}))});
+ const make=(n)=>({index:'NIFTY',strategyId:'hypothesis:demo',instrumentType:'OPTION_PREMIUM',trades:Array.from({length:n},(_,i)=>({id:'t'+i,entryAt:iso(1000-i*2),exitAt:iso(999-i*2),side:'CE',entryPremium:100,exitPremium:102,quantity:25,feesINR:5,slippageINR:1,netINR:44,quoteSource:'KOTAK_NEO',entryQuoteAt:iso(1000-i*2),exitQuoteAt:iso(999-i*2),contractToken:'123',expiry:'2026-11-26'}))});
  const good=make(30),bad=make(30);bad.trades[1].id=bad.trades[0].id;
  const wrong=make(30);wrong.trades[0].netINR=999;
  const staleQuote=make(30);staleQuote.trades[0].entryQuoteAt=iso(1200);
@@ -3401,7 +3212,7 @@ async function automaticEvidenceCertification(e){
   // Only explicit, successfully persisted paper approvals enter certification.
   // Never certify rejected, errored, or ambiguous promotion outcomes.
   if(!isApprovedPromotionOutcome(item))continue;
-  if(!['NIFTY','SENSEX'].includes(index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(id||'')))continue;
+  if(!['NIFTY'].includes(index)||!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(id||'')))continue;
   const k=index+':'+id;
   if(seen.has(k))continue;
   seen.add(k);
@@ -3428,7 +3239,7 @@ async function automaticEvidenceCertification(e){
 // Evidence-qualified candidates are recorded for review, never silently activated.
 function candidateDecision(cert, now=Date.now()){
  const blockers=[];
- if(!cert||!['NIFTY','SENSEX'].includes(cert.index))blockers.push('INVALID_INDEX');
+ if(!cert||!['NIFTY'].includes(cert.index))blockers.push('INVALID_INDEX');
  if(!/^hypothesis:[a-zA-Z0-9:_-]{1,100}$/.test(String(cert?.id||'')))blockers.push('INVALID_ID');
  if(cert?.certifiedEvidence!==true)blockers.push('NOT_CERTIFIED');
  if(cert?.ledgerAttested!==true)blockers.push('LEDGER_NOT_ATTESTED');
@@ -3571,7 +3382,7 @@ function signalEvidenceConsistency({approval,contract,quote,spot,signal,now=Date
  const issues=[];
  const bad=(code,condition)=>{if(condition)issues.push(code)};
  const index=signal?.index;
- bad('INDEX_EXCHANGE_MISMATCH',!!contract&&((index==='NIFTY'&&contract.exchange!=='NFO')||(index==='SENSEX'&&contract.exchange!=='BFO')));
+ bad('INDEX_EXCHANGE_MISMATCH',!!contract&&((index==='NIFTY'&&contract.exchange!=='NFO')));
  bad('CONTRACT_SIDE_MISSING',!['CE','PE'].includes(contract?.side));
  bad('SIGNAL_TIME_MISSING',!Number.isFinite(Date.parse(signal?.at||'')));
  const signalAt=Date.parse(signal?.at||'');
@@ -3598,9 +3409,9 @@ function verifiedSignalDecision({approval,contract,quote,spot,signal,now=Date.no
  if(approval?.status!=='PRODUCTION_STRATEGY_APPROVED')blockers.push('STRATEGY_NOT_APPROVED');
  const until=Date.parse(approval?.validUntil||'');
  if(!Number.isFinite(until)||until<=now)blockers.push('APPROVAL_EXPIRED');
- if(!['NIFTY','SENSEX'].includes(contract?.underlying))blockers.push('INVALID_INDEX');
+ if(!['NIFTY'].includes(contract?.underlying))blockers.push('INVALID_INDEX');
  if(!['CE','PE'].includes(contract?.side))blockers.push('INVALID_OPTION_SIDE');
- if(!['NFO','BFO'].includes(contract?.exchange)||!/^\d+$/.test(String(contract?.token||'')))blockers.push('INVALID_CONTRACT');
+ if(!['NFO'].includes(contract?.exchange)||!/^\d+$/.test(String(contract?.token||'')))blockers.push('INVALID_CONTRACT');
  if(!contract?.symbol||!Number.isFinite(Date.parse(contract?.expiry))||Date.parse(contract.expiry)<=now)blockers.push('EXPIRED_OR_UNKNOWN_EXPIRY');
  if(!Number.isFinite(quote?.bid)||!Number.isFinite(quote?.ask)||quote.bid<=0||quote.ask<quote.bid)blockers.push('INVALID_BID_ASK');
  else if((quote.ask-quote.bid)/quote.ask>0.02)blockers.push('SPREAD_TOO_WIDE');
@@ -3652,7 +3463,7 @@ function verifiedSignalDecision({approval,contract,quote,spot,signal,now=Date.no
  if(signal?.historicalEvidenceId!==approval?.historicalEvidenceId)blockers.push('HISTORICAL_EVIDENCE_MISMATCH');
  if(signal?.forwardEvidenceId!==approval?.forwardEvidenceId)blockers.push('FORWARD_EVIDENCE_MISMATCH');
  if(signal?.brokerQuoteEvidenceId!==quote?.evidenceId)blockers.push('QUOTE_EVIDENCE_MISMATCH');
- if(contract?.exchange!==(contract?.underlying==='NIFTY'?'NFO':'BFO'))blockers.push('INDEX_EXCHANGE_MISMATCH');
+ if(contract?.exchange!==('NFO'))blockers.push('INDEX_EXCHANGE_MISMATCH');
  if(signal?.contractToken!==String(contract?.token||''))blockers.push('SIGNAL_CONTRACT_MISMATCH');
  if(signal?.contractSymbol!==contract?.symbol)blockers.push('SIGNAL_SYMBOL_MISMATCH');
  if(signal?.action==='EXIT'&&signal?.positionContractToken!==String(contract?.token||''))blockers.push('EXIT_CONTRACT_MISMATCH');
@@ -3693,7 +3504,7 @@ function independentIntakeChecks(candidate,index,scan,approval,paper,now=Date.no
  const errors=[]; const fail=(name,test)=>{if(test)errors.push(name)};
  const signalAt=Date.parse(s.at||''),quoteAt=Date.parse(q.at||''),spotAt=Date.parse(sp.at||'');
  fail('INDEX_MISMATCH',s.index!==index);
- fail('INDEX_NOT_SUPPORTED',!['NIFTY','SENSEX'].includes(index));
+ fail('INDEX_NOT_SUPPORTED',!['NIFTY'].includes(index));
  fail('BROKER_NOT_RECONCILED',candidate?.brokerReconciled!==true);
  fail('INDEPENDENT_VALIDATOR_MISSING',candidate?.independentValidatorPassed!==true);
  fail('APPROVAL_MISSING',approval?.status!=='PRODUCTION_STRATEGY_APPROVED');
@@ -3707,7 +3518,7 @@ function independentIntakeChecks(candidate,index,scan,approval,paper,now=Date.no
  fail('SPOT_STALE',!Number.isFinite(spotAt)||now-spotAt>15000||spotAt>now+2000);
  fail('SIGNAL_QUOTE_SKEW',Number.isFinite(signalAt)&&Number.isFinite(quoteAt)&&Math.abs(signalAt-quoteAt)>15000);
  fail('CONTRACT_MISMATCH',String(s.contractToken||'')!==String(c.token||'')||s.contractSymbol!==c.symbol);
- fail('CONTRACT_EXCHANGE_MISMATCH',c.exchange!==(index==='NIFTY'?'NFO':'BFO'));
+ fail('CONTRACT_EXCHANGE_MISMATCH',c.exchange!==('NFO'));
  fail('QUOTE_EVIDENCE_MISMATCH',s.brokerQuoteEvidenceId!==q.evidenceId);
  fail('PAPER_LEDGER_UNHEALTHY',paper?.healthy!==true);
  fail('NO_DIRECTIONAL_ACTION',!['BUY_CE','BUY_PE','EXIT'].includes(s.action));
@@ -3750,7 +3561,7 @@ async function ingestIndependentSignalEvidence(e){
  const age=Date.now()-Date.parse(scan?.at||'');
  if(!scan?.scanHealthy||!scan?.scanSummarySaved||!Number.isFinite(age)||age<0||age>60000){result.reason='FRESH_SCAN_REQUIRED';return result;}
  const approval=await get(e,'research:production-approval:last');
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   const row={status:'WAIT',reason:'NO_INDEPENDENT_CANDIDATE'};result.indices[index]=row;
   try{
    const candidate=await get(e,'signal:independent:'+index);
@@ -3777,7 +3588,7 @@ async function ingestIndependentSignalEvidence(e){
 // Batch 1: automatically generated, explicitly UNVERIFIED paper research signals.
 // This path never claims production certification and never submits broker orders.
 function paperWatchDecision(w, now=Date.now()) {
- if(!w||w.status!=='RESEARCH_WATCH'||!['NIFTY','SENSEX'].includes(w.underlying)||!['CE','PE'].includes(w.side))return {ok:false,reason:'INVALID_WATCH'};
+ if(!w||w.status!=='RESEARCH_WATCH'||!['NIFTY'].includes(w.underlying)||!['CE','PE'].includes(w.side))return {ok:false,reason:'INVALID_WATCH'};
  if(!Number.isFinite(w.referencePremium)||w.referencePremium<=0||!Number.isFinite(w.hypotheticalSL)||!Number.isFinite(w.hypotheticalTarget)||w.hypotheticalSL<=0||w.hypotheticalSL>=w.referencePremium||w.hypotheticalTarget<=w.referencePremium)return {ok:false,reason:'INVALID_LEVELS'};
  if(!Number.isFinite(w.spotMovePct)||!Number.isFinite(w.premiumMovePct)||!Number.isFinite(w.oiDelta)||w.oiDelta<=0)return {ok:false,reason:'MISSING_MARKET_CONFIRMATION'};
  if(!Number.isFinite(w.referencePremium)||w.hypotheticalTarget-w.referencePremium<1.2*(w.referencePremium-w.hypotheticalSL))return {ok:false,reason:'LOW_RISK_REWARD'};
@@ -3798,7 +3609,7 @@ export class PaperAlertCoordinator {
   if(new URL(request.url).pathname==='/internal/platform-journal'){
    const signed=await readSigned(request,this.env);if(!signed||signed.command!=='platform-journal'||!/^\d{4}-\d{2}-\d{2}$/.test(signed.day||''))return privateJson({error:'FORBIDDEN'},403);
    const decode=x=>{try{return typeof x==='string'?JSON.parse(x):x}catch{return null}};
-   const current=await Promise.all(['NIFTY','SENSEX'].map(async index=>decode(await this.state.storage.get('research:paper:position:'+signed.day+':'+index)||await get(this.env,'research:paper:position:'+signed.day+':'+index))));
+   const current=await Promise.all(['NIFTY'].map(async index=>decode(await this.state.storage.get('research:paper:position:'+signed.day+':'+index)||await get(this.env,'research:paper:position:'+signed.day+':'+index))));
    const closed=await this.state.storage.list({prefix:'research:paper:closed:'+signed.day+':',limit:200});
    const trades=[...new Map([...closed.values(),...current].map(decode).filter(Boolean).map(p=>[p.index+':'+p.entryAt,p])).values()];return privateJson({trades});
   }
@@ -3810,7 +3621,7 @@ export class PaperAlertCoordinator {
    const job=this.queue.then(async()=>{
     const key='daily-results:'+signed.day,old=await this.state.storage.get(key);if(old)return Response.json(old);
     const decode=x=>typeof x==='string'?JSON.parse(x):x;
-    const current=await Promise.all(['NIFTY','SENSEX'].map(async index=>{const k='research:paper:position:'+signed.day+':'+index;return decode(await this.state.storage.get(k)||await get(this.env,k))}));
+    const current=await Promise.all(['NIFTY'].map(async index=>{const k='research:paper:position:'+signed.day+':'+index;return decode(await this.state.storage.get(k)||await get(this.env,k))}));
     const archived=this.state.storage.list?await this.state.storage.list({prefix:'research:paper:closed:'+signed.day+':'}):new Map();
     const positions=[...new Map([...archived.values(),...current].map(decode).filter(Boolean).map(x=>[x.index+':'+x.entryAt,x])).values()];
     const summary=researchDailySummary(signed.day,positions,await get(this.env,'directional-alerts:'+signed.day)||{});
@@ -3877,13 +3688,13 @@ async function automaticResearchPaperAlerts(e) {
  const age=Date.now()-Date.parse(scanState?.at||'');
  if(!scanState?.scanHealthy||!scanState?.scanSummarySaved||scanState.kvStateSaved!==true||!Number.isFinite(age)||age<0||age>60000)return {...report,status:'BLOCKED',reason:'NO_FRESH_SCAN'};
  const rolling=await get(e,'rolling:'+day())||{};
- for(const index of ['NIFTY','SENSEX']) {
+ for(const index of ['NIFTY']) {
   const key='research:paper:position:'+day()+':'+index; // New trading day has independent paper state
   const pos=await get(e,key);
   if(pos?.status==='OPEN') {
    const history=rolling[pos.exchange+':'+pos.token];
    let last=Array.isArray(history)?history.at(-1):null;
-   if(useNeo(e)&&(pos.provider||'ANGEL')==='ANGEL'){try{const legacy={...e,MARKET_DATA_PROVIDER:'ANGEL'},raw=(await quotes(legacy,await session(legacy),pos.exchange,[String(pos.token)]))[0],quality=quoteQuality(raw||{});last=quality.state==='FRESH'?{p:quality.price,t:Date.now()-quality.ageSeconds*1000}:null;}catch{last=null;}}
+   if(pos.provider!=='KOTAK_NEO'){last=null;}
    if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<pos.entryAt||last.t<Number(scanState?.at?Date.parse(scanState.at):0)-60000){report.blocked.push(index+':STALE_EXIT_QUOTE');continue;}
    const decision=paperWatchExit(pos,last.p);
    if(!decision.exit){
@@ -3914,13 +3725,13 @@ async function automaticResearchPaperAlerts(e) {
   if(!ai){report.blocked.push(index+':AI_REVIEW_MISSING');continue;}
   if(!['WATCH',watch.side==='CE'?'BUY_CE':'BUY_PE'].includes(ai.action)||(ai.side&&ai.side!==watch.side)|| (ai.underlying&&ai.underlying!==index)){report.blocked.push(index+':AI_NOT_MATCHED_WATCH');continue;}
   const contract=(scanState.paperContractEvidence||{})[watch.symbol];
-  if(!contract?.token||!contract?.exchange||contract.exchange!==(index==='NIFTY'?'NFO':'BFO')||!/^\d+$/.test(String(contract.token))||!Number.isSafeInteger(Number(contract.lotSize))||Number(contract.lotSize)<=0){report.blocked.push(index+':CONTRACT_EVIDENCE_MISSING');continue;}
+  if(!contract?.token||!contract?.exchange||contract.exchange!==('NFO')||!/^\d+$/.test(String(contract.token))||!Number.isSafeInteger(Number(contract.lotSize))||Number(contract.lotSize)<=0){report.blocked.push(index+':CONTRACT_EVIDENCE_MISSING');continue;}
   const history=rolling[contract.exchange+':'+contract.token],last=Array.isArray(history)?history.at(-1):null;
   if(!last||!Number.isFinite(last.p)||last.p<=0||!Number.isFinite(last.t)||last.t>Date.now()+2000||Date.now()-last.t>60000||last.t<Date.parse(scanState.at)-60000){report.blocked.push(index+':QUOTE_MISSING');continue;}
   if(watch.symbol!==contract.symbol||watch.side!==contract.side||!contract.expiry||!Number.isFinite(parseExpiry(contract.expiry))||parseExpiry(contract.expiry)<=Date.now()){report.blocked.push(index+':CONTRACT_IDENTITY_OR_EXPIRY_INVALID');continue;}
   if(Math.abs(last.p-watch.referencePremium)/watch.referencePremium>0.03){report.blocked.push(index+':WATCH_PRICE_MISMATCH');continue;}
   if(!(watch.hypotheticalSL<last.p&&last.p<watch.hypotheticalTarget)){report.blocked.push(index+':LIVE_ENTRY_LEVELS_INVALID');continue;}
-  const position={provider:useNeo(e)?'KOTAK_NEO':'ANGEL',signalId:watch.signalId,status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:watch.quotedAt||last.t,entryPremium:watch.referencePremium,...paperSize(Number(contract.lotSize),sentDirectional.lots??1),stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
+  const position={provider:'KOTAK_NEO',signalId:watch.signalId,status:'OPEN',index,symbol:watch.symbol,exchange:contract.exchange,token:contract.token,side:watch.side,entryAt:watch.quotedAt||last.t,entryPremium:watch.referencePremium,...paperSize(Number(contract.lotSize),sentDirectional.lots??1),stop:watch.hypotheticalSL,target:watch.hypotheticalTarget,source:'SAMPLED_RESEARCH_WATCH',noBrokerOrder:true,delivery:'PENDING'};
   if(!await put(e,key,position,86400*7)){report.blocked.push(index+':ENTRY_SAVE_FAILED');continue;}
   if(sentDirectional?.state==='SENT'){position.delivery='DELIVERED';position.entryDelivery='DELIVERED';position.entryNotice='EXISTING_DIRECTIONAL_ALERT';await put(e,key,position,86400*7);report.entries.push({index,symbol:watch.symbol,delivery:position.delivery});continue;}
   const msg=`🧪 JANGGO PAPER RESEARCH ${watch.side} — NOT A VERIFIED BUY SIGNAL\n${index} ${watch.symbol}\nObserved premium ₹${last.p.toFixed(2)} | Hypothetical SL ₹${position.stop.toFixed(2)} | Target ₹${position.target.toFixed(2)}\nSpot momentum ${watch.spotMovePct}% | OI change ${watch.oiDelta}\nNo broker order. Not independently certified; do not trade from this message.`;
@@ -3941,7 +3752,7 @@ async function productionSignalPipeline(e,{dryRun=true}={}){
  const last=await get(e,'scan:last'),age=Date.now()-Date.parse(last?.at||'');
  if(!last?.scanHealthy||!last?.scanSummarySaved||!Number.isFinite(age)||age<0||age>60000){out.reason='SCAN_NOT_VERIFIED_FRESH';return out;}
  const approved=await get(e,'research:production-approval:last');
- for(const index of ['NIFTY','SENSEX']){
+ for(const index of ['NIFTY']){
   try{
    const candidates=(approved?.results||[]).filter(x=>x.index===index&&x.status==='PRODUCTION_STRATEGY_APPROVED');
    const record=await get(e,'signal:validated:'+index);
@@ -4011,7 +3822,7 @@ export async function neoResearchAudit(e){
  const report={version:'neo-research-v1',day:day(),at:new Date().toISOString(),provider:'KOTAK_NEO',status:'CHECKING',ordersEnabled:false,liveSessionVerified:false};
  try{const catalog=await neoInstruments(e,['NIFTY']);report.catalog={contracts:catalog.length,provider:'KOTAK_NEO',coverage:catalog[0]?.catalogCoverage||null};const end=day(),start=new Date(Date.now()-6*86400000).toLocaleDateString('sv-SE',{timeZone:TZ});
   const data=await neoHistoryWindow(e,{exchange:'NSE',symboltoken:String(e.NIFTY_SPOT_TOKEN||'99926000'),interval:'ONE_MINUTE',fromdate:start+' 09:15:00',todate:end+' 15:30:00'});
-  const rows=normalizeAngelCandles(data.data,{intervalMs:60000});if(!rows.length)throw Error('NEO_INDEX_HISTORY_EMPTY');
+  const rows=normalizeBrokerCandles(data.data,{intervalMs:60000});if(!rows.length)throw Error('NEO_INDEX_HISTORY_EMPTY');
   report.history={index:'NIFTY',rows:rows.length,firstAt:new Date(rows[0].t).toISOString(),lastAt:new Date(rows.at(-1).t).toISOString(),source:'KOTAK_NEO_INDEX_OHLC'};
   if(e.PAPER_COORDINATOR){const stub=e.PAPER_COORDINATOR.get(e.PAPER_COORDINATOR.idFromName('janggo-history-cache-kotak-v1'));const cached=await requestCandleCache(e,stub,'cache-read');if(!cached.ok)throw Error('NEO_HISTORY_CACHE_READ_FAILED');const cache=await cached.json()||{rows:{},errors:{}};cache.rows||={};cache.rows.NIFTY=rows;cache.errors||={};delete cache.errors.NIFTY;cache.at=Date.now();const saved=await requestCandleCache(e,stub,'cache-write',cache);if(!saved.ok)throw Error('NEO_HISTORY_CACHE_WRITE_FAILED');report.cachePrimed=true;}
   report.status='HISTORICAL_DATA_RETURNED';
@@ -4030,28 +3841,28 @@ if(new URL(req.url).pathname==='/internal/nifty-context'&&req.method==='POST'){
  return Response.json(buildNiftyContext(market,position));
 }
 if(new URL(req.url).pathname==='/internal/research-audit'&&req.method==='POST'){
- const signed=await readSigned(req,e);if(!signed||signed.command!=='research-audit'||!['NIFTY','SENSEX'].includes(signed.index))return new Response('Forbidden',{status:403});
+ const signed=await readSigned(req,e);if(!signed||signed.command!=='research-audit'||!['NIFTY'].includes(signed.index))return new Response('Forbidden',{status:403});
  const index=signed.index,key='deployment:research-data-v1:'+index;
  const result=await researchAudit({index,read:()=>get(e,key),write:r=>put(e,key,r,86400*30),analyse:()=>marketIntelligence(e,index),benchmark:async()=>tenHistoricalChecks(await historicalCandles(e,await session(e),index,7),index),send:message=>telegram(e,message)});
  return Response.json(result);
 }
-if(new URL(req.url).pathname==='/commodity-status'){try{return Response.json(await chainCommand(e,'commodity-status'));}catch{return Response.json({status:'UNAVAILABLE',ordersEnabled:false},{status:503});}}
-if(new URL(req.url).pathname==='/research-data-audit'){let optionChain=null;try{optionChain=await chainCommand(e,'status');}catch{}return Response.json({NIFTY:await get(e,'deployment:research-data-v1:NIFTY'),SENSEX:await get(e,'deployment:research-data-v1:SENSEX'),aiConnectionAudit:optionChain?.aiConnectionAudit||null,optionChain,researchBroker:{provider:useNeo(e)?'KOTAK_NEO':'ANGEL',sharedAiEnabled:sharedBudgetEnabled(e),audit:await get(e,'broker:neo:commissioning')},currentResearch:{NIFTY:await get(e,'marketintel:NIFTY'),SENSEX:await get(e,'marketintel:SENSEX')},ordersEnabled:false});}
+
+if(new URL(req.url).pathname==='/research-data-audit'){let optionChain=null;try{optionChain=await chainCommand(e,'status');}catch{}return Response.json({NIFTY:await get(e,'deployment:research-data-v1:NIFTY'),aiConnectionAudit:optionChain?.aiConnectionAudit||null,optionChain,researchBroker:{provider:'KOTAK_NEO',sharedAiEnabled:sharedBudgetEnabled(e),audit:await get(e,'broker:neo:commissioning')},currentResearch:{NIFTY:await get(e,'marketintel:NIFTY')},ordersEnabled:false});}
 if(new URL(req.url).pathname==='/internal/router'&&req.method==='POST'){
  const signed=await readSigned(req,e);if(!signed||signed.command!=='ensure-router')return new Response('Forbidden',{status:403});
  try{const routed=await ensureBotRouter(e);if(signed.audit==='history-chain-runtime-v1'&&executionCtx){executionCtx.waitUntil(deploymentAudit({read:()=>get(e,'deployment:history-chain-runtime-v1'),write:r=>put(e,'deployment:history-chain-runtime-v1',r,86400*30),probe:index=>historicalProbe(e,index),status:()=>chainCommand(e,'status'),send:message=>telegram(e,message)}).catch(()=>console.warn('deployment-audit-failed')));routed.auditAccepted=true;}return Response.json(routed);}catch{return Response.json({configured:false,reason:'TELEGRAM_ROUTER_SETUP_FAILED'},{status:502});}
 }
 if(new URL(req.url).pathname==='/deployment-audit')return Response.json(await get(e,'deployment:history-chain-runtime-v1')||{status:'NOT_RUN',ordersEnabled:false});
-await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/daily-results-status')return Response.json(await freshDailyResults(e,true));if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:'+day()+':NIFTY'),SENSEX:await get(e,'research:paper:position:'+day()+':SENSEX'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty,sensex]=await Promise.all(['NIFTY','SENSEX'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,SENSEX:sensex||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
+await hydrateExchangeCalendar(e);const u=new URL(req.url);if(u.pathname==='/daily-results-status')return Response.json(await freshDailyResults(e,true));if(u.pathname==='/paper-watch-selftest')return json(paperWatchSelftest());if(u.pathname==='/paper-watch-status')return json({last:await get(e,'research:paper:alerts:last'),NIFTY:await get(e,'research:paper:position:'+day()+':NIFTY'),ordersEnabled:false});if(u.pathname==='/broker-evidence'){const [nifty]=await Promise.all(['NIFTY'].map(n=>get(e,'broker:snapshot:'+n)));return json({at:new Date().toISOString(),marketOpen:marketOpen(e),NIFTY:nifty||null,verifiedGreeks:false,verifiedProductionSignals:false,ordersEnabled:false});}if(u.pathname==='/workflow-status'){
   const keys=['scan:last','research:production-approval:last','signal:production-pipeline:last','signal:scheduled-audit:last','paper:cycle:last','cron:last-failure'];
   const rows=await Promise.all(keys.map(k=>get(e,k).catch(err=>({status:'READ_FAILED',reason:String(err?.message||err).slice(0,100)}))));
   return json({version:VERSION,at:new Date().toISOString(),session:sessionConfig(e),ordersEnabled:false,configuredEntryPolicy:RESEARCH_ENTRY_POLICY,paperMonitoring:{intervalSeconds:180,trailing:'ONE_INITIAL_RISK_THEN_ONE_RISK_BELOW_OBSERVED_PEAK',ordersPlaced:false},
-   brokerProvider:useNeo(e)?'KOTAK_NEO':'ANGEL',sharedAiPolicy:{enabled:sharedBudgetEnabled(e),model:aiModel(e),nonTradingAiEnabled:false},brokerConnectionAudit:await get(e,'broker:neo:commissioning'),newEntryUnderlyings:entryUniverse(e),tradePreferences,scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
+   brokerProvider:'KOTAK_NEO',sharedAiPolicy:{enabled:sharedBudgetEnabled(e),model:aiModel(e),nonTradingAiEnabled:false},brokerConnectionAudit:await get(e,'broker:neo:commissioning'),newEntryUnderlyings:entryUniverse(e),tradePreferences,scan:rows[0],productionApprovals:rows[1],signalEvidence:rows[2],scheduledSignalAudit:rows[3],paperCycle:rows[4],lastFailure:rows[5],
    verifiedLiveSignalDelivery:false});
  }if(u.pathname==='/independent-intake-selftest')return json({version:VERSION,...independentIntakeSelftest()});if(u.pathname==='/production-delivery-selftest')return json({version:VERSION,...productionDeliverySelftest()});if(u.pathname==='/verified-signal-selftest')return json({version:VERSION,...verifiedSignalSelftest()});if(u.pathname==='/signal-evidence-intake-status')return json({version:VERSION,...(await get(e,'signal:evidence-intake:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/production-signal-pipeline')return json({version:VERSION,...await productionSignalPipeline(e,{dryRun:true})});if(u.pathname==='/production-approval-selftest')return json({version:VERSION,...productionApprovalSelftest()});if(u.pathname==='/production-approval-status')return json({version:VERSION,...(await get(e,'research:production-approval:last')||{status:'NOT_RUN',ordersEnabled:false})});if(u.pathname==='/candidate-review-selftest')return json({version:VERSION,...candidateReviewSelftest()});if(u.pathname==='/candidate-review-status')return json({version:VERSION,...(await get(e,'research:candidate-review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/attestation-selftest')return json({version:VERSION,...attestationRegression()});if(u.pathname==='/attestation-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN'})});if(u.pathname==='/certification-workflow-selftest')return json({version:VERSION,...certificationWorkflowRegression()});if(u.pathname==='/certification-workflow-status')return json({version:VERSION,...(await get(e,'research:certification:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/certification-selftest')return json({version:VERSION,...certificationRegression()});if(u.pathname==='/certification-audit')return json({version:VERSION,...await certificationAudit(e)});if(u.pathname==='/paper-promotion-selftest')return json({version:VERSION,...paperPromotionSelftest()});if(u.pathname==='/paper-promotion-status')return json({version:VERSION,...(await get(e,'research:paper-promotion:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/forward-qualification-selftest')return json({version:VERSION,...forwardQualificationSelftest()});if(u.pathname==='/forward-qualification-status')return json({version:VERSION,...(await get(e,'research:forward-qualification:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/autonomous-research-status')return json({version:VERSION,...(await get(e,'research:auto:last')||{status:'NOT_RUN',signalsEnabled:false})});if(u.pathname==='/release-gate-selftest')return json({version:VERSION,...releaseGateSelftest()});if(u.pathname==='/release-gate')return json({version:VERSION,...await releaseEvidenceAudit(e)});if(u.pathname==='/paper-integrity-selftest')return json({version:VERSION,...paperIntegritySelftest()});if(u.pathname==='/paper-integrity')return json({version:VERSION,...await persistedPaperIntegrity(e)});if(u.pathname==='/research-review-status')return json({version:VERSION,...(await get(e,'research:review:last')||{status:'NOT_RUN',productionSignalsEnabled:false})});if(u.pathname==='/research-promotion-selftest')return json({version:VERSION,...researchPromotionSelftest()});if(u.pathname==='/research-promotion-audit')return json({version:VERSION,...await researchPromotionAudit(e)});if(u.pathname==='/integrated-safety-selftest')return json({version:VERSION,...integratedSafetyRegression()});if(u.pathname==='/production-blockers')return json({version:VERSION,...await productionBlockerAudit(e)});if(u.pathname==='/option-gate-selftest')return json({version:VERSION,...optionGateRegression()});if(u.pathname==='/paper-lifecycle-selftest')return json({version:VERSION,...await __modules['paper-lifecycle-regression.mjs'].runPaperLifecycleRegression()});if(u.pathname==='/operational-selftest')return json({version:VERSION,...operationalHealthRegression()});if(u.pathname==='/operational-health'){const [cron,scan,paper,forward,failure]=await Promise.all([get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last'),get(e,'cron:last-failure')]);return json({version:VERSION,at:new Date().toISOString(),...classifyOperationalHealth({marketOpen:marketOpen(e),cron,scan,paper,forward,failure})});}if(u.pathname==='/health')return json({ok:true,version:VERSION,mode:'signals-only-research',ordersEnabled:false,verifiedSignalsEnabled:false,evidenceGate:'INDEPENDENT_EVIDENCE_REQUIRED_BEFORE_ANY_ALERT'});if(u.pathname==='/operations-status'){
  const [scan,paper,cron,tg]=await Promise.all([get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'cron:last-trigger'),telegramHealth(e)]);
  const age=Date.now()-Date.parse(scan?.at||'');
- return json({version:VERSION,niftyOnly:niftyOnly(e),commodityEnabled:!niftyOnly(e)&&e.COMMODITY_ENABLED!=='no',at:new Date().toISOString(),session:sessionConfig(e),marketOpen:marketOpen(e),lastCron:cron?.at||null,lastScan:scan?.at||null,scanHealthy:scan?.scanHealthy===true,scanFresh:Number.isFinite(age)&&age>=0&&age<5*60000,lastPaperCycle:paper||null,telegram:tg,realOrdersEnabled:false,liveSignalsCertified:false});
+ return json({version:VERSION,niftyOnly:niftyOnly(e),commodityEnabled:false,at:new Date().toISOString(),session:sessionConfig(e),marketOpen:marketOpen(e),lastCron:cron?.at||null,lastScan:scan?.at||null,scanHealthy:scan?.scanHealthy===true,scanFresh:Number.isFinite(age)&&age>=0&&age<5*60000,lastPaperCycle:paper||null,telegram:tg,realOrdersEnabled:false,liveSignalsCertified:false});
  }if(u.pathname==='/recovery-status'){
   const [failure,cron,scan,paper,forward]=await Promise.all([get(e,'cron:last-failure'),get(e,'cron:last-trigger'),get(e,'scan:last'),get(e,'paper:cycle:last'),get(e,'forward:cycle:last')]);
   const now=Date.now(),age=t=>{const d=Date.parse(t||'');return Number.isFinite(d)?Math.max(0,Math.floor((now-d)/1000)):null};
@@ -4249,7 +4060,7 @@ export { signalEvidenceConsistency, verifiedSignalDecision };
 export { independentIntakeSelftest, independentIntakeChecks };
 
 // Read-only transport exports for regression tests; no additional HTTP routes.
-export {historicalRequest,normalizeAngelCandles,fetchHistoricalWindow,marketIntelligence,angelHeaders,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly,sendDirectionalAlerts,paperWatchExit};
+export {normalizeBrokerCandles,fetchHistoricalWindow,marketIntelligence,historicalProbe,historicalCandles,minuteCandles,aggregateCandles,frameIntelligence,tenHistoricalChecks,runScheduledPaperCycle,automaticResearchPaperAlerts,reviewDirectionalSignals,reviewResearchWithAI,scanQuotesOnly,sendDirectionalAlerts,paperWatchExit};
 
 // Owner login handler export for authorization regression tests.
 export {handle as handleBotUpdate};

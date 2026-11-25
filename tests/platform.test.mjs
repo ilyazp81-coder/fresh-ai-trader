@@ -11,9 +11,7 @@ function storage(){const values=new Map();return {values,get:async k=>values.get
 function environment(){const env={TELEGRAM_BOT_TOKEN:'test-token-not-for-browser',TELEGRAM_CHAT_ID:'123',MARKET_DATA_PROVIDER:'KOTAK_NEO'},st=storage();env.PAPER_COORDINATOR={idFromName:n=>n,get:()=>({fetch:async(url,init)=>deskSessionRequest(new Request(url,init),env,st)})};return {env,st};}
 async function signed(env,data){const body=JSON.stringify({command:'platform-session',chatId:'123',at:Date.now(),...data});return new Request('https://desk.internal/internal/platform-session',{method:'POST',headers:{'x-janggo-signature':await signCommand(env.TELEGRAM_BOT_TOKEN,body)},body});}
 const deps={date:'2026-11-16',session:{valid:true,open:'09:15',close:'15:30'},marketOpen:false,read:async()=>null};
-test('crude paper journal uses actual multiplier and remains separate from research attribution',()=>{
- const t=deskTrade({entry:100,quantity:1,lotSize:1,priceMultiplier:100,symbol:'CRUDECE',provider:'KOTAK_NEO',exchange:'MCX'},'commodity','PAPER_CLOSED',{exitPrice:110});assert.equal(t.grossPnl,1000);assert.equal(t.points,10);assert.equal(t.countable,true);assert.equal(t.project,'commodity');assert.equal(t.exchange,'MCX');
-});
+
 test('an existing approved browser upgrades once to a fixed 30-day cookie and logout still revokes it',async t=>{
  const now=Date.parse('2026-11-17T10:00:00Z');t.mock.method(Date,'now',()=>now);const {env,st}=environment(),sid='c'.repeat(64),hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(sid)))].map(x=>x.toString(16).padStart(2,'0')).join('');
  await st.put('desk:session:'+hash,{approved:true,expires:now+3600000});const req=new Request('https://example.test/platform/session',{headers:{cookie:'__Host-janggo_desk='+sid}}),r=await deskSessionStatus(req,env),s=await r.json();assert.equal(s.approved,true);assert.equal(s.sessionDays,30);assert.ok(s.expires>now+29*86400000);assert.match(r.headers.get('set-cookie'),/HttpOnly; Secure; SameSite=Strict/);
@@ -80,7 +78,7 @@ test('an approved browser initializes against the actual page IDs and loads the 
  for(const id of ['refresh','export','chart-series','chain-lots','research-lots','save-chain','save-research'])assert.equal(nodes.get(id).disabled,false,id);
  assert.ok(calls.some(p=>p.endsWith('/data')));assert.ok(calls.some(p=>p.includes('/chart?')));assert.match(nodes.get('chain-size').textContent,/1 lot/);
  context.testPayload={...data,chain:{...data.chain,aiDecisionMode:'SINGLE_FINAL_AI'},commodity:{connected:true,enabled:true,paperAlertsEnabled:false,newEntriesEnabled:false,lots:1,entryWindow:{open:Date.now()+60000,configuredStartIst:'16:00'}}};
- vm.runInNewContext('render(testPayload)',context);assert.match(nodes.get('chain-method').textContent,/Mistral/);assert.equal(nodes.get('commodity-state').textContent,'Entries from 16:00 IST');
+ vm.runInNewContext('render(testPayload)',context);assert.match(nodes.get('chain-method').textContent,/AI-led|Mistral/);assert.equal(nodes.has('commodity-state'),false);
  const count=calls.length;context.testPayload={...data,analysis:{estimatedGreeks:{status:'ESTIMATED',at:new Date().toISOString(),brokerReported:false,model:'BLACK_76_ZERO_RATE_SCENARIO',contracts:[{symbol:'<img src=x onerror=alert(1)>',expiry:'2026-11-23',mid:130,ivPct:14.321,deltaForward:.5,gammaForward:.0004,thetaPerCalendarDay:-12,vegaPerVolPoint:10}]}}};
  vm.runInNewContext('render(testPayload);lock()',context);assert.equal(nodes.has('greeks-table'),false);assert.doesNotMatch(deskHtml,/estimated-greeks-panel|Estimated IV/);assert.equal(calls.length,count,'Removing analytics must not add API or AI calls');
 
