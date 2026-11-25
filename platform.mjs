@@ -1,3 +1,4 @@
+import {deskTrade,researchDeskJournal} from './platform-data.mjs';
 import {niftyOnly} from './entry-policy.mjs';
 import {paperSize} from './paper-sizing.mjs';
 import {deskHtml,deskHtmlFor,deskCss,deskJs} from './platform-page.mjs';
@@ -36,6 +37,8 @@ export async function platformFetch(request,env,deps){
   if(path==='/platform/logout'&&request.method==='POST')return await logoutDesk(request,env);
   if(path==='/platform/session'&&request.method==='GET')return deskSessionStatus(request,env);
   if(!await approvedDesk(request,env))return privateJson({message:'Approve this browser through Janggo first.'},401);
+  if(path==='/platform/journal'&&request.method==='GET'){const day=new URL(request.url).searchParams.get('day');if(!/^\d{4}-\d{2}-\d{2}$/.test(day||''))return privateJson({message:'Choose a valid date.'},400);const [chain,research]=await Promise.all([chainCommand(env,'journal',{day}),researchDeskJournal(env,day)]);return privateJson({day,trades:[...(chain.trades||[]).map(t=>deskTrade(t.body,'chain',t.state,t)),...(research.trades||[]).map(t=>deskTrade(t,'research',t.status))],retention:'Stored records have no automatic expiry; storage is finite.'});}
+  if(path==='/platform/audit'&&request.method==='GET'){const p=new URL(request.url).searchParams;return privateJson(await chainCommand(env,'audit-events',{day:p.get('day'),tradeId:p.get('tradeId'),before:p.get('before'),limit:50}));}
   if(path==='/platform/data'&&request.method==='GET')return privateJson(await snapshot(env,deps));
   if(path==='/platform/chart'&&request.method==='GET')return privateJson(await chart(env,deps,new URL(request.url).searchParams.get('trade')));
   if(path==='/platform/settings'&&request.method==='POST'){
